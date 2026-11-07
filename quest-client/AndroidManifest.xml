@@ -1,47 +1,57 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.projectvxr.client"
-    android:versionCode="1"
-    android:versionName="0.1.0">
+    android:versionCode="2"
+    android:versionName="0.2.0">
 
-    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="32" />
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34" />
 
-    <!-- Meta Quest VR Features -->
-    <uses-feature android:name="android.hardware.vr.headtracking" android:required="true" android:version="1" />
+    <!-- Meta Quest VR & Hardware Features (non-blocking so simulators/panels also work) -->
+    <uses-feature android:name="android.hardware.vr.headtracking" android:required="false" android:version="1" />
     <uses-feature android:name="oculus.software.handtracking" android:required="false" />
     <uses-feature android:name="com.oculus.feature.PASSTHROUGH" android:required="false" />
-    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x403000" android:required="true" />
+    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="false" />
 
     <!-- Permissions -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <application
         android:label="Project VXR"
+        android:icon="@drawable/ic_launcher"
+        android:banner="@drawable/ic_banner"
         android:hasCode="false"
         android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
 
-        <!-- Meta Quest standalone VR flag -->
-        <meta-data android:name="com.samsung.android.vr.application.mode" android:value="vr_only" />
-        <meta-data android:name="com.oculus.supportedDevices" android:value="quest2|questpro|quest3" />
+        <meta-data android:name="com.oculus.supportedDevices" android:value="quest|quest2|questpro|quest3|quest3s" />
 
         <activity
             android:name="android.app.NativeActivity"
             android:label="Project VXR"
-            android:configChanges="screenSize|screenLayout|orientation|keyboardHidden|keyboard|navigation|uiMode"
+            android:icon="@drawable/ic_launcher"
+            android:banner="@drawable/ic_banner"
+            android:configChanges="screenSize|screenLayout|orientation|keyboardHidden|keyboard|navigation|uiMode|density"
             android:launchMode="singleTask"
             android:screenOrientation="landscape"
+            android:resizeableActivity="true"
             android:exported="true">
+
+            <layout
+                android:defaultWidth="1280dp"
+                android:defaultHeight="800dp"
+                android:minWidth="800dp"
+                android:minHeight="500dp" />
 
             <meta-data android:name="android.app.lib_name" android:value="vxr_quest_client" />
 
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
-                <category android:name="com.oculus.intent.category.VR" />
+                <category android:name="com.oculus.intent.category.2D" />
             </intent-filter>
         </activity>
     </application>

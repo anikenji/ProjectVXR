@@ -42,6 +42,12 @@ public:
     /// Updates 0ms hardware cursor position from host input packet
     void UpdateHardwareCursor(float norm_x, float norm_y, bool visible);
 
+    /// Handles direct pointer/laser/touch interaction in normalized [0..1] window coordinates
+    void OnSurfacePointerEvent(float norm_x, float norm_y, bool is_down, bool is_click);
+
+    /// Returns the 1280x800 RGBA8888 composited UI + HUD buffer for ANativeWindow presentation
+    const uint32_t* GetCompositedRgbaFrame(uint32_t* out_width, uint32_t* out_height);
+
     VxrMediaCodecDecoder& GetDecoder() { return m_decoder; }
     VxrVulkanRenderer& GetRenderer() { return m_renderer; }
     VxrOpenXrClient& GetOpenXr() { return m_openXr; }
@@ -58,6 +64,9 @@ private:
     uint64_t m_totalFramesRendered;
     bool m_prevMenuBtnPressed;
     bool m_prevTriggerClicked;
+    float m_surfacePointerX;
+    float m_surfacePointerY;
+    bool m_hasSurfacePointer;
 
     VxrMediaCodecDecoder m_decoder;
     VxrVulkanRenderer m_renderer;

@@ -14,6 +14,9 @@ VxrQuestApp::VxrQuestApp()
     , m_totalFramesRendered(0)
     , m_prevMenuBtnPressed(false)
     , m_prevTriggerClicked(false)
+    , m_surfacePointerX(0.5f)
+    , m_surfacePointerY(0.5f)
+    , m_hasSurfacePointer(false)
 {
     memset(&m_config, 0, sizeof(m_config));
 }
@@ -79,6 +82,9 @@ bool VxrQuestApp::Initialize(const QuestAppConfig& config) {
     m_totalFramesRendered = 0;
     m_prevMenuBtnPressed = false;
     m_prevTriggerClicked = false;
+    m_surfacePointerX = 0.5f;
+    m_surfacePointerY = 0.5f;
+    m_hasSurfacePointer = false;
 
     std::cout << "[VXR-App] Meta Quest Client Pipeline initialized successfully: "
               << config.stream_width << "x" << config.stream_height << " @ " << config.target_fps << "Hz"
@@ -96,6 +102,43 @@ bool VxrQuestApp::FeedVideoData(const uint8_t* data, size_t size, uint64_t pts_u
 
 void VxrQuestApp::UpdateHardwareCursor(float norm_x, float norm_y, bool visible) {
     m_cursor.UpdatePosition(norm_x, norm_y, visible);
+}
+
+void VxrQuestApp::OnSurfacePointerEvent(float norm_x, float norm_y, bool is_down, bool is_click) {
+    if (norm_x < 0.0f) norm_x = 0.0f;
+    if (norm_x > 1.0f) norm_x = 1.0f;
+    if (norm_y < 0.0f) norm_y = 0.0f;
+    if (norm_y > 1.0f) norm_y = 1.0f;
+
+    m_surfacePointerX = norm_x;
+    m_surfacePointerY = norm_y;
+    m_hasSurfacePointer = true;
+
+    if (m_vrMenu.IsVisible()) {
+        m_vrMenu.OnPointerMove(norm_x, norm_y);
+        if (is_click) {
+            m_vrMenu.OnPointerClick(norm_x, norm_y);
+            // If user clicked Connect on a computer entry, trigger UDP discovery/handshake
+            const auto& comps = m_vrMenu.GetComputers();
+            for (const auto& c : comps) {
+                if (c.connected && !c.ip_address.empty()) {
+                    m_network.SendDiscoverAndConnect(c.ip_address.c_str(), 38810);
+                }
+            }
+        }
+    } else if (m_vrMenu.GetSettings().controllers_interact_desktop && m_network.IsConnected()) {
+        uint8_t btnMask = is_down ? 0x01 : 0x00;
+        m_network.SendDesktopMouseInput(norm_x, norm_y, btnMask, 0);
+    }
+}
+
+const uint32_t* VxrQuestApp::GetCompositedRgbaFrame(uint32_t* out_width, uint32_t* out_height) {
+    if (out_width) *out_width = MENU_OVERLAY_W;
+    if (out_height) *out_height = MENU_OVERLAY_H;
+    if (m_menuRgbaBuffer.size() < MENU_OVERLAY_W * MENU_OVERLAY_H) {
+        m_menuRgbaBuffer.assign(MENU_OVERLAY_W * MENU_OVERLAY_H, 0xFF121418);
+    }
+    return m_menuRgbaBuffer.data();
 }
 
 bool VxrQuestApp::RunFrame() {
@@ -152,26 +195,28 @@ bool VxrQuestApp::RunFrame() {
     }
     m_prevMenuBtnPressed = ctrl.button_menu;
 
-    float pointerU = 0.5f;
-    float pointerV = 0.5f;
-    float screenDist = m_vrMenu.GetSettings().screen_distance_m;
-    bool hitScreen = m_openXr.ComputeDesktopPointerUV(screenDist, &pointerU, &pointerV);
+    if (!m_hasSurfacePointer) {
+        float pointerU = 0.5f;
+        float pointerV = 0.5f;
+        float screenDist = m_vrMenu.GetSettings().screen_distance_m;
+        bool hitScreen = m_openXr.ComputeDesktopPointerUV(screenDist, &pointerU, &pointerV);
 
-    if (hitScreen) {
-        if (m_vrMenu.IsVisible()) {
-            m_vrMenu.OnPointerMove(pointerU, pointerV);
-            if (ctrl.trigger_clicked && !m_prevTriggerClicked) {
-                m_vrMenu.OnPointerClick(pointerU, pointerV);
+        if (hitScreen) {
+            if (m_vrMenu.IsVisible()) {
+                m_vrMenu.OnPointerMove(pointerU, pointerV);
+                if (ctrl.trigger_clicked && !m_prevTriggerClicked) {
+                    m_vrMenu.OnPointerClick(pointerU, pointerV);
+                }
+            } else if (m_vrMenu.GetSettings().controllers_interact_desktop && m_network.IsConnected()) {
+                uint8_t btnMask = 0;
+                if (ctrl.trigger_clicked || ctrl.button_a) btnMask |= 0x01; // Left click
+                if (ctrl.button_b) btnMask |= 0x02;                         // Right click
+                int16_t wheelDelta = 0;
+                if (m_vrMenu.GetSettings().thumbstick_vertical_scroll && (ctrl.thumbstick_y > 0.15f || ctrl.thumbstick_y < -0.15f)) {
+                    wheelDelta = static_cast<int16_t>(ctrl.thumbstick_y * 120.0f);
+                }
+                m_network.SendDesktopMouseInput(pointerU, pointerV, btnMask, wheelDelta);
             }
-        } else if (m_vrMenu.GetSettings().controllers_interact_desktop && m_network.IsConnected()) {
-            uint8_t btnMask = 0;
-            if (ctrl.trigger_clicked || ctrl.button_a) btnMask |= 0x01; // Left click
-            if (ctrl.button_b) btnMask |= 0x02;                         // Right click
-            int16_t wheelDelta = 0;
-            if (m_vrMenu.GetSettings().thumbstick_vertical_scroll && (ctrl.thumbstick_y > 0.15f || ctrl.thumbstick_y < -0.15f)) {
-                wheelDelta = static_cast<int16_t>(ctrl.thumbstick_y * 120.0f);
-            }
-            m_network.SendDesktopMouseInput(pointerU, pointerV, btnMask, wheelDelta);
         }
     }
     m_prevTriggerClicked = ctrl.trigger_clicked;
@@ -200,7 +245,7 @@ bool VxrQuestApp::RunFrame() {
         m_vrMenu.ClearSettingsDirty();
     }
 
-    // 7. Update Menu & Performance Overlay Textures if visible
+    // 7. Update Menu & Performance Overlay Textures
     if (m_vrMenu.IsVisible()) {
         m_vrMenu.RenderMenuToRgba(m_menuRgbaBuffer.data(), MENU_OVERLAY_W, MENU_OVERLAY_H);
         m_renderer.UpdateMenuOverlayTexture(m_menuRgbaBuffer.data(), MENU_OVERLAY_W, MENU_OVERLAY_H);
@@ -218,11 +263,11 @@ bool VxrQuestApp::RunFrame() {
     DecodedOutputFrame outputFrame = {};
     DecoderStatus decStatus = m_decoder.DequeueOutputBuffer(&outputFrame, 0);
 
+    m_renderer.BeginFrame();
+
     if (decStatus == DecoderStatus::Success) {
         VulkanTexture streamTexture = {};
         if (m_renderer.ImportHardwareBuffer(outputFrame.hardware_buffer, outputFrame.width, outputFrame.height, &streamTexture)) {
-            m_renderer.BeginFrame();
-
             // Render stereo stream quads
             m_renderer.RenderStreamQuad(streamTexture, 0);
             m_renderer.RenderStreamQuad(streamTexture, 1);
@@ -236,15 +281,15 @@ bool VxrQuestApp::RunFrame() {
                 m_cursor.IsVisible()
             );
 
-            // Render In-VR Menu Overlay Quad & Performance HUD Quad
-            m_renderer.RenderMenuOverlayQuad(m_vrMenu.IsVisible(), menuCfg.show_performance_overlay);
-
-            m_renderer.EndFrame();
-
             m_renderer.ReleaseTexture(&streamTexture);
-            m_decoder.ReleaseOutputBuffer(outputFrame.buffer_index, false);
         }
+        m_decoder.ReleaseOutputBuffer(outputFrame.buffer_index, false);
     }
+
+    // Always render In-VR Menu Overlay Quad & Performance HUD Quad even before stream starts
+    m_renderer.RenderMenuOverlayQuad(m_vrMenu.IsVisible(), menuCfg.show_performance_overlay);
+
+    m_renderer.EndFrame();
 
     // 9. End OpenXR frame and submit layers to compositor
     m_openXr.EndFrame(predictedDisplayTimeNs);

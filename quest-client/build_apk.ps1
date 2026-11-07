@@ -36,15 +36,21 @@ if ($LASTEXITCODE -ne 0) { throw "CMake NDK compilation failed." }
 $soSource = Join-Path $buildDir "libvxr_quest_client.so"
 Copy-Item $soSource -Destination $libDir -Force
 
-# 2. Compile AndroidManifest.xml and SPIR-V Shader Assets into base APK
-Write-Host ">>> [2/5] Compiling AndroidManifest.xml & SPIR-V Shaders via aapt2..." -ForegroundColor Yellow
+# 2. Compile res/ (ic_launcher & ic_banner), AndroidManifest.xml, and SPIR-V Shader Assets into base APK
+Write-Host ">>> [2/5] Compiling resources, AndroidManifest.xml & SPIR-V Shaders via aapt2..." -ForegroundColor Yellow
 $assetsDir = Join-Path $apkRoot "assets\shaders"
 New-Item -ItemType Directory -Path $assetsDir -Force | Out-Null
 Copy-Item (Join-Path $root "shaders\*.spv") -Destination $assetsDir -Force
 
+$resDir = Join-Path $root "res"
+$resZip = Join-Path $buildDir "res.zip"
+if (Test-Path $resZip) { Remove-Item $resZip -Force }
+& $aapt2 compile --dir $resDir -o $resZip
+if ($LASTEXITCODE -ne 0) { throw "aapt2 compile failed." }
+
 $manifest = Join-Path $root "AndroidManifest.xml"
 $unalignedApk = Join-Path $buildDir "unaligned.apk"
-& $aapt2 link -I $androidJar --manifest $manifest -A (Join-Path $apkRoot "assets") -o $unalignedApk --min-sdk-version 29 --target-sdk-version 34
+& $aapt2 link -I $androidJar --manifest $manifest -R $resZip -A (Join-Path $apkRoot "assets") -o $unalignedApk --min-sdk-version 29 --target-sdk-version 34
 if ($LASTEXITCODE -ne 0) { throw "aapt2 link failed." }
 
 # 3. Add ARM64 shared library into APK archive
@@ -66,7 +72,7 @@ if (-not (Test-Path $keystore)) {
     & keytool -genkey -v -keystore $keystore -alias androiddebugkey -storepass android -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
 }
 $finalApk = Join-Path $root "vxr-quest-client.apk"
-& $apksigner sign --ks $keystore --ks-pass pass:android --key-pass pass:android --out $finalApk $alignedApk
+& $apksigner sign --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true --ks $keystore --ks-pass pass:android --key-pass pass:android --out $finalApk $alignedApk
 if ($LASTEXITCODE -ne 0) { throw "apksigner failed." }
 
 # Verify and report

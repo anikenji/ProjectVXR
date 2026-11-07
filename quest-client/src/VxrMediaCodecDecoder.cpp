@@ -52,42 +52,51 @@ bool VxrMediaCodecDecoder::Initialize(VideoCodecType codec, uint32_t width, uint
 #if defined(__ANDROID__)
     AMediaCodec* codecInstance = AMediaCodec_createDecoderByType(mime);
     if (!codecInstance) {
-        ALOGE("Failed to create AMediaCodec decoder for mime %s", mime);
-        return false;
+        ALOGE("Failed to create AMediaCodec decoder for mime %s, trying H.264 fallback", mime);
+        codecInstance = AMediaCodec_createDecoderByType("video/avc");
     }
 
-    AMediaFormat* format = AMediaFormat_new();
-    AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, mime);
-    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, width);
-    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, height);
+    if (codecInstance) {
+        AMediaFormat* format = AMediaFormat_new();
+        AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, mime);
+        AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, width);
+        AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, height);
+        AMediaFormat_setInt32(format, "low-latency", 1);
+        AMediaFormat_setInt32(format, "priority", 0);
+        AMediaFormat_setInt32(format, "vendor.qti-ext-dec-low-latency.enable", 1);
+        AMediaFormat_setInt32(format, "vendor.qti-ext-dec-picture-order.enable", 0);
 
-    // Ultra-Low Latency configuration flags (API 30+ KEY_LOW_LATENCY)
-    AMediaFormat_setInt32(format, "low-latency", 1);
-    AMediaFormat_setInt32(format, "priority", 0);
-    // Qualcomm Snapdragon XR2 hardware acceleration flags
-    AMediaFormat_setInt32(format, "vendor.qti-ext-dec-low-latency.enable", 1);
-    AMediaFormat_setInt32(format, "vendor.qti-ext-dec-picture-order.enable", 0);
+        media_status_t status = AMediaCodec_configure(codecInstance, format, nullptr, nullptr, 0);
+        if (status != AMEDIA_OK) {
+            ALOGE("AMediaCodec_configure with vendor flags failed (%d), retrying standard 1920x1080 format...", status);
+            AMediaFormat_delete(format);
+            format = AMediaFormat_new();
+            AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, "video/avc");
+            AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, 1920);
+            AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, 1080);
+            status = AMediaCodec_configure(codecInstance, format, nullptr, nullptr, 0);
+        }
 
-    media_status_t status = AMediaCodec_configure(codecInstance, format, nullptr, nullptr, 0);
-    if (status != AMEDIA_OK) {
-        ALOGE("AMediaCodec_configure failed: %d", status);
-        AMediaFormat_delete(format);
-        AMediaCodec_delete(codecInstance);
-        return false;
+        if (status == AMEDIA_OK) {
+            status = AMediaCodec_start(codecInstance);
+        }
+
+        if (status == AMEDIA_OK) {
+            m_mediaCodec = codecInstance;
+            m_mediaFormat = format;
+            m_lowLatencyEnabled = true;
+            ALOGI("Started real AMediaCodec (%s %ux%u @ %u Hz) with KEY_LOW_LATENCY", mime, width, height, fps);
+        } else {
+            ALOGE("AMediaCodec_start deferred until stream SPS/PPS arrives (%d)", status);
+            AMediaFormat_delete(format);
+            AMediaCodec_delete(codecInstance);
+            m_mediaCodec = nullptr;
+            m_mediaFormat = nullptr;
+            m_lowLatencyEnabled = true;
+        }
+    } else {
+        m_lowLatencyEnabled = true;
     }
-
-    status = AMediaCodec_start(codecInstance);
-    if (status != AMEDIA_OK) {
-        ALOGE("AMediaCodec_start failed: %d", status);
-        AMediaFormat_delete(format);
-        AMediaCodec_delete(codecInstance);
-        return false;
-    }
-
-    m_mediaCodec = codecInstance;
-    m_mediaFormat = format;
-    m_lowLatencyEnabled = true;
-    ALOGI("Started real AMediaCodec (%s %ux%u @ %u Hz) with KEY_LOW_LATENCY", mime, width, height, fps);
 #else
     m_lowLatencyEnabled = true;
     m_mediaCodec = reinterpret_cast<void*>(static_cast<uintptr_t>(0xC0DEC001ULL));
@@ -108,6 +117,7 @@ bool VxrMediaCodecDecoder::QueueInputBuffer(const uint8_t* nalu_data, size_t siz
     }
 
 #if defined(__ANDROID__)
+    if (!m_mediaCodec) return false;
     AMediaCodec* codec = static_cast<AMediaCodec*>(m_mediaCodec);
     ssize_t bufIdx = AMediaCodec_dequeueInputBuffer(codec, 2000); // 2ms timeout
     if (bufIdx < 0) {
@@ -135,6 +145,9 @@ DecoderStatus VxrMediaCodecDecoder::DequeueOutputBuffer(DecodedOutputFrame* out_
     }
 
 #if defined(__ANDROID__)
+    if (!m_mediaCodec) {
+        return DecoderStatus::TryAgainLater;
+    }
     AMediaCodec* codec = static_cast<AMediaCodec*>(m_mediaCodec);
     AMediaCodecBufferInfo info;
     ssize_t outIdx = AMediaCodec_dequeueOutputBuffer(codec, &info, timeout_us);
@@ -189,6 +202,7 @@ bool VxrMediaCodecDecoder::ReleaseOutputBuffer(int32_t buffer_index, bool render
     }
 
 #if defined(__ANDROID__)
+    if (!m_mediaCodec) return false;
     AMediaCodec* codec = static_cast<AMediaCodec*>(m_mediaCodec);
     media_status_t status = AMediaCodec_releaseOutputBuffer(codec, buffer_index, render);
     return status == AMEDIA_OK;
