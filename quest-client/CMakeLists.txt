@@ -14,6 +14,7 @@ set(CLIENT_SOURCES
     src/VxrHardwareCursor.cpp
     src/VxrOpenXrClient.cpp
     src/VxrComputeShaders.cpp
+    src/spatial_canvas.cpp
     src/VxrQuestApp.cpp
     src/main.cpp
 )
@@ -40,6 +41,7 @@ add_executable(test_quest_client
     src/VxrHardwareCursor.cpp
     src/VxrOpenXrClient.cpp
     src/VxrComputeShaders.cpp
+    src/spatial_canvas.cpp
     src/VxrQuestApp.cpp
 )
 
@@ -62,5 +64,19 @@ target_include_directories(test_shaders PRIVATE
 )
 
 target_compile_definitions(test_shaders PRIVATE
+    _CRT_SECURE_NO_WARNINGS
+)
+
+# Spatial Canvas & Passthrough Cutout Test Executable
+add_executable(test_spatial_canvas
+    tests/test_spatial_canvas.cpp
+    src/spatial_canvas.cpp
+)
+
+target_include_directories(test_spatial_canvas PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_compile_definitions(test_spatial_canvas PRIVATE
     _CRT_SECURE_NO_WARNINGS
 )
