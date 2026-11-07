@@ -1,0 +1,20 @@
+[package]
+name = "vxr-discovery"
+version = "0.1.0"
+edition = "2021"
+authors = ["Project VXR Team"]
+description = "mDNS local discovery, PIN-based pairing handshake, and Wi-Fi Direct P2P helper for Project VXR"
+
+[dependencies]
+vxr-protocol = { path = "../vxr-protocol" }
+sha2 = "0.10"
+hmac = "0.12"
+rand = "0.8"
+socket2 = { version = "0.5", features = ["all"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+log = "0.4"
+
+[dev-dependencies]
+env_logger = "0.11"

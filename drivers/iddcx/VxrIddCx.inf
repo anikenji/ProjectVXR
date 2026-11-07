@@ -1,0 +1,64 @@
+;
+; VxrIddCx.inf - Windows UMDF v2 Indirect Display Driver for Project VXR
+;
+
+[Version]
+Signature = "$Windows NT$"
+Class = Display
+ClassGuid = {4D36E968-E325-11CE-BFC1-08002BE10318}
+Provider = %ManufacturerName%
+CatalogFile = VxrIddCx.cat
+DriverVer = 01/01/2026,1.0.0.0
+PnpLockdown = 1
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceName% = VxrIddCx_Install, Root\VXR\VDA
+
+[SourceDisksFiles]
+VxrIddCx.dll = 1
+
+[SourceDisksNames]
+1 = %DiskName%
+
+; =================== Installation ===================
+
+[VxrIddCx_Install.NT]
+CopyFiles = UMDriverCopy
+
+[UMDriverCopy]
+VxrIddCx.dll
+
+[VxrIddCx_Install.NT.hw]
+AddReg = VxrIddCx_DeviceSettings
+
+[VxrIddCx_DeviceSettings]
+HKR,, "UpperFilters", 0x00010000, "IndirectKmd"
+HKR, "WUDF", "DeviceGroupId", 0x00000000, "VxrDriverGroup"
+HKR,, "Security",, "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;WD)"
+
+[VxrIddCx_Install.NT.Services]
+AddService = WUDFRd, 0x000001fa, WUDFRd_ServiceInstall
+
+[WUDFRd_ServiceInstall]
+DisplayName = %WudfRdDisplayName%
+ServiceType = 1
+StartType = 3
+ErrorControl = 1
+ServiceBinary = %12%\WUDFRd.sys
+
+[VxrIddCx_Install.NT.Wdf]
+UmdfService = VxrIddCx, VxrIddCx_Install
+UmdfServiceOrder = VxrIddCx
+
+[VxrIddCx_Install]
+UmdfLibraryVersion = 2.25.0
+ServiceBinary = %12%\UMDF\VxrIddCx.dll
+
+[Strings]
+ManufacturerName = "Project VXR"
+DiskName = "Project VXR IDDCX Installation Disk"
+DeviceName = "Project VXR Virtual Display Adapter"
+WudfRdDisplayName = "Windows Driver Foundation - User-mode Driver Framework Reflector"
