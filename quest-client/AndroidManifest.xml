@@ -1,29 +1,55 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.projectvxr.client"
-    android:versionCode="2"
-    android:versionName="0.2.0">
+    android:versionCode="3"
+    android:versionName="0.3.0">
 
-    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34" />
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="32" />
 
-    <!-- Meta Quest VR & Hardware Features (non-blocking so simulators/panels also work) -->
+    <!-- Meta Quest VR & Hardware Features -->
     <uses-feature android:name="android.hardware.vr.headtracking" android:required="false" android:version="1" />
     <uses-feature android:name="oculus.software.handtracking" android:required="false" />
     <uses-feature android:name="com.oculus.feature.PASSTHROUGH" android:required="false" />
+    <uses-feature android:name="com.oculus.feature.RENDER_MODEL" android:required="false" />
+    <uses-feature android:name="com.oculus.feature.VIRTUAL_KEYBOARD" android:required="false" />
+    <uses-feature android:name="com.oculus. experimental.enabled" android:required="false" />
+    <uses-feature android:name="oculus.software.trackedkeyboard" android:required="false" />
+    <uses-feature android:name="com.oculus.software.body_tracking" android:required="false" />
+    <uses-feature android:name="oculus.software.eye_tracking" android:required="false" />
+    <uses-feature android:name="oculus.software.face_tracking" android:required="false" />
     <uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="false" />
 
-    <!-- Permissions -->
+    <!-- Network & Audio Permissions -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!-- Storage Read & Write Permissions (VIDEOS tab local playback, downloads & screenshot sync) -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+
+    <!-- Meta Quest / Oculus OpenXR Runtime Permissions (Controller Render Models, Hand/Body Tracking, Desk Portal) -->
+    <uses-permission android:name="com.oculus.permission.RENDER_MODEL" />
+    <uses-permission android:name="com.oculus.permission.HAND_TRACKING" />
+    <uses-permission android:name="com.oculus.permission.USE_SCENE" />
+    <uses-permission android:name="com.oculus.permission.BOUNDARY_VISIBILITY" />
+    <uses-permission android:name="com.oculus.permission.BODY_TRACKING" />
+    <uses-permission android:name="com.oculus.permission.EYE_TRACKING" />
+    <uses-permission android:name="com.oculus.permission.FACE_TRACKING" />
 
     <application
         android:label="Project VXR"
         android:icon="@drawable/ic_launcher"
         android:banner="@drawable/ic_banner"
+        android:requestLegacyExternalStorage="true"
         android:hasCode="false"
         android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
 

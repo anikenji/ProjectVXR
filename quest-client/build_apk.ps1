@@ -50,7 +50,7 @@ if ($LASTEXITCODE -ne 0) { throw "aapt2 compile failed." }
 
 $manifest = Join-Path $root "AndroidManifest.xml"
 $unalignedApk = Join-Path $buildDir "unaligned.apk"
-& $aapt2 link -I $androidJar --manifest $manifest -R $resZip -A (Join-Path $apkRoot "assets") -o $unalignedApk --min-sdk-version 29 --target-sdk-version 34
+& $aapt2 link -I $androidJar --manifest $manifest -R $resZip -A (Join-Path $apkRoot "assets") -o $unalignedApk --min-sdk-version 29 --target-sdk-version 32
 if ($LASTEXITCODE -ne 0) { throw "aapt2 link failed." }
 
 # 3. Add ARM64 shared library into APK archive
