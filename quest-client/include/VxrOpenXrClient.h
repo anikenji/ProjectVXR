@@ -58,6 +58,9 @@ public:
     VxrOpenXrClient();
     ~VxrOpenXrClient();
 
+    /// Sets the Android JavaVM* and NativeActivity jobject before Initialize()
+    void SetAndroidAppContext(void* javaVm, void* activityClazz);
+
     bool Initialize(const OpenXrClientConfig& config);
     void Cleanup();
 
@@ -78,6 +81,13 @@ public:
 
     /// Locates head views for both eyes at predicted display time
     bool LocateViews(uint64_t display_time_ns, XrEyeView out_views[2]);
+
+    /// Uploads the 1280x800 RGBA8888 composited UI/Desktop frame into the OpenXR Quad Swapchain
+    void SubmitQuadSwapchainRgba(const uint32_t* rgbaPixels,
+                                 uint32_t width,
+                                 uint32_t height,
+                                 float screenDistM = 2.0f,
+                                 float screenScale = 1.25f);
 
     /// Submits rendered layers to OpenXR compositor (xrEndFrame)
     bool EndFrame(uint64_t display_time_ns);
@@ -104,26 +114,63 @@ public:
 
     OpenXrSessionState GetSessionState() const { return m_sessionState; }
     bool IsSessionRunning() const { return m_sessionRunning; }
+    bool IsRealRuntimeActive() const { return m_realXrActive; }
     bool IsFocused() const { return m_sessionState == OpenXrSessionState::Focused; }
     bool IsSpaceWarpEnabled() const { return m_config.enable_space_warp_ssw; }
     uint32_t GetRefreshRate() const { return m_config.display_refresh_rate; }
     uint64_t GetFrameIndex() const { return m_frameIndex; }
-    bool IsLoaderPresent() const { return m_loaderHandle != nullptr; }
+    bool IsLoaderPresent() const { return m_loaderHandle != nullptr || m_realXrActive; }
 
 private:
+    void PollXrEvents();
+
     OpenXrClientConfig m_config;
     bool m_initialized;
     bool m_sessionRunning;
+    bool m_realXrActive;
+    bool m_shouldRenderFrame;
     OpenXrSessionState m_sessionState;
     uint64_t m_frameIndex;
+    uint64_t m_lastPredictedDisplayTimeNs;
 
-    void* m_loaderHandle;        // dlopen("libopenxr_loader.so")
-    void* m_pfnGetInstanceProcAddr; // PFN_xrGetInstanceProcAddr
-    void* m_instance;            // XrInstance
-    void* m_systemId;            // XrSystemId
-    void* m_session;             // XrSession
-    void* m_localSpace;          // XrSpace
+    void* m_javaVm;
+    void* m_activityClazz;
+    void* m_loaderHandle;
+    void* m_pfnGetInstanceProcAddr;
+    void* m_instance;
+    void* m_systemId;
+    void* m_session;
+    void* m_localSpace;
+    void* m_viewSpace;
 
+    // EGL / GLES3 context & OpenXR swapchain state (used on Android OpenXR)
+    void* m_eglDisplay;
+    void* m_eglConfig;
+    void* m_eglContext;
+    void* m_eglSurface;
+    void* m_quadSwapchain;
+    void* m_skySwapchain;
+    std::vector<uint32_t> m_quadSwapchainTexIds;
+    std::vector<uint32_t> m_skySwapchainTexIds;
+    std::vector<uint32_t> m_flippedUploadBuffer;
+    float m_quadDistM;
+    float m_quadWidthM;
+    float m_quadHeightM;
+
+    // OpenXR Action Set & Touch Controller handles
+    void* m_actionSet;
+    void* m_aimPoseAction;
+    void* m_triggerAction;
+    void* m_squeezeAction;
+    void* m_thumbstickAction;
+    void* m_buttonAAction;
+    void* m_buttonBAction;
+    void* m_menuAction;
+    void* m_rightAimSpace;
+    void* m_leftAimSpace;
+    uint64_t m_handPaths[2];
+
+    XrEyeView m_cachedViews[2];
     XrControllerInputState m_controllerState;
 };
 

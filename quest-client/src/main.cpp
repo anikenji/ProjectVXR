@@ -24,22 +24,22 @@ static void HandleAppCmd(struct android_app* app, int32_t cmd) {
     switch (cmd) {
         case APP_CMD_INIT_WINDOW:
             if (app->window != nullptr) {
-                ANativeWindow_setBuffersGeometry(app->window, 1280, 800, WINDOW_FORMAT_RGBA_8888);
+                if (!ctx->questApp.GetOpenXr().IsRealRuntimeActive()) {
+                    ANativeWindow_setBuffersGeometry(app->window, 1280, 800, WINDOW_FORMAT_RGBA_8888);
+                }
                 ctx->windowWidth = ANativeWindow_getWidth(app->window);
                 ctx->windowHeight = ANativeWindow_getHeight(app->window);
                 if (ctx->windowWidth <= 0) ctx->windowWidth = 1280;
                 if (ctx->windowHeight <= 0) ctx->windowHeight = 800;
                 ctx->windowReady = true;
                 __android_log_print(ANDROID_LOG_INFO, "VXR-Client",
-                    "APP_CMD_INIT_WINDOW ready: surface configured to 1280x800 RGBA_8888");
+                    "APP_CMD_INIT_WINDOW ready (RealOpenXR=%d)",
+                    ctx->questApp.GetOpenXr().IsRealRuntimeActive() ? 1 : 0);
             }
             break;
 
         case APP_CMD_TERM_WINDOW:
-        case APP_CMD_LOST_FOCUS:
-            if (cmd == APP_CMD_TERM_WINDOW) {
-                ctx->windowReady = false;
-            }
+            ctx->windowReady = false;
             break;
 
         default:
@@ -119,16 +119,15 @@ static void PresentRgbaToNativeWindow(ANativeWindow* window, const uint32_t* src
 
 void android_main(struct android_app* app) {
     __android_log_print(ANDROID_LOG_INFO, "VXR-Client",
-        "Starting Project VXR NativeActivity (OpenXR + Vulkan 1.3 + 7-Tab VR Menu)...");
+        "Starting Project VXR NativeActivity (Real OpenXR + 7-Tab VR Menu + Live Desktop Streamer)...");
 
     AndroidAppContext ctx;
     app->userData = &ctx;
     app->onAppCmd = HandleAppCmd;
     app->onInputEvent = HandleInputEvent;
 
-    if (app->window != nullptr) {
-        ANativeWindow_setBuffersGeometry(app->window, 1280, 800, WINDOW_FORMAT_RGBA_8888);
-        ctx.windowReady = true;
+    if (app->activity != nullptr) {
+        ctx.questApp.GetOpenXr().SetAndroidAppContext(app->activity->vm, app->activity->clazz);
     }
 
     vxr::QuestAppConfig config;
@@ -167,14 +166,15 @@ void android_main(struct android_app* app) {
 
         ctx.questApp.RunFrame();
 
-        if (ctx.windowReady && app->window != nullptr) {
-            uint32_t fw = 0, fh = 0;
-            const uint32_t* rgba = ctx.questApp.GetCompositedRgbaFrame(&fw, &fh);
-            PresentRgbaToNativeWindow(app->window, rgba, fw, fh);
+        // If running on a non-VR 2D device where OpenXR runtime wasn't active, present directly to ANativeWindow
+        if (!ctx.questApp.GetOpenXr().IsRealRuntimeActive()) {
+            if (ctx.windowReady && app->window != nullptr) {
+                uint32_t fw = 0, fh = 0;
+                const uint32_t* rgba = ctx.questApp.GetCompositedRgbaFrame(&fw, &fh);
+                PresentRgbaToNativeWindow(app->window, rgba, fw, fh);
+            }
+            usleep(11000);
         }
-
-        // Pace loop at ~90 Hz (11 ms)
-        usleep(11000);
     }
 
     ctx.questApp.Shutdown();

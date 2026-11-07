@@ -36,6 +36,9 @@ if ($LASTEXITCODE -ne 0) { throw "CMake NDK compilation failed." }
 $soSource = Join-Path $buildDir "libvxr_quest_client.so"
 Copy-Item $soSource -Destination $libDir -Force
 
+$openxrLoaderSource = Join-Path $root "third_party\openxr\prefab\modules\openxr_loader\libs\android.arm64-v8a\libopenxr_loader.so"
+Copy-Item $openxrLoaderSource -Destination $libDir -Force
+
 # 2. Compile res/ (ic_launcher & ic_banner), AndroidManifest.xml, and SPIR-V Shader Assets into base APK
 Write-Host ">>> [2/5] Compiling resources, AndroidManifest.xml & SPIR-V Shaders via aapt2..." -ForegroundColor Yellow
 $assetsDir = Join-Path $apkRoot "assets\shaders"
@@ -53,10 +56,10 @@ $unalignedApk = Join-Path $buildDir "unaligned.apk"
 & $aapt2 link -I $androidJar --manifest $manifest -R $resZip -A (Join-Path $apkRoot "assets") -o $unalignedApk --min-sdk-version 29 --target-sdk-version 32
 if ($LASTEXITCODE -ne 0) { throw "aapt2 link failed." }
 
-# 3. Add ARM64 shared library into APK archive
-Write-Host ">>> [3/5] Packaging lib/arm64-v8a into APK..." -ForegroundColor Yellow
+# 3. Add ARM64 shared libraries (libvxr_quest_client.so & libopenxr_loader.so) into APK archive
+Write-Host ">>> [3/5] Packaging lib/arm64-v8a (libvxr_quest_client.so + libopenxr_loader.so) into APK..." -ForegroundColor Yellow
 Push-Location $apkRoot
-& jar -u -f $unalignedApk -0 "lib/arm64-v8a/libvxr_quest_client.so"
+& jar -u -f $unalignedApk -0 "lib/arm64-v8a/libvxr_quest_client.so" "lib/arm64-v8a/libopenxr_loader.so"
 Pop-Location
 
 # 4. 4-byte page-align APK for direct mmap execution

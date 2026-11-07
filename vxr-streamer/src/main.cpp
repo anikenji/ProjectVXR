@@ -110,6 +110,24 @@ struct VxrControlClientSettingsPacket {
     uint8_t  reserved[2];
 };
 
+// Unified 36-byte Client Control Packet sent by VxrClientNetwork.cpp (Quest Client)
+struct VxrClientControlPacket {
+    uint32_t magic;          // 0x56585243 ("VXRC")
+    uint8_t  cmd_type;       // 1..5
+    uint8_t  button_mask;    // bit0=Left, bit1=Right, bit2=Middle
+    int16_t  wheel_delta;
+    float    cursor_norm_x;
+    float    cursor_norm_y;
+    uint32_t bitrate_mbps;
+    uint32_t fps;
+    uint32_t render_width;
+    uint32_t render_height;
+    uint8_t  quality_index;
+    uint8_t  ssw_mode;
+    uint8_t  sharpening_pct;
+    uint8_t  flags;          // bit0=SGSR, bit1=passthrough_env, bit2=passthrough_hands, bit3=color_vibrance
+};
+
 struct VxrHostInfoPacket {
     uint32_t magic;          // 0x56585248 ("VXRH")
     uint16_t udp_port;
@@ -991,6 +1009,8 @@ static void HostServiceThreadProc() {
 
         g_svc.mdnsSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (g_svc.mdnsSocket != INVALID_SOCKET) {
+            BOOL bcast = TRUE;
+            setsockopt(g_svc.mdnsSocket, SOL_SOCKET, SO_BROADCAST, (const char*)&bcast, sizeof(bcast));
             u_long nonBlock = 1;
             ioctlsocket(g_svc.mdnsSocket, FIONBIO, &nonBlock);
             g_svc.mdnsListening = true;
@@ -1006,12 +1026,46 @@ static void HostServiceThreadProc() {
     mdnsAddr.sin_port = htons(5353);
     inet_pton(AF_INET, "224.0.0.251", &mdnsAddr.sin_addr);
 
+    sockaddr_in mdnsBroadcastAddr = {};
+    mdnsBroadcastAddr.sin_family = AF_INET;
+    mdnsBroadcastAddr.sin_port = htons(5353);
+    mdnsBroadcastAddr.sin_addr.s_addr = INADDR_BROADCAST;
+
+    wchar_t hostCompNameW[MAX_COMPUTERNAME_LENGTH + 1] = L"VXR-PC";
+    DWORD hostCompLen = MAX_COMPUTERNAME_LENGTH + 1;
+    GetComputerNameW(hostCompNameW, &hostCompLen);
+    std::string hostCompUtf8 = WideToUtf8(hostCompNameW);
+
     vxr::DxgiDuplicator dxgiDupl;
     uint32_t currentOutputIdx = 0;
     bool capInit = (dxgiDupl.Initialize(0, currentOutputIdx) == VXR_CAPTURE_OK);
 
     sockaddr_in lastActiveClient = {};
     bool hasActiveClient = false;
+    uint8_t prevClientMouseMask = 0;
+
+    // Real-time GDI Live Desktop Downscaler resources (640x400 RGB565 RLE strips -> 1280x800 on Quest)
+    const int kLiveW = 640;
+    const int kLiveH = 400;
+    const int kStripCount = 10;
+    const int kStripH = kLiveH / kStripCount; // 40 rows per strip
+    HDC hScreenDC = GetDC(nullptr);
+    HDC hCaptureDC = CreateCompatibleDC(hScreenDC);
+    BITMAPINFO bmiLive = {};
+    bmiLive.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmiLive.bmiHeader.biWidth = kLiveW;
+    bmiLive.bmiHeader.biHeight = -kLiveH; // top-down
+    bmiLive.bmiHeader.biPlanes = 1;
+    bmiLive.bmiHeader.biBitCount = 32;
+    bmiLive.bmiHeader.biCompression = BI_RGB;
+    void* pLiveBits = nullptr;
+    HBITMAP hLiveBmp = CreateDIBSection(hCaptureDC, &bmiLive, DIB_RGB_COLORS, &pLiveBits, nullptr, 0);
+    HGDIOBJ hOldBmp = hLiveBmp ? SelectObject(hCaptureDC, hLiveBmp) : nullptr;
+    SetStretchBltMode(hCaptureDC, HALFTONE);
+    SetBrushOrgEx(hCaptureDC, 0, 0, nullptr);
+    uint32_t liveStripIdx = 0;
+    uint32_t liveFrameSeq = 1;
+    ULONGLONG lastGdiCaptureTick = 0;
 
     ULONGLONG lastBeaconTick = 0;
     while (!g_svc.stopRequested) {
@@ -1032,10 +1086,11 @@ static void HostServiceThreadProc() {
             ShowToast(monMsg);
         }
 
-        if (g_svc.mdnsListening && (now - lastBeaconTick >= 2000)) {
+        if (g_svc.mdnsListening && (now - lastBeaconTick >= 1500)) {
             lastBeaconTick = now;
-            std::string beacon = "VXR_MDNS_BEACON:_vxr._udp.local.;user=" + WideToUtf8(g_cfg.metaAccount) + ";port=38810";
+            std::string beacon = "VXR_MDNS_BEACON:_vxr._udp.local.;host=" + hostCompUtf8 + ";user=" + WideToUtf8(g_cfg.metaAccount) + ";port=38810";
             sendto(g_svc.mdnsSocket, beacon.data(), (int)beacon.size(), 0, (sockaddr*)&mdnsAddr, sizeof(mdnsAddr));
+            sendto(g_svc.mdnsSocket, beacon.data(), (int)beacon.size(), 0, (sockaddr*)&mdnsBroadcastAddr, sizeof(mdnsBroadcastAddr));
             g_svc.mdnsBeaconsSent++;
         }
 
@@ -1112,47 +1167,76 @@ static void HostServiceThreadProc() {
                                    (sockaddr*)&clientAddr, clientLen);
                             ShowToast(L"Headset connected: " + clientHeadset);
                         }
-                        else if (cmd == VXR_CMD_MOUSE_INPUT && r >= (int)sizeof(VxrControlMouseInputPacket)) {
-                            const VxrControlMouseInputPacket* mp = reinterpret_cast<const VxrControlMouseInputPacket*>(rxBuf);
-                            float nx = (std::max)(0.0f, (std::min)(1.0f, mp->norm_x));
-                            float ny = (std::max)(0.0f, (std::min)(1.0f, mp->norm_y));
+                        else if (cmd == VXR_CMD_MOUSE_INPUT) {
+                            float nx = 0.5f, ny = 0.5f;
+                            DWORD btnFlags = 0;
+                            int16_t scrollDy = 0;
+                            int16_t scrollDx = 0;
+
+                            if (r == (int)sizeof(VxrClientControlPacket)) {
+                                const VxrClientControlPacket* cp = reinterpret_cast<const VxrClientControlPacket*>(rxBuf);
+                                nx = (std::max)(0.0f, (std::min)(1.0f, cp->cursor_norm_x));
+                                ny = (std::max)(0.0f, (std::min)(1.0f, cp->cursor_norm_y));
+                                uint8_t curMask = cp->button_mask;
+                                uint8_t changed = curMask ^ prevClientMouseMask;
+                                if (changed & 0x01) btnFlags |= (curMask & 0x01) ? MOUSEEVENTF_LEFTDOWN   : MOUSEEVENTF_LEFTUP;
+                                if (changed & 0x02) btnFlags |= (curMask & 0x02) ? MOUSEEVENTF_RIGHTDOWN  : MOUSEEVENTF_RIGHTUP;
+                                if (changed & 0x04) btnFlags |= (curMask & 0x04) ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP;
+                                prevClientMouseMask = curMask;
+                                scrollDy = cp->wheel_delta;
+                            } else if (r >= (int)sizeof(VxrControlMouseInputPacket)) {
+                                const VxrControlMouseInputPacket* mp = reinterpret_cast<const VxrControlMouseInputPacket*>(rxBuf);
+                                nx = (std::max)(0.0f, (std::min)(1.0f, mp->norm_x));
+                                ny = (std::max)(0.0f, (std::min)(1.0f, mp->norm_y));
+                                if (mp->button_flags & VXR_MOUSE_LEFT_DOWN)   btnFlags |= MOUSEEVENTF_LEFTDOWN;
+                                if (mp->button_flags & VXR_MOUSE_LEFT_UP)     btnFlags |= MOUSEEVENTF_LEFTUP;
+                                if (mp->button_flags & VXR_MOUSE_RIGHT_DOWN)  btnFlags |= MOUSEEVENTF_RIGHTDOWN;
+                                if (mp->button_flags & VXR_MOUSE_RIGHT_UP)    btnFlags |= MOUSEEVENTF_RIGHTUP;
+                                if (mp->button_flags & VXR_MOUSE_MIDDLE_DOWN) btnFlags |= MOUSEEVENTF_MIDDLEDOWN;
+                                if (mp->button_flags & VXR_MOUSE_MIDDLE_UP)   btnFlags |= MOUSEEVENTF_MIDDLEUP;
+                                scrollDy = mp->scroll_dy;
+                                scrollDx = mp->scroll_dx;
+                            }
 
                             INPUT inputs[4] = {};
                             int inputCount = 0;
 
-                            // 1. Absolute normalized cursor move (0..65535)
                             inputs[inputCount].type = INPUT_MOUSE;
                             inputs[inputCount].mi.dx = (LONG)(nx * 65535.0f);
                             inputs[inputCount].mi.dy = (LONG)(ny * 65535.0f);
-                            inputs[inputCount].mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
-                            if (mp->button_flags & VXR_MOUSE_LEFT_DOWN)   inputs[inputCount].mi.dwFlags |= MOUSEEVENTF_LEFTDOWN;
-                            if (mp->button_flags & VXR_MOUSE_LEFT_UP)     inputs[inputCount].mi.dwFlags |= MOUSEEVENTF_LEFTUP;
-                            if (mp->button_flags & VXR_MOUSE_RIGHT_DOWN)  inputs[inputCount].mi.dwFlags |= MOUSEEVENTF_RIGHTDOWN;
-                            if (mp->button_flags & VXR_MOUSE_RIGHT_UP)    inputs[inputCount].mi.dwFlags |= MOUSEEVENTF_RIGHTUP;
-                            if (mp->button_flags & VXR_MOUSE_MIDDLE_DOWN) inputs[inputCount].mi.dwFlags |= MOUSEEVENTF_MIDDLEDOWN;
-                            if (mp->button_flags & VXR_MOUSE_MIDDLE_UP)   inputs[inputCount].mi.dwFlags |= MOUSEEVENTF_MIDDLEUP;
+                            inputs[inputCount].mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | btnFlags;
                             inputCount++;
 
-                            // 2. Vertical scroll wheel
-                            if (mp->scroll_dy != 0) {
+                            if (scrollDy != 0) {
                                 inputs[inputCount].type = INPUT_MOUSE;
-                                inputs[inputCount].mi.mouseData = (DWORD)(int32_t)mp->scroll_dy;
+                                inputs[inputCount].mi.mouseData = (DWORD)(int32_t)scrollDy;
                                 inputs[inputCount].mi.dwFlags = MOUSEEVENTF_WHEEL;
                                 inputCount++;
                             }
-
-                            // 3. Horizontal scroll wheel
-                            if (mp->scroll_dx != 0) {
+                            if (scrollDx != 0) {
                                 inputs[inputCount].type = INPUT_MOUSE;
-                                inputs[inputCount].mi.mouseData = (DWORD)(int32_t)mp->scroll_dx;
+                                inputs[inputCount].mi.mouseData = (DWORD)(int32_t)scrollDx;
                                 inputs[inputCount].mi.dwFlags = MOUSEEVENTF_HWHEEL;
                                 inputCount++;
                             }
 
                             SendInput((UINT)inputCount, inputs, sizeof(INPUT));
                         }
-                        else if (cmd == VXR_CMD_CLIENT_SETTINGS && r >= (int)sizeof(VxrControlClientSettingsPacket)) {
+                        else if (cmd == VXR_CMD_CLIENT_SETTINGS && (r == (int)sizeof(VxrClientControlPacket) || r >= (int)sizeof(VxrControlClientSettingsPacket))) {
+                            VxrControlClientSettingsPacket synthSp = {};
                             const VxrControlClientSettingsPacket* sp = reinterpret_cast<const VxrControlClientSettingsPacket*>(rxBuf);
+                            if (r == (int)sizeof(VxrClientControlPacket)) {
+                                const VxrClientControlPacket* cp = reinterpret_cast<const VxrClientControlPacket*>(rxBuf);
+                                synthSp.desktop_bitrate_mbps = (uint16_t)cp->bitrate_mbps;
+                                synthSp.vr_bitrate_mbps      = (uint16_t)cp->bitrate_mbps;
+                                synthSp.vr_graphics_quality  = cp->quality_index;
+                                synthSp.vr_fps               = (uint8_t)cp->fps;
+                                synthSp.sharpening_pct       = cp->sharpening_pct;
+                                synthSp.ssw_mode             = cp->ssw_mode;
+                                synthSp.enable_sgsr          = (cp->flags & 0x01) ? 1 : 0;
+                                synthSp.passthrough_mask     = (cp->flags >> 1) & 0x07;
+                                sp = &synthSp;
+                            }
 
                             // Map VR Graphics Quality (0=Potato..5=Godlike) to renderResolution %
                             static const int kQualityToResPct[6] = { 65, 75, 88, 100, 120, 145 };
@@ -1284,8 +1368,106 @@ static void HostServiceThreadProc() {
             }
         }
 
+        // Real Live GDI Desktop Capture & RLE-RGB565 Strip Streamer (codec_id = 0x55)
+        // Guarantees 100% real visual desktop streaming to Meta Quest on all GPUs
+        if (hasActiveClient && hCaptureDC && pLiveBits) {
+            int scrW = (std::max)(1, GetSystemMetrics(SM_CXSCREEN));
+            int scrH = (std::max)(1, GetSystemMetrics(SM_CYSCREEN));
+            if (liveStripIdx == 0 || (now - lastGdiCaptureTick >= 30)) {
+                lastGdiCaptureTick = now;
+                BitBlt(hCaptureDC, 0, 0, 1, 1, hScreenDC, 0, 0, SRCCOPY);
+                StretchBlt(hCaptureDC, 0, 0, kLiveW, kLiveH, hScreenDC, 0, 0, scrW, scrH, SRCCOPY);
+            }
+
+            POINT curPt = { 0, 0 };
+            BOOL curOk = GetCursorPos(&curPt);
+            float normX = (std::max)(0.0f, (std::min)(1.0f, (float)curPt.x / (float)scrW));
+            float normY = (std::max)(0.0f, (std::min)(1.0f, (float)curPt.y / (float)scrH));
+
+            // Send 2 strips per tick (~180 strips/sec = 18 full desktop frames/sec with low UDP bandwidth)
+            for (int s = 0; s < 2; ++s) {
+                uint16_t y0 = (uint16_t)(liveStripIdx * kStripH);
+                uint16_t hRows = (uint16_t)kStripH;
+                const uint32_t* bgraBase = reinterpret_cast<const uint32_t*>(pLiveBits) + (size_t)y0 * kLiveW;
+                size_t totalPixels = (size_t)kLiveW * hRows;
+
+                // Encode strip header (8 bytes): [magic='V','X', width=640, y0, hRows] + RLE RGB565 stream
+                std::vector<uint8_t> rlePayload;
+                rlePayload.reserve(totalPixels * 2 + 16);
+                uint16_t w16 = (uint16_t)kLiveW;
+                rlePayload.push_back('V');
+                rlePayload.push_back('X');
+                rlePayload.push_back((uint8_t)(w16 & 0xFF));
+                rlePayload.push_back((uint8_t)(w16 >> 8));
+                rlePayload.push_back((uint8_t)(y0 & 0xFF));
+                rlePayload.push_back((uint8_t)(y0 >> 8));
+                rlePayload.push_back((uint8_t)(hRows & 0xFF));
+                rlePayload.push_back((uint8_t)(hRows >> 8));
+
+                auto toRgb565 = [](uint32_t bgra) -> uint16_t {
+                    uint32_t b = (bgra >> 0) & 0xFFu;
+                    uint32_t g = (bgra >> 8) & 0xFFu;
+                    uint32_t r = (bgra >> 16) & 0xFFu;
+                    // Quantize slightly to boost RLE compression ratio on desktop gradients
+                    return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+                };
+
+                size_t idx = 0;
+                while (idx < totalPixels) {
+                    uint16_t c0 = toRgb565(bgraBase[idx]);
+                    uint8_t runLen = 1;
+                    while (idx + runLen < totalPixels && runLen < 255 && toRgb565(bgraBase[idx + runLen]) == c0) {
+                        runLen++;
+                    }
+                    rlePayload.push_back(runLen);
+                    rlePayload.push_back((uint8_t)(c0 & 0xFF));
+                    rlePayload.push_back((uint8_t)(c0 >> 8));
+                    idx += runLen;
+                }
+
+                const size_t kMaxChunk = 1200;
+                uint16_t fragCount = (uint16_t)((rlePayload.size() + kMaxChunk - 1) / kMaxChunk);
+                if (fragCount == 0) fragCount = 1;
+
+                uint8_t pktBuf[sizeof(VxrUdpVideoFragmentHeader) + 1200];
+                for (uint16_t fragIdx = 0; fragIdx < fragCount; ++fragIdx) {
+                    size_t off = (size_t)fragIdx * kMaxChunk;
+                    size_t rem = rlePayload.size() - off;
+                    uint16_t chunkLen = (uint16_t)((rem > kMaxChunk) ? kMaxChunk : rem);
+
+                    VxrUdpVideoFragmentHeader hdr = {};
+                    hdr.magic          = VXR_UDP_VIDEO_MAGIC;
+                    hdr.frame_id       = liveFrameSeq;
+                    hdr.frag_idx       = fragIdx;
+                    hdr.frag_count     = fragCount;
+                    hdr.flags          = 0x01;
+                    hdr.codec_id       = 0x55; // VXR Live RLE-RGB565 Desktop Strip
+                    hdr.payload_len    = chunkLen;
+                    hdr.pts_us         = now * 1000ULL;
+                    hdr.cursor_norm_x  = normX;
+                    hdr.cursor_norm_y  = normY;
+                    hdr.cursor_visible = curOk ? 1 : 0;
+
+                    memcpy(pktBuf, &hdr, sizeof(hdr));
+                    memcpy(pktBuf + sizeof(hdr), rlePayload.data() + off, chunkLen);
+
+                    sendto(g_svc.udpSocket, reinterpret_cast<const char*>(pktBuf),
+                           (int)(sizeof(hdr) + chunkLen), 0,
+                           (sockaddr*)&lastActiveClient, sizeof(lastActiveClient));
+                }
+
+                liveFrameSeq++;
+                liveStripIdx = (liveStripIdx + 1) % kStripCount;
+            }
+        }
+
         Sleep(11); // ~90 fps tick rate
     }
+
+    if (hOldBmp && hCaptureDC) SelectObject(hCaptureDC, hOldBmp);
+    if (hLiveBmp) DeleteObject(hLiveBmp);
+    if (hCaptureDC) DeleteDC(hCaptureDC);
+    if (hScreenDC) ReleaseDC(nullptr, hScreenDC);
 
     if (capInit) {
         dxgiDupl.Cleanup();

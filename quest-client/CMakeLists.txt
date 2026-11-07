@@ -22,9 +22,12 @@ set(CLIENT_SOURCES
 )
 
 if(ANDROID)
-    # Android NDK NativeActivity build
-    include_directories(${ANDROID_NDK}/sources/android/native_app_glue)
-    
+    # Android NDK NativeActivity build with Khronos OpenXR Loader & EGL/GLES3
+    include_directories(
+        ${ANDROID_NDK}/sources/android/native_app_glue
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/openxr/prefab/modules/headers/include
+    )
+
     add_library(vxr_quest_client SHARED
         ${CLIENT_SOURCES}
         ${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c
@@ -32,6 +35,8 @@ if(ANDROID)
 
     target_compile_definitions(vxr_quest_client PRIVATE
         ANDROID
+        XR_USE_PLATFORM_ANDROID
+        XR_USE_GRAPHICS_API_OPENGL_ES
     )
 
     target_link_libraries(vxr_quest_client PUBLIC
@@ -39,7 +44,10 @@ if(ANDROID)
         log
         mediandk
         vulkan
+        EGL
+        GLESv3
         dl
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/openxr/prefab/modules/openxr_loader/libs/android.arm64-v8a/libopenxr_loader.so
     )
 
 else()

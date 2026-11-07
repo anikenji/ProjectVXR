@@ -90,6 +90,8 @@ bool VxrClientNetwork::Initialize(uint16_t streamPort, uint16_t mdnsPort) {
     if (udpSock != VXR_INVALID_SOCK) {
         int reuse = 1;
         setsockopt(udpSock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+        int bcast = 1;
+        setsockopt(udpSock, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&bcast), sizeof(bcast));
         int rcvBuf = 8 * 1024 * 1024;
         setsockopt(udpSock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvBuf), sizeof(rcvBuf));
         SetSocketNonBlocking(udpSock);
@@ -98,8 +100,6 @@ bool VxrClientNetwork::Initialize(uint16_t streamPort, uint16_t mdnsPort) {
         bindAddr.sin_family = AF_INET;
         bindAddr.sin_port = htons(m_streamPort);
         bindAddr.sin_addr.s_addr = htonl(INADDR_ANY);
-        // Bind to streamPort; if already bound by local host streamer on the same machine,
-        // fall back to ephemeral port so local client-to-host tests work seamlessly.
         if (bind(udpSock, reinterpret_cast<sockaddr*>(&bindAddr), sizeof(bindAddr)) != 0) {
             bindAddr.sin_port = htons(0);
             bind(udpSock, reinterpret_cast<sockaddr*>(&bindAddr), sizeof(bindAddr));
@@ -196,7 +196,6 @@ bool VxrClientNetwork::ReassembleFrame(const uint8_t* packetData, size_t packetL
             // Multi-fragment frame reassembly
             auto it = m_pendingFrames.find(frameId);
             if (it == m_pendingFrames.end()) {
-                // Keep at most 8 concurrent incomplete frame assemblies
                 while (m_pendingFrameOrder.size() >= 8) {
                     uint32_t oldestId = m_pendingFrameOrder.front();
                     m_pendingFrameOrder.erase(m_pendingFrameOrder.begin());
@@ -323,13 +322,53 @@ bool VxrClientNetwork::PollNetwork(ReassembledVideoFrame* outFrame) {
             break;
         }
 
+        char senderIp[64] = {};
+        inet_ntop(AF_INET, &fromAddr.sin_addr, senderIp, sizeof(senderIp));
+
+        if (r >= 4) {
+            uint32_t magic = 0;
+            std::memcpy(&magic, rxBuf, 4);
+            // VXR_HOST_INFO_MAGIC = 0x56585248 ("VXRH")
+            if (magic == 0x56585248u) {
+                m_connected = true;
+                if (senderIp[0] != '\0') {
+                    m_connectedHostIp = senderIp;
+                }
+                if (r >= 80) {
+                    char compName[65] = {};
+                    std::memcpy(compName, rxBuf + 16, 64);
+                    DiscoveredHostInfo hInfo = {};
+                    hInfo.ip_address = m_connectedHostIp;
+                    hInfo.computer_name = (compName[0] != '\0') ? compName : "VXR-PC";
+                    hInfo.port = m_connectedHostPort;
+                    hInfo.ping_ms = 2;
+                    bool found = false;
+                    for (auto& ex : m_discoveredHosts) {
+                        if (ex.ip_address == hInfo.ip_address) {
+                            ex = hInfo;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) m_discoveredHosts.push_back(hInfo);
+                }
+                continue;
+            }
+        }
+
         if (r >= 10 && std::memcmp(rxBuf, "VXR_ACK_OK", 10) == 0) {
             m_connected = true;
+            if (senderIp[0] != '\0') {
+                m_connectedHostIp = senderIp;
+            }
             continue;
         }
 
         if (outFrame && ReassembleFrame(rxBuf, static_cast<size_t>(r), outFrame)) {
             m_connected = true;
+            if (senderIp[0] != '\0' && (m_connectedHostIp == "127.0.0.1" || m_connectedHostIp == "255.255.255.255")) {
+                m_connectedHostIp = senderIp;
+            }
             return true;
         }
     }
@@ -435,7 +474,6 @@ bool VxrClientNetwork::SendControlPacketInternal(const VxrClientControlPacket& p
 
     VxrRawSocket s = static_cast<VxrRawSocket>(m_udpSocket);
     if (!m_initialized || s == VXR_INVALID_SOCK) {
-        // Still record the packet for offline unit testing
         return true;
     }
 
@@ -452,7 +490,8 @@ bool VxrClientNetwork::SendControlPacketInternal(const VxrClientControlPacket& p
 }
 
 bool VxrClientNetwork::SendDiscoverAndConnect(const char* hostIp, uint16_t port) {
-    if (hostIp && hostIp[0] != '\0') {
+    bool isBroadcast = (hostIp && std::strcmp(hostIp, "255.255.255.255") == 0);
+    if (hostIp && hostIp[0] != '\0' && !isBroadcast) {
         m_connectedHostIp = hostIp;
     }
     if (port > 0) {
@@ -462,6 +501,20 @@ bool VxrClientNetwork::SendDiscoverAndConnect(const char* hostIp, uint16_t port)
     VxrClientControlPacket pkt = {};
     pkt.magic = VXR_UDP_CTRL_MAGIC; // 0x56585243 ("VXRC")
     pkt.cmd_type = 1;
+
+    if (isBroadcast) {
+        VxrRawSocket s = static_cast<VxrRawSocket>(m_udpSocket);
+        if (m_initialized && s != VXR_INVALID_SOCK) {
+            sockaddr_in bcastAddr = {};
+            bcastAddr.sin_family = AF_INET;
+            bcastAddr.sin_port = htons(m_connectedHostPort);
+            inet_pton(AF_INET, "255.255.255.255", &bcastAddr.sin_addr);
+            sendto(s, reinterpret_cast<const char*>(&pkt), sizeof(pkt), 0,
+                   reinterpret_cast<const sockaddr*>(&bcastAddr), sizeof(bcastAddr));
+        }
+        return true;
+    }
+
     bool ok = SendControlPacketInternal(pkt);
     if (ok) {
         m_connected = true;

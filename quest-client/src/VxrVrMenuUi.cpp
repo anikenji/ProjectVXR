@@ -8,23 +8,30 @@ namespace vxr {
 
 namespace {
 
-// Color Palette (0xAARRGGBB)
-constexpr uint32_t COLOR_BG_OUTER        = 0xFF101216u;
-constexpr uint32_t COLOR_BG_SIDEBAR      = 0xFF161920u;
-constexpr uint32_t COLOR_BG_PANEL        = 0xFF1C2029u;
-constexpr uint32_t COLOR_BG_CARD         = 0xFF242936u;
-constexpr uint32_t COLOR_BG_TOPBAR       = 0xFF12151Cu;
-constexpr uint32_t COLOR_BG_BOTTOMBAR    = 0xFF12151Cu;
-constexpr uint32_t COLOR_BORDER          = 0xFF32394Au;
-constexpr uint32_t COLOR_ACCENT_BLUE     = 0xFF1E90FFu; // #1E90FF DodgerBlue
-constexpr uint32_t COLOR_ACCENT_HOVER    = 0xFF3CA0FFu;
-constexpr uint32_t COLOR_TEXT_PRIMARY    = 0xFFF2F5FAu;
-constexpr uint32_t COLOR_TEXT_SECONDARY  = 0xFFA5B0C2u;
-constexpr uint32_t COLOR_TEXT_MUTED      = 0xFF6E788Au;
-constexpr uint32_t COLOR_STATUS_GREEN    = 0xFF2ECC71u;
-constexpr uint32_t COLOR_STATUS_ORANGE   = 0xFFF39C12u;
-constexpr uint32_t COLOR_DANGER_RED      = 0xFFE74C3Cu;
-constexpr uint32_t COLOR_CONTROL_BG      = 0xFF2B3140u;
+// Color Palette: Little-Endian RGBA_8888 (bytes in memory: [R, G, B, A] -> uint32_t 0xAABBGGRR)
+constexpr uint32_t Rgba(uint8_t r, uint8_t g, uint8_t b, uint8_t a = 0xFFu) {
+    return static_cast<uint32_t>(r) |
+           (static_cast<uint32_t>(g) << 8) |
+           (static_cast<uint32_t>(b) << 16) |
+           (static_cast<uint32_t>(a) << 24);
+}
+
+constexpr uint32_t COLOR_BG_OUTER        = Rgba(0x10, 0x12, 0x16);
+constexpr uint32_t COLOR_BG_SIDEBAR      = Rgba(0x16, 0x19, 0x20);
+constexpr uint32_t COLOR_BG_PANEL        = Rgba(0x1C, 0x20, 0x29);
+constexpr uint32_t COLOR_BG_CARD         = Rgba(0x24, 0x29, 0x36);
+constexpr uint32_t COLOR_BG_TOPBAR       = Rgba(0x12, 0x15, 0x1C);
+constexpr uint32_t COLOR_BG_BOTTOMBAR    = Rgba(0x12, 0x15, 0x1C);
+constexpr uint32_t COLOR_BORDER          = Rgba(0x32, 0x39, 0x4A);
+constexpr uint32_t COLOR_ACCENT_BLUE     = Rgba(0x1E, 0x90, 0xFF); // #1E90FF DodgerBlue
+constexpr uint32_t COLOR_ACCENT_HOVER    = Rgba(0x3C, 0xA0, 0xFF);
+constexpr uint32_t COLOR_TEXT_PRIMARY    = Rgba(0xF2, 0xF5, 0xFA);
+constexpr uint32_t COLOR_TEXT_SECONDARY  = Rgba(0xA5, 0xB0, 0xC2);
+constexpr uint32_t COLOR_TEXT_MUTED      = Rgba(0x6E, 0x78, 0x8A);
+constexpr uint32_t COLOR_STATUS_GREEN    = Rgba(0x2E, 0xCC, 0x71);
+constexpr uint32_t COLOR_STATUS_ORANGE   = Rgba(0xF3, 0x9C, 0x12);
+constexpr uint32_t COLOR_DANGER_RED      = Rgba(0xE7, 0x4C, 0x3C);
+constexpr uint32_t COLOR_CONTROL_BG      = Rgba(0x2B, 0x31, 0x40);
 
 // HitBox Action IDs
 enum HitActionId : uint32_t {
@@ -39,6 +46,7 @@ enum HitActionId : uint32_t {
     HIT_TAB_VIDEOS       = 16,
     HIT_BTN_STEAMVR      = 17,
     HIT_BTN_QUIT         = 18,
+    HIT_BTN_VIEW_DESKTOP = 19,
 
     // COMPUTERS Tab
     HIT_COMPUTER_TOGGLE_CONNECT = 100,
@@ -331,8 +339,10 @@ bool VxrVrMenuUi::Initialize() {
     m_settingsDirty = false;
 
     m_computers.clear();
+#ifndef __ANDROID__
     m_computers.push_back({"DESKTOP-VXR-HOST", "192.168.1.61", true, true, 1200, 5});
     m_computers.push_back({"WORKSTATION-RTX", "192.168.1.104", false, true, 2400, 6});
+#endif
 
     m_games.clear();
     m_games.push_back({"Half-Life: Alyx", "steam://rungameid/546560", true});
@@ -630,12 +640,13 @@ void VxrVrMenuUi::RenderTopBar(uint32_t* buf, uint32_t bw, uint32_t bh) {
     FillRect(buf, bw, bh, 0, 0, static_cast<int>(bw), barH, COLOR_BG_TOPBAR);
     FillRect(buf, bw, bh, 0, barH - 1, static_cast<int>(bw), 1, COLOR_BORDER);
 
-    // Hamburger Menu icon '≡' (3 horizontal bars)
+    // Hamburger Menu icon '≡' (3 horizontal bars) - click to toggle Full-Screen Desktop View
     int iconX = 16;
     int iconY = 11;
     FillRect(buf, bw, bh, iconX, iconY,      16, 2, COLOR_ACCENT_BLUE);
     FillRect(buf, bw, bh, iconX, iconY + 6,  16, 2, COLOR_ACCENT_BLUE);
     FillRect(buf, bw, bh, iconX, iconY + 12, 16, 2, COLOR_ACCENT_BLUE);
+    RegisterHitBox(HIT_BTN_VIEW_DESKTOP, 6, 2, 36, 32, bw, bh, 0);
 
     // Clock & Battery
     DrawText5x7(buf, bw, bh, 46, 14, m_settings.clock_text.c_str(), 1, COLOR_TEXT_PRIMARY);
@@ -738,6 +749,14 @@ void VxrVrMenuUi::RenderComputersTab(uint32_t* buf, uint32_t bw, uint32_t bh, in
     DrawText5x7(buf, bw, bh, contentX + 24, contentY + 44, "Select a computer on your local network to connect", 1, COLOR_TEXT_SECONDARY);
 
     int cardY = contentY + 72;
+    if (m_computers.empty()) {
+        int emptyX = contentX + 24;
+        int emptyW = contentW - 48;
+        FillRect(buf, bw, bh, emptyX, cardY, emptyW, 88, COLOR_BG_CARD);
+        DrawRectBorder(buf, bw, bh, emptyX, cardY, emptyW, 88, 1, COLOR_BORDER);
+        DrawText5x7(buf, bw, bh, emptyX + 24, cardY + 26, "Searching for Project VXR Streamer on local network...", 1, COLOR_ACCENT_BLUE);
+        DrawText5x7(buf, bw, bh, emptyX + 24, cardY + 48, "Ensure ProjectVXR.exe is running on your PC (UDP :38810 / mDNS :5353)", 1, COLOR_TEXT_SECONDARY);
+    }
     for (size_t i = 0; i < m_computers.size(); ++i) {
         const VrComputerEntry& pc = m_computers[i];
         int cardX = contentX + 24;
@@ -764,10 +783,15 @@ void VxrVrMenuUi::RenderComputersTab(uint32_t* buf, uint32_t bw, uint32_t bh, in
         DrawText5x7(buf, bw, bh, monX + 64, cardY + 46, subInfo, 1, COLOR_TEXT_SECONDARY);
 
         // Status indicator
-        const char* statusStr = pc.connected ? "Connected" : (pc.available ? "Available" : "Offline");
+        const char* statusStr = pc.connected ? "Connected - Live Desktop Ready" : (pc.available ? "Available" : "Offline");
         uint32_t statusColor = pc.connected ? COLOR_STATUS_GREEN : (pc.available ? COLOR_TEXT_SECONDARY : COLOR_DANGER_RED);
         DrawCircleFill(buf, bw, bh, monX + 68, cardY + 67, 4, statusColor);
         DrawText5x7(buf, bw, bh, monX + 78, cardY + 64, statusStr, 1, statusColor);
+
+        if (pc.connected) {
+            DrawButton(buf, bw, bh, cardX + cardW - 268, cardY + 26, 118, 36, "View Desktop", true,
+                       HIT_BTN_VIEW_DESKTOP, static_cast<int32_t>(i));
+        }
 
         // Connect / Disconnect button
         const char* btnLabel = pc.connected ? "Disconnect" : "Connect";
@@ -1351,6 +1375,9 @@ bool VxrVrMenuUi::HandleHitAction(const VrUiHitBox& box, float normX, float norm
         case HIT_BTN_QUIT:
             m_settings.quit_requested = true;
             MarkSettingsDirty();
+            return true;
+        case HIT_BTN_VIEW_DESKTOP:
+            m_visible = false;
             return true;
 
         // COMPUTERS

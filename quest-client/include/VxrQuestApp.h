@@ -45,7 +45,7 @@ public:
     /// Handles direct pointer/laser/touch interaction in normalized [0..1] window coordinates
     void OnSurfacePointerEvent(float norm_x, float norm_y, bool is_down, bool is_click);
 
-    /// Returns the 1280x800 RGBA8888 composited UI + HUD buffer for ANativeWindow presentation
+    /// Returns the 1280x800 RGBA8888 composited UI + Live Desktop buffer
     const uint32_t* GetCompositedRgbaFrame(uint32_t* out_width, uint32_t* out_height);
 
     VxrMediaCodecDecoder& GetDecoder() { return m_decoder; }
@@ -59,6 +59,9 @@ public:
     uint64_t GetTotalFramesRendered() const { return m_totalFramesRendered; }
 
 private:
+    void DecodeLiveDesktopStrip(const uint8_t* data, size_t size);
+    void CompositeFinalRgbaFrame();
+
     QuestAppConfig m_config;
     bool m_running;
     uint64_t m_totalFramesRendered;
@@ -67,6 +70,7 @@ private:
     float m_surfacePointerX;
     float m_surfacePointerY;
     bool m_hasSurfacePointer;
+    bool m_hasLiveDesktopFrame;
 
     VxrMediaCodecDecoder m_decoder;
     VxrVulkanRenderer m_renderer;
@@ -76,6 +80,8 @@ private:
     VxrClientNetwork m_network;
 
     std::vector<uint32_t> m_menuRgbaBuffer;
+    std::vector<uint32_t> m_desktopRgbaBuffer;
+    std::vector<uint32_t> m_compositedRgbaBuffer;
     std::vector<uint32_t> m_perfHudRgbaBuffer;
 };
 
