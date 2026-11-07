@@ -1,6 +1,9 @@
 #include "VxrOpenXrClient.h"
 #include <iostream>
+#include <fstream>
 #include <chrono>
+#include <ctime>
+#include <cstdio>
 #include <cstring>
 #include <cmath>
 #include <algorithm>
@@ -8,6 +11,7 @@
 #if defined(__ANDROID__)
 #include <dlfcn.h>
 #include <jni.h>
+#include <sys/system_properties.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl3.h>
@@ -27,11 +31,241 @@
 
 namespace vxr {
 
+#if defined(__ANDROID__)
+namespace {
+
+struct Vec3 {
+    float x, y, z;
+};
+
+struct Vertex3D {
+    float pos[3];
+    float norm[3];
+};
+
+static void Mat4Identity(float m[16]) {
+    std::memset(m, 0, 16 * sizeof(float));
+    m[0] = m[5] = m[10] = m[15] = 1.0f;
+}
+
+static void Mat4Multiply(float out[16], const float a[16], const float b[16]) {
+    float r[16] = {};
+    for (int col = 0; col < 4; ++col) {
+        for (int row = 0; row < 4; ++row) {
+            r[col * 4 + row] =
+                a[0 * 4 + row] * b[col * 4 + 0] +
+                a[1 * 4 + row] * b[col * 4 + 1] +
+                a[2 * 4 + row] * b[col * 4 + 2] +
+                a[3 * 4 + row] * b[col * 4 + 3];
+        }
+    }
+    std::memcpy(out, r, 16 * sizeof(float));
+}
+
+static void Mat4CreateProjectionFromFov(float out[16],
+                                        float angleLeft,
+                                        float angleRight,
+                                        float angleUp,
+                                        float angleDown,
+                                        float nearZ,
+                                        float farZ) {
+    const float tanLeft  = std::tan(angleLeft);
+    const float tanRight = std::tan(angleRight);
+    const float tanUp    = std::tan(angleUp);
+    const float tanDown  = std::tan(angleDown);
+
+    const float tanWidth  = tanRight - tanLeft;
+    const float tanHeight = tanUp - tanDown;
+
+    std::memset(out, 0, 16 * sizeof(float));
+    out[0]  = 2.0f / tanWidth;
+    out[5]  = 2.0f / tanHeight;
+    out[8]  = (tanRight + tanLeft) / tanWidth;
+    out[9]  = (tanUp + tanDown) / tanHeight;
+    out[10] = -(farZ + nearZ) / (farZ - nearZ);
+    out[11] = -1.0f;
+    out[14] = -(farZ * 2.0f * nearZ) / (farZ - nearZ);
+}
+
+static void Mat4CreateFromQuatPos(float out[16], const float q[4], const float pos[3]) {
+    const float x = q[0], y = q[1], z = q[2], w = q[3];
+    const float x2 = x + x, y2 = y + y, z2 = z + z;
+    const float xx = x * x2, xy = x * y2, xz = x * z2;
+    const float yy = y * y2, yz = y * z2, zz = z * z2;
+    const float wx = w * x2, wy = w * y2, wz = w * z2;
+
+    out[0]  = 1.0f - (yy + zz);
+    out[1]  = xy + wz;
+    out[2]  = xz - wy;
+    out[3]  = 0.0f;
+
+    out[4]  = xy - wz;
+    out[5]  = 1.0f - (xx + zz);
+    out[6]  = yz + wx;
+    out[7]  = 0.0f;
+
+    out[8]  = xz + wy;
+    out[9]  = yz - wx;
+    out[10] = 1.0f - (xx + yy);
+    out[11] = 0.0f;
+
+    out[12] = pos[0];
+    out[13] = pos[1];
+    out[14] = pos[2];
+    out[15] = 1.0f;
+}
+
+static void Mat4CreateViewFromEyePose(float out[16], const float q[4], const float pos[3]) {
+    // Inverse of rigid transform (R, T) is (R^T, -R^T * T)
+    float worldFromEye[16];
+    Mat4CreateFromQuatPos(worldFromEye, q, pos);
+
+    out[0]  = worldFromEye[0];
+    out[1]  = worldFromEye[4];
+    out[2]  = worldFromEye[8];
+    out[3]  = 0.0f;
+
+    out[4]  = worldFromEye[1];
+    out[5]  = worldFromEye[5];
+    out[6]  = worldFromEye[9];
+    out[7]  = 0.0f;
+
+    out[8]  = worldFromEye[2];
+    out[9]  = worldFromEye[6];
+    out[10] = worldFromEye[10];
+    out[11] = 0.0f;
+
+    out[12] = -(out[0] * pos[0] + out[4] * pos[1] + out[8]  * pos[2]);
+    out[13] = -(out[1] * pos[0] + out[5] * pos[1] + out[9]  * pos[2]);
+    out[14] = -(out[2] * pos[0] + out[6] * pos[1] + out[10] * pos[2]);
+    out[15] = 1.0f;
+}
+
+static void AppendOrientedBox(std::vector<Vertex3D>* verts,
+                              float cx, float cy, float cz,
+                              float hx, float hy, float hz,
+                              float rotXRad = 0.0f,
+                              float rotZRad = 0.0f) {
+    const float cxr = std::cos(rotXRad), sxr = std::sin(rotXRad);
+    const float czr = std::cos(rotZRad), szr = std::sin(rotZRad);
+
+    auto xform = [&](float x, float y, float z, float* ox, float* oy, float* oz) {
+        // Rotate around X then Z, then translate
+        float y1 = y * cxr - z * sxr;
+        float z1 = y * sxr + z * cxr;
+        float x2 = x * czr - y1 * szr;
+        float y2 = x * szr + y1 * czr;
+        *ox = cx + x2;
+        *oy = cy + y2;
+        *oz = cz + z1;
+    };
+
+    struct FaceDef {
+        float n[3];
+        float v[4][3];
+    };
+    const FaceDef faces[6] = {
+        { {  0,  0,  1 }, { {-hx, -hy,  hz}, { hx, -hy,  hz}, { hx,  hy,  hz}, {-hx,  hy,  hz} } },
+        { {  0,  0, -1 }, { { hx, -hy, -hz}, {-hx, -hy, -hz}, {-hx,  hy, -hz}, { hx,  hy, -hz} } },
+        { {  0,  1,  0 }, { {-hx,  hy,  hz}, { hx,  hy,  hz}, { hx,  hy, -hz}, {-hx,  hy, -hz} } },
+        { {  0, -1,  0 }, { {-hx, -hy, -hz}, { hx, -hy, -hz}, { hx, -hy,  hz}, {-hx, -hy,  hz} } },
+        { {  1,  0,  0 }, { { hx, -hy,  hz}, { hx, -hy, -hz}, { hx,  hy, -hz}, { hx,  hy,  hz} } },
+        { { -1,  0,  0 }, { {-hx, -hy, -hz}, {-hx, -hy,  hz}, {-hx,  hy,  hz}, {-hx,  hy, -hz} } }
+    };
+
+    const int triOrder[6] = { 0, 1, 2, 0, 2, 3 };
+    for (int f = 0; f < 6; ++f) {
+        float nx, ny, nz;
+        float ny1 = faces[f].n[1] * cxr - faces[f].n[2] * sxr;
+        float nz1 = faces[f].n[1] * sxr + faces[f].n[2] * cxr;
+        nx = faces[f].n[0] * czr - ny1 * szr;
+        ny = faces[f].n[0] * szr + ny1 * czr;
+        nz = nz1;
+
+        for (int k = 0; k < 6; ++k) {
+            int vi = triOrder[k];
+            Vertex3D vtx = {};
+            xform(faces[f].v[vi][0], faces[f].v[vi][1], faces[f].v[vi][2],
+                  &vtx.pos[0], &vtx.pos[1], &vtx.pos[2]);
+            vtx.norm[0] = nx;
+            vtx.norm[1] = ny;
+            vtx.norm[2] = nz;
+            verts->push_back(vtx);
+        }
+    }
+}
+
+static void AppendCylinderY(std::vector<Vertex3D>* verts,
+                            float cx, float cy, float cz,
+                            float radius, float halfHeight,
+                            int segments = 12,
+                            float tiltXRad = 0.0f,
+                            float tiltZRad = 0.0f) {
+    const float cxr = std::cos(tiltXRad), sxr = std::sin(tiltXRad);
+    const float czr = std::cos(tiltZRad), szr = std::sin(tiltZRad);
+
+    auto xform = [&](float x, float y, float z, float* ox, float* oy, float* oz) {
+        float y1 = y * cxr - z * sxr;
+        float z1 = y * sxr + z * cxr;
+        float x2 = x * czr - y1 * szr;
+        float y2 = x * szr + y1 * czr;
+        *ox = cx + x2;
+        *oy = cy + y2;
+        *oz = cz + z1;
+    };
+
+    const float step = 2.0f * 3.14159265f / static_cast<float>(segments);
+    for (int i = 0; i < segments; ++i) {
+        float a0 = i * step;
+        float a1 = (i + 1) * step;
+        float x0 = std::cos(a0) * radius, z0 = std::sin(a0) * radius;
+        float x1 = std::cos(a1) * radius, z1 = std::sin(a1) * radius;
+
+        // Top disk triangle
+        Vertex3D t0 = {}, t1 = {}, t2 = {};
+        xform(0.0f, halfHeight, 0.0f, &t0.pos[0], &t0.pos[1], &t0.pos[2]);
+        xform(x0,   halfHeight, z0,   &t1.pos[0], &t1.pos[1], &t1.pos[2]);
+        xform(x1,   halfHeight, z1,   &t2.pos[0], &t2.pos[1], &t2.pos[2]);
+        t0.norm[1] = t1.norm[1] = t2.norm[1] = 1.0f;
+        verts->push_back(t0); verts->push_back(t1); verts->push_back(t2);
+
+        // Side quad (2 triangles)
+        Vertex3D s0 = {}, s1 = {}, s2 = {}, s3 = {};
+        xform(x0, -halfHeight, z0, &s0.pos[0], &s0.pos[1], &s0.pos[2]);
+        xform(x1, -halfHeight, z1, &s1.pos[0], &s1.pos[1], &s1.pos[2]);
+        xform(x1,  halfHeight, z1, &s2.pos[0], &s2.pos[1], &s2.pos[2]);
+        xform(x0,  halfHeight, z0, &s3.pos[0], &s3.pos[1], &s3.pos[2]);
+        s0.norm[0] = s3.norm[0] = std::cos(a0); s0.norm[2] = s3.norm[2] = std::sin(a0);
+        s1.norm[0] = s2.norm[0] = std::cos(a1); s1.norm[2] = s2.norm[2] = std::sin(a1);
+        verts->push_back(s0); verts->push_back(s1); verts->push_back(s2);
+        verts->push_back(s0); verts->push_back(s2); verts->push_back(s3);
+    }
+}
+
+static GLuint CompileGlShader(GLenum type, const char* src) {
+    GLuint sh = glCreateShader(type);
+    glShaderSource(sh, 1, &src, nullptr);
+    glCompileShader(sh);
+    GLint ok = 0;
+    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char logBuf[512] = {};
+        glGetShaderInfoLog(sh, sizeof(logBuf) - 1, nullptr, logBuf);
+        ALOGE("GLES3 Shader compile error: %s", logBuf);
+    }
+    return sh;
+}
+
+} // namespace
+#endif
+
 VxrOpenXrClient::VxrOpenXrClient()
     : m_initialized(false)
     , m_sessionRunning(false)
     , m_realXrActive(false)
     , m_shouldRenderFrame(true)
+    , m_fbRenderModelSupported(false)
+    , m_passthroughEnabled(false)
     , m_sessionState(OpenXrSessionState::Unknown)
     , m_frameIndex(0)
     , m_lastPredictedDisplayTimeNs(0)
@@ -44,17 +278,33 @@ VxrOpenXrClient::VxrOpenXrClient()
     , m_session(nullptr)
     , m_localSpace(nullptr)
     , m_viewSpace(nullptr)
+#if defined(__ANDROID__)
+    , m_screenCenterY(0.0f)
+#else
+    , m_screenCenterY(1.40f)
+#endif
+    , m_screenAnchorInitialized(false)
+    , m_recenterHeld(false)
     , m_eglDisplay(nullptr)
     , m_eglConfig(nullptr)
     , m_eglContext(nullptr)
     , m_eglSurface(nullptr)
     , m_quadSwapchain(nullptr)
     , m_skySwapchain(nullptr)
+    , m_skyWidth(1024)
+    , m_skyHeight(1024)
+    , m_skyFbo(0)
+    , m_skyDepthRbo(0)
+    , m_sceneProgram(0)
+    , m_uViewProjLoc(-1)
+    , m_uModelLoc(-1)
+    , m_uColorLoc(-1)
     , m_quadDistM(2.0f)
     , m_quadWidthM(2.2f)
     , m_quadHeightM(1.375f)
     , m_actionSet(nullptr)
     , m_aimPoseAction(nullptr)
+    , m_gripPoseAction(nullptr)
     , m_triggerAction(nullptr)
     , m_squeezeAction(nullptr)
     , m_thumbstickAction(nullptr)
@@ -63,13 +313,31 @@ VxrOpenXrClient::VxrOpenXrClient()
     , m_menuAction(nullptr)
     , m_rightAimSpace(nullptr)
     , m_leftAimSpace(nullptr)
+    , m_rightGripSpace(nullptr)
+    , m_leftGripSpace(nullptr)
+    , m_activeHand(1)
+    , m_triggerPressed(false)
+    , m_gripPressed(false)
+    , m_thumbstickX(0.0f)
+    , m_thumbstickY(0.0f)
+    , m_hasLaserHit(false)
 {
     m_handPaths[0] = 0;
     m_handPaths[1] = 0;
+    std::memset(&m_leftControllerPose, 0, sizeof(m_leftControllerPose));
+    std::memset(&m_rightControllerPose, 0, sizeof(m_rightControllerPose));
+    m_leftControllerPose.orientation[3] = 1.0f;
+    m_rightControllerPose.orientation[3] = 1.0f;
+    std::memset(&m_headPose, 0, sizeof(m_headPose));
+    m_headPose.orientation[3] = 1.0f;
+    m_laserHitPoint[0] = 0.0f;
+    m_laserHitPoint[1] = m_screenCenterY;
+    m_laserHitPoint[2] = -2.0f;
+
     std::memset(m_cachedViews, 0, sizeof(m_cachedViews));
     std::memset(&m_controllerState, 0, sizeof(m_controllerState));
     m_controllerState.ray_origin[0] = 0.0f;
-    m_controllerState.ray_origin[1] = 1.50f;
+    m_controllerState.ray_origin[1] = m_screenCenterY;
     m_controllerState.ray_origin[2] = 0.0f;
     m_controllerState.ray_direction[0] = 0.0f;
     m_controllerState.ray_direction[1] = 0.0f;
@@ -101,6 +369,21 @@ bool VxrOpenXrClient::Initialize(const OpenXrClientConfig& config) {
             loaderInit.applicationContext = m_activityClazz;
             XrResult lr = pfnInitLoader(reinterpret_cast<const XrLoaderInitInfoBaseHeaderKHR*>(&loaderInit));
             ALOGI("xrInitializeLoaderKHR returned %d", (int)lr);
+        }
+
+        // Probe available OpenXR instance extensions (including XR_FB_render_model)
+        uint32_t extCount = 0;
+        xrEnumerateInstanceExtensionProperties(nullptr, 0, &extCount, nullptr);
+        if (extCount > 0) {
+            std::vector<XrExtensionProperties> exts(extCount, { XR_TYPE_EXTENSION_PROPERTIES });
+            if (XR_SUCCEEDED(xrEnumerateInstanceExtensionProperties(nullptr, extCount, &extCount, exts.data()))) {
+                for (const auto& ep : exts) {
+                    if (std::strcmp(ep.extensionName, "XR_FB_render_model") == 0) {
+                        m_fbRenderModelSupported = true;
+                        ALOGI("Detected OpenXR extension: XR_FB_render_model (version %u)", ep.extensionVersion);
+                    }
+                }
+            }
         }
 
         const char* enabledExts[] = {
@@ -135,6 +418,13 @@ bool VxrOpenXrClient::Initialize(const OpenXrClientConfig& config) {
             if (XR_SUCCEEDED(res)) {
                 m_systemId = reinterpret_cast<void*>(static_cast<uintptr_t>(sysId));
 
+                // Query real XrSystemProperties for headset identification
+                XrSystemProperties sysProps = { XR_TYPE_SYSTEM_PROPERTIES };
+                if (XR_SUCCEEDED(xrGetSystemProperties(xrInst, sysId, &sysProps))) {
+                    m_xrSystemName = sysProps.systemName;
+                    ALOGI("OpenXR System Name: '%s' (vendorId=%u)", sysProps.systemName, sysProps.vendorId);
+                }
+
                 // Query OpenGLES graphics requirements (mandatory before xrCreateSession)
                 PFN_xrGetOpenGLESGraphicsRequirementsKHR pfnGetGlesReqs = nullptr;
                 xrGetInstanceProcAddr(xrInst, "xrGetOpenGLESGraphicsRequirementsKHR",
@@ -154,7 +444,7 @@ bool VxrOpenXrClient::Initialize(const OpenXrClientConfig& config) {
                     EGL_GREEN_SIZE, 8,
                     EGL_BLUE_SIZE, 8,
                     EGL_ALPHA_SIZE, 8,
-                    EGL_DEPTH_SIZE, 0,
+                    EGL_DEPTH_SIZE, 24,
                     EGL_STENCIL_SIZE, 0,
                     EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
                     EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
@@ -253,9 +543,11 @@ bool VxrOpenXrClient::Initialize(const OpenXrClientConfig& config) {
                         ALOGI("Created 1280x800 OpenXR Quad Swapchain with %u GLES textures", imgCount);
                     }
 
-                    // 2. Create 64x64 Environment Projection Swapchain for dark VR theater room backdrop
-                    scInfo.width = 64;
-                    scInfo.height = 64;
+                    // 2. Create 1024x1024 Stereo Projection Swapchain for 3D Environment, 3D Touch Controllers & 3D Laser Beam
+                    m_skyWidth = 1024;
+                    m_skyHeight = 1024;
+                    scInfo.width = m_skyWidth;
+                    scInfo.height = m_skyHeight;
                     XrSwapchain skySc = XR_NULL_HANDLE;
                     if (XR_SUCCEEDED(xrCreateSwapchain(xrSess, &scInfo, &skySc))) {
                         m_skySwapchain = reinterpret_cast<void*>(skySc);
@@ -268,7 +560,15 @@ bool VxrOpenXrClient::Initialize(const OpenXrClientConfig& config) {
                         for (const auto& img : glImgs) {
                             m_skySwapchainTexIds.push_back(img.image);
                         }
+                        ALOGI("Created %ux%u OpenXR Stereo 3D Scene Swapchain with %u GLES textures",
+                              m_skyWidth, m_skyHeight, imgCount);
                     }
+
+                    InitStereoSceneResources();
+
+                    // Try loading optional custom .glb environment from /sdcard/ProjectVXR/Environments/
+                    VxrGltfLoader gltfLoader;
+                    gltfLoader.LoadEnvironmentByIndex(0, &m_customEnvModel);
 
                     // 3. Create 6DoF Oculus Touch Controller Action Set & Bindings
                     XrActionSetCreateInfo asInfo = { XR_TYPE_ACTION_SET_CREATE_INFO };
@@ -294,6 +594,7 @@ bool VxrOpenXrClient::Initialize(const OpenXrClientConfig& config) {
                         };
 
                         XrAction aimAct   = createAct(XR_ACTION_TYPE_POSE_INPUT,     "aim_pose",   "Controller Aim Pose");
+                        XrAction gripAct  = createAct(XR_ACTION_TYPE_POSE_INPUT,     "grip_pose",  "Controller Grip Pose");
                         XrAction trigAct  = createAct(XR_ACTION_TYPE_FLOAT_INPUT,    "trigger",    "Trigger Pull");
                         XrAction sqzAct   = createAct(XR_ACTION_TYPE_FLOAT_INPUT,    "squeeze",    "Grip Squeeze");
                         XrAction thumbAct = createAct(XR_ACTION_TYPE_VECTOR2F_INPUT, "thumbstick", "Thumbstick");
@@ -302,6 +603,7 @@ bool VxrOpenXrClient::Initialize(const OpenXrClientConfig& config) {
                         XrAction menuAct  = createAct(XR_ACTION_TYPE_BOOLEAN_INPUT,  "menu_btn",   "Menu Button");
 
                         m_aimPoseAction    = reinterpret_cast<void*>(aimAct);
+                        m_gripPoseAction   = reinterpret_cast<void*>(gripAct);
                         m_triggerAction    = reinterpret_cast<void*>(trigAct);
                         m_squeezeAction    = reinterpret_cast<void*>(sqzAct);
                         m_thumbstickAction = reinterpret_cast<void*>(thumbAct);
@@ -318,6 +620,8 @@ bool VxrOpenXrClient::Initialize(const OpenXrClientConfig& config) {
                         XrActionSuggestedBinding touchBindings[] = {
                             bindPath(aimAct,   "/user/hand/left/input/aim/pose"),
                             bindPath(aimAct,   "/user/hand/right/input/aim/pose"),
+                            bindPath(gripAct,  "/user/hand/left/input/grip/pose"),
+                            bindPath(gripAct,  "/user/hand/right/input/grip/pose"),
                             bindPath(trigAct,  "/user/hand/left/input/trigger/value"),
                             bindPath(trigAct,  "/user/hand/right/input/trigger/value"),
                             bindPath(sqzAct,   "/user/hand/left/input/squeeze/value"),
@@ -344,15 +648,26 @@ bool VxrOpenXrClient::Initialize(const OpenXrClientConfig& config) {
                         aspInfo.poseInActionSpace.orientation = { 0.0f, 0.0f, 0.0f, 1.0f };
                         aspInfo.poseInActionSpace.position = { 0.0f, 0.0f, 0.0f };
 
-                        aspInfo.subactionPath = m_handPaths[1]; // Right hand
+                        aspInfo.subactionPath = m_handPaths[1]; // Right hand aim
                         XrSpace rSpace = XR_NULL_HANDLE;
                         xrCreateActionSpace(xrSess, &aspInfo, &rSpace);
                         m_rightAimSpace = reinterpret_cast<void*>(rSpace);
 
-                        aspInfo.subactionPath = m_handPaths[0]; // Left hand
+                        aspInfo.subactionPath = m_handPaths[0]; // Left hand aim
                         XrSpace lSpace = XR_NULL_HANDLE;
                         xrCreateActionSpace(xrSess, &aspInfo, &lSpace);
                         m_leftAimSpace = reinterpret_cast<void*>(lSpace);
+
+                        aspInfo.action = gripAct;
+                        aspInfo.subactionPath = m_handPaths[1]; // Right hand grip
+                        XrSpace rgSpace = XR_NULL_HANDLE;
+                        xrCreateActionSpace(xrSess, &aspInfo, &rgSpace);
+                        m_rightGripSpace = reinterpret_cast<void*>(rgSpace);
+
+                        aspInfo.subactionPath = m_handPaths[0]; // Left hand grip
+                        XrSpace lgSpace = XR_NULL_HANDLE;
+                        xrCreateActionSpace(xrSess, &aspInfo, &lgSpace);
+                        m_leftGripSpace = reinterpret_cast<void*>(lgSpace);
 
                         XrSessionActionSetsAttachInfo attachInfo = { XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO };
                         attachInfo.countActionSets = 1;
@@ -364,10 +679,13 @@ bool VxrOpenXrClient::Initialize(const OpenXrClientConfig& config) {
                     m_initialized = true;
                     m_sessionRunning = true;
                     m_sessionState = OpenXrSessionState::Focused;
+                    m_screenCenterY = 0.0f;
+                    m_screenAnchorInitialized = false;
 
                     // Pump initial events so if READY is already queued, xrBeginSession runs immediately
                     PollXrEvents();
-                    ALOGI("Real Meta Quest OpenXR Session initialized and ready!");
+                    ALOGI("Real Meta Quest OpenXR Session initialized and ready! Model='%s'",
+                          GetDetectedHeadsetModel().c_str());
                     return true;
                 }
             }
@@ -382,10 +700,12 @@ bool VxrOpenXrClient::Initialize(const OpenXrClientConfig& config) {
     m_sessionState = OpenXrSessionState::Idle;
     m_initialized = true;
     m_realXrActive = false;
+    m_screenCenterY = 1.40f;
+    m_screenAnchorInitialized = true;
 
     std::memset(&m_controllerState, 0, sizeof(m_controllerState));
     m_controllerState.ray_origin[0] = 0.0f;
-    m_controllerState.ray_origin[1] = 1.50f;
+    m_controllerState.ray_origin[1] = m_screenCenterY;
     m_controllerState.ray_origin[2] = 0.0f;
     m_controllerState.ray_direction[0] = 0.0f;
     m_controllerState.ray_direction[1] = 0.0f;
@@ -398,6 +718,292 @@ bool VxrOpenXrClient::Initialize(const OpenXrClientConfig& config) {
 
     HandleSessionStateChanged(OpenXrSessionState::Ready);
     return true;
+}
+
+void VxrOpenXrClient::InitStereoSceneResources() {
+#if defined(__ANDROID__)
+    DestroyStereoSceneResources();
+
+    glGenFramebuffers(1, &m_skyFbo);
+    glGenRenderbuffers(1, &m_skyDepthRbo);
+    glBindRenderbuffer(GL_RENDERBUFFER, m_skyDepthRbo);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24,
+                          static_cast<GLsizei>(m_skyWidth), static_cast<GLsizei>(m_skyHeight));
+    glBindRenderbuffer(GL_RENDERBUFFER, 0);
+
+    const char* vsSrc =
+        "#version 300 es\n"
+        "precision highp float;\n"
+        "layout(location = 0) in vec3 aPos;\n"
+        "layout(location = 1) in vec3 aNormal;\n"
+        "uniform mat4 uViewProj;\n"
+        "uniform mat4 uModel;\n"
+        "out vec3 vNormal;\n"
+        "void main() {\n"
+        "    vNormal = mat3(uModel) * aNormal;\n"
+        "    gl_Position = uViewProj * (uModel * vec4(aPos, 1.0));\n"
+        "}\n";
+
+    const char* fsSrc =
+        "#version 300 es\n"
+        "precision mediump float;\n"
+        "in vec3 vNormal;\n"
+        "uniform vec4 uColor;\n"
+        "out vec4 fragColor;\n"
+        "void main() {\n"
+        "    vec3 n = normalize(vNormal + vec3(0.0, 0.0001, 0.0));\n"
+        "    vec3 lightDir = normalize(vec3(0.35, 0.85, 0.50));\n"
+        "    float diff = max(dot(n, lightDir), 0.0);\n"
+        "    float lighting = 0.48 + 0.52 * diff;\n"
+        "    fragColor = vec4(uColor.rgb * lighting, uColor.a);\n"
+        "}\n";
+
+    GLuint vs = CompileGlShader(GL_VERTEX_SHADER, vsSrc);
+    GLuint fs = CompileGlShader(GL_FRAGMENT_SHADER, fsSrc);
+    m_sceneProgram = glCreateProgram();
+    glAttachShader(m_sceneProgram, vs);
+    glAttachShader(m_sceneProgram, fs);
+    glLinkProgram(m_sceneProgram);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+
+    m_uViewProjLoc = glGetUniformLocation(m_sceneProgram, "uViewProj");
+    m_uModelLoc    = glGetUniformLocation(m_sceneProgram, "uModel");
+    m_uColorLoc    = glGetUniformLocation(m_sceneProgram, "uColor");
+#endif
+}
+
+void VxrOpenXrClient::DestroyStereoSceneResources() {
+#if defined(__ANDROID__)
+    if (m_sceneProgram != 0) {
+        glDeleteProgram(m_sceneProgram);
+        m_sceneProgram = 0;
+    }
+    if (m_skyDepthRbo != 0) {
+        glDeleteRenderbuffers(1, &m_skyDepthRbo);
+        m_skyDepthRbo = 0;
+    }
+    if (m_skyFbo != 0) {
+        glDeleteFramebuffers(1, &m_skyFbo);
+        m_skyFbo = 0;
+    }
+#endif
+}
+
+void VxrOpenXrClient::RenderStereoEnvironmentAndControllers(uint32_t skyTexId) {
+#if defined(__ANDROID__)
+    if (m_skyFbo == 0 || m_sceneProgram == 0 || skyTexId == 0) return;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, m_skyFbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, skyTexId, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, m_skyDepthRbo);
+
+    glViewport(0, 0, static_cast<GLsizei>(m_skyWidth), static_cast<GLsizei>(m_skyHeight));
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+
+    if (m_passthroughEnabled) {
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    } else {
+        glClearColor(0.055f, 0.065f, 0.090f, 1.0f);
+    }
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    glUseProgram(m_sceneProgram);
+
+    auto drawVerts = [&](const std::vector<Vertex3D>& verts, const float modelMat[16],
+                         float r, float g, float b, float a = 1.0f) {
+        if (verts.empty()) return;
+        glUniformMatrix4fv(m_uModelLoc, 1, GL_FALSE, modelMat);
+        glUniform4f(m_uColorLoc, r, g, b, a);
+        glEnableVertexAttribArray(0);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex3D), &verts[0].pos[0]);
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex3D), &verts[0].norm[0]);
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(verts.size()));
+    };
+
+    float identityMat[16];
+    Mat4Identity(identityMat);
+
+    // Build 3D Environment Room geometry (Floor grid + architectural theater frame)
+    std::vector<Vertex3D> roomFloorVerts;
+    std::vector<Vertex3D> roomGridVerts;
+    std::vector<Vertex3D> roomFrameVerts;
+    if (!m_passthroughEnabled) {
+        const float floorY = m_screenCenterY - 1.25f;
+        AppendOrientedBox(&roomFloorVerts, 0.0f, floorY - 0.02f, -1.5f, 4.5f, 0.02f, 4.5f);
+
+        // Floor architectural grid strips
+        for (int i = -4; i <= 4; ++i) {
+            float offset = static_cast<float>(i) * 0.75f;
+            AppendOrientedBox(&roomGridVerts, offset, floorY + 0.002f, -1.5f, 0.006f, 0.002f, 3.2f);
+            AppendOrientedBox(&roomGridVerts, 0.0f, floorY + 0.002f, -1.5f + offset, 3.2f, 0.002f, 0.006f);
+        }
+
+        // Architectural cinema frame behind screen quad
+        const float backZ = -m_quadDistM - 0.12f;
+        AppendOrientedBox(&roomFrameVerts, -1.45f, m_screenCenterY, backZ, 0.06f, 1.05f, 0.06f);
+        AppendOrientedBox(&roomFrameVerts,  1.45f, m_screenCenterY, backZ, 0.06f, 1.05f, 0.06f);
+        AppendOrientedBox(&roomFrameVerts,  0.0f,  m_screenCenterY + 1.02f, backZ, 1.51f, 0.05f, 0.06f);
+        AppendOrientedBox(&roomFrameVerts,  0.0f,  m_screenCenterY - 1.02f, backZ, 1.51f, 0.05f, 0.06f);
+    }
+
+    // Build custom .glb mesh vertices if a custom room was loaded
+    std::vector<Vertex3D> customGlbVerts;
+    if (!m_passthroughEnabled && m_customEnvModel.valid && !m_customEnvModel.meshes.empty()) {
+        for (const auto& mesh : m_customEnvModel.meshes) {
+            for (uint32_t idx : mesh.indices) {
+                if (idx < mesh.vertices.size()) {
+                    Vertex3D v = {};
+                    v.pos[0]  = mesh.vertices[idx].pos[0];
+                    v.pos[1]  = mesh.vertices[idx].pos[1] + m_screenCenterY - 1.25f;
+                    v.pos[2]  = mesh.vertices[idx].pos[2];
+                    v.norm[0] = mesh.vertices[idx].normal[0];
+                    v.norm[1] = mesh.vertices[idx].normal[1];
+                    v.norm[2] = mesh.vertices[idx].normal[2];
+                    customGlbVerts.push_back(v);
+                }
+            }
+        }
+    }
+
+    // Render Side-by-Side Stereo Views (eye 0 = left half [0..512], eye 1 = right half [512..1024])
+    const GLsizei halfW = static_cast<GLsizei>(m_skyWidth / 2);
+    const GLsizei fullH = static_cast<GLsizei>(m_skyHeight);
+
+    for (int eye = 0; eye < 2; ++eye) {
+        glViewport(eye * halfW, 0, halfW, fullH);
+
+        float projMat[16], viewMat[16], viewProjMat[16];
+        Mat4CreateProjectionFromFov(projMat,
+                                    m_cachedViews[eye].fov_left,
+                                    m_cachedViews[eye].fov_right,
+                                    m_cachedViews[eye].fov_top,
+                                    m_cachedViews[eye].fov_bottom,
+                                    0.05f, 100.0f);
+        Mat4CreateViewFromEyePose(viewMat, m_cachedViews[eye].orientation, m_cachedViews[eye].position);
+        Mat4Multiply(viewProjMat, projMat, viewMat);
+        glUniformMatrix4fv(m_uViewProjLoc, 1, GL_FALSE, viewProjMat);
+
+        // 1. Draw 3D Environment Room
+        if (!m_passthroughEnabled) {
+            drawVerts(roomFloorVerts, identityMat, 0.08f, 0.10f, 0.14f);
+            drawVerts(roomGridVerts,  identityMat, 0.14f, 0.22f, 0.34f);
+            drawVerts(roomFrameVerts, identityMat, 0.12f, 0.15f, 0.21f);
+            if (!customGlbVerts.empty()) {
+                drawVerts(customGlbVerts, identityMat, 0.20f, 0.24f, 0.32f);
+            }
+        }
+
+        // 2. Draw Left & Right 3D Quest Touch Controller Models
+        for (int hand = 0; hand < 2; ++hand) {
+            const XrControllerPose& cp = (hand == 0) ? m_leftControllerPose : m_rightControllerPose;
+            float ctrlPos[3] = { cp.position[0], cp.position[1], cp.position[2] };
+            float ctrlQuat[4] = { cp.orientation[0], cp.orientation[1], cp.orientation[2], cp.orientation[3] };
+            if (!cp.is_tracked) {
+                // Default ergonomic resting pose in front of user if controller is idle
+                ctrlPos[0] = (hand == 0) ? -0.18f : 0.18f;
+                ctrlPos[1] = m_screenCenterY - 0.26f;
+                ctrlPos[2] = -0.36f;
+                ctrlQuat[0] = 0.0f; ctrlQuat[1] = 0.0f; ctrlQuat[2] = 0.0f; ctrlQuat[3] = 1.0f;
+            }
+
+            float ctrlModelMat[16];
+            Mat4CreateFromQuatPos(ctrlModelMat, ctrlQuat, ctrlPos);
+
+            const bool isActiveHand = (hand == m_activeHand);
+            const float trigPull = isActiveHand ? (m_triggerPressed ? 1.0f : m_controllerState.trigger_value) : 0.0f;
+            const float gripPull = isActiveHand ? (m_gripPressed ? 1.0f : m_controllerState.grip_value) : 0.0f;
+            const float stickX   = isActiveHand ? m_thumbstickX : 0.0f;
+            const float stickY   = isActiveHand ? m_thumbstickY : 0.0f;
+            const float innerSign = (hand == 0) ? 1.0f : -1.0f;
+
+            std::vector<Vertex3D> bodyShellVerts;
+            std::vector<Vertex3D> faceplateVerts;
+            std::vector<Vertex3D> controlsVerts;
+
+            // (a) Ergonomic angled grip handle + outer body shell (#E8ECF2 matte pearl white/gray)
+            AppendOrientedBox(&bodyShellVerts, 0.0f, -0.028f, 0.042f, 0.017f, 0.052f, 0.019f, -0.45f, 0.0f);
+            AppendCylinderY(&bodyShellVerts,   0.0f,  0.002f, -0.005f, 0.029f, 0.008f, 14);
+
+            // (b) Circular dark slate top faceplate (#242936)
+            AppendCylinderY(&faceplateVerts, 0.0f, 0.007f, -0.005f, 0.025f, 0.004f, 14);
+
+            // (c) Thumbstick stalk & cap tilting with m_thumbstickX / m_thumbstickY
+            const float stickXOff = -innerSign * 0.007f;
+            AppendCylinderY(&controlsVerts, stickXOff, 0.016f, -0.008f, 0.0035f, 0.007f, 8,
+                            -stickY * 0.35f, -stickX * 0.35f);
+            AppendCylinderY(&controlsVerts,
+                            stickXOff + stickX * 0.003f, 0.023f, -0.008f - stickY * 0.003f,
+                            0.0085f, 0.0025f, 10, -stickY * 0.35f, -stickX * 0.35f);
+
+            // (d) A/B or X/Y Face buttons
+            AppendCylinderY(&controlsVerts, innerSign * 0.008f, 0.012f, -0.001f, 0.0045f, 0.002f, 8);
+            AppendCylinderY(&controlsVerts, innerSign * 0.005f, 0.012f, -0.013f, 0.0045f, 0.002f, 8);
+
+            // (e) Index Trigger on front underside that rotates/depresses with trigger pull
+            AppendOrientedBox(&controlsVerts, 0.0f, -0.012f, -0.026f + trigPull * 0.005f,
+                              0.007f, 0.012f, 0.005f, 0.30f + trigPull * 0.38f, 0.0f);
+
+            // (f) Side Grip button on inner handle that depresses with grip squeeze
+            AppendOrientedBox(&controlsVerts, innerSign * (0.016f - gripPull * 0.003f), -0.026f, 0.036f,
+                              0.003f, 0.018f, 0.008f, -0.45f, 0.0f);
+
+            // Render #E8ECF2 body shell, #242936 top faceplate, and dark controls
+            drawVerts(bodyShellVerts, ctrlModelMat, 0.910f, 0.925f, 0.949f);
+            drawVerts(faceplateVerts, ctrlModelMat, 0.141f, 0.161f, 0.212f);
+            drawVerts(controlsVerts,  ctrlModelMat, 0.220f, 0.255f, 0.330f);
+        }
+
+        // 3. Draw 3D Glowing Laser Beam in DodgerBlue (#1E90FF) from active controller tip to m_laserHitPoint
+        if (m_controllerState.is_active) {
+            const float ox = m_controllerState.ray_origin[0];
+            const float oy = m_controllerState.ray_origin[1];
+            const float oz = m_controllerState.ray_origin[2];
+            const float hx = m_laserHitPoint[0];
+            const float hy = m_laserHitPoint[1];
+            const float hz = m_laserHitPoint[2];
+
+            // Build thin 3D rectangular prism beam between (ox, oy, oz) and (hx, hy, hz)
+            const float r = 0.0022f;
+            std::vector<Vertex3D> beamVerts;
+            const Vertex3D v[8] = {
+                { { ox - r, oy - r, oz }, { 0, 1, 0 } },
+                { { ox + r, oy - r, oz }, { 0, 1, 0 } },
+                { { ox + r, oy + r, oz }, { 0, 1, 0 } },
+                { { ox - r, oy + r, oz }, { 0, 1, 0 } },
+                { { hx - r, hy - r, hz }, { 0, 1, 0 } },
+                { { hx + r, hy - r, hz }, { 0, 1, 0 } },
+                { { hx + r, hy + r, hz }, { 0, 1, 0 } },
+                { { hx - r, hy + r, hz }, { 0, 1, 0 } }
+            };
+            const int idx[24] = {
+                0, 1, 5,  0, 5, 4,
+                1, 2, 6,  1, 6, 5,
+                2, 3, 7,  2, 7, 6,
+                3, 0, 4,  3, 4, 7
+            };
+            for (int k = 0; k < 24; ++k) {
+                beamVerts.push_back(v[idx[k]]);
+            }
+            // DodgerBlue (#1E90FF -> 0.118, 0.565, 1.0)
+            drawVerts(beamVerts, identityMat, 0.18f, 0.64f, 1.0f);
+
+            // 3D glowing cursor dot at m_laserHitPoint
+            std::vector<Vertex3D> hitDotVerts;
+            AppendOrientedBox(&hitDotVerts, hx, hy, hz + 0.008f, 0.012f, 0.012f, 0.004f);
+            drawVerts(hitDotVerts, identityMat, 0.35f, 0.78f, 1.0f);
+        }
+    }
+
+    glDisableVertexAttribArray(0);
+    glDisableVertexAttribArray(1);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glFlush();
+#else
+    (void)skyTexId;
+#endif
 }
 
 void VxrOpenXrClient::PollXrEvents() {
@@ -442,6 +1048,9 @@ void VxrOpenXrClient::PollXrEvents() {
                 default:
                     break;
             }
+        } else if (ev.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
+            // User recentered headset via Meta button long-press -> re-anchor screen Y on next LocateViews
+            m_recenterHeld = true;
         }
     }
 #endif
@@ -561,6 +1170,21 @@ bool VxrOpenXrClient::LocateViews(uint64_t display_time_ns, XrEyeView out_views[
                 out_views[i].fov_bottom = xrViews[i].fov.angleDown;
                 m_cachedViews[i] = out_views[i];
             }
+
+            m_headPose = out_views[0];
+            m_headPose.position[0] = 0.5f * (out_views[0].position[0] + out_views[1].position[0]);
+            m_headPose.position[1] = 0.5f * (out_views[0].position[1] + out_views[1].position[1]);
+            m_headPose.position[2] = 0.5f * (out_views[0].position[2] + out_views[1].position[2]);
+
+            // Anchor screen center Y in LOCAL space to the user's actual eye height on first valid head pose or Recenter
+            if ((viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0) {
+                if (!m_screenAnchorInitialized || m_recenterHeld) {
+                    m_screenCenterY = m_headPose.position[1];
+                    m_screenAnchorInitialized = true;
+                    m_recenterHeld = false;
+                    ALOGI("Anchored VR Screen Center Y to LOCAL head height: %.3fm", m_screenCenterY);
+                }
+            }
             return true;
         }
     }
@@ -592,6 +1216,8 @@ bool VxrOpenXrClient::LocateViews(uint64_t display_time_ns, XrEyeView out_views[
 
     m_cachedViews[0] = out_views[0];
     m_cachedViews[1] = out_views[1];
+    m_headPose = out_views[0];
+    m_headPose.position[0] = 0.0f;
     return true;
 }
 
@@ -643,7 +1269,7 @@ void VxrOpenXrClient::SubmitQuadSwapchainRgba(const uint32_t* rgbaPixels,
         }
     }
 
-    // 2. Also cycle the 64x64 background projection swapchain so both layers are valid
+    // 2. Render 3D Stereo Environment, 3D Quest Touch Controllers & 3D Laser Beam into m_skySwapchain (1024x1024)
     if (m_skySwapchain && !m_skySwapchainTexIds.empty()) {
         XrSwapchain skySc = reinterpret_cast<XrSwapchain>(m_skySwapchain);
         XrSwapchainImageAcquireInfo acqInfo = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
@@ -653,11 +1279,7 @@ void VxrOpenXrClient::SubmitQuadSwapchainRgba(const uint32_t* rgbaPixels,
             waitInfo.timeout = XR_INFINITE_DURATION;
             if (XR_SUCCEEDED(xrWaitSwapchainImage(skySc, &waitInfo))) {
                 if (imgIdx < m_skySwapchainTexIds.size()) {
-                    static std::vector<uint32_t> s_skyPixels(64 * 64, 0xFF140E0Cu); // dark slate theater room
-                    GLuint texId = m_skySwapchainTexIds[imgIdx];
-                    glBindTexture(GL_TEXTURE_2D, texId);
-                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 64, 64, GL_RGBA, GL_UNSIGNED_BYTE, s_skyPixels.data());
-                    glBindTexture(GL_TEXTURE_2D, 0);
+                    RenderStereoEnvironmentAndControllers(m_skySwapchainTexIds[imgIdx]);
                 }
             }
             XrSwapchainImageReleaseInfo relInfo = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
@@ -679,7 +1301,7 @@ bool VxrOpenXrClient::EndFrame(uint64_t display_time_ns) {
         const XrCompositionLayerBaseHeader* layers[2] = {};
         uint32_t layerCount = 0;
 
-        // Layer 0: Stereo Projection Layer (360 dark VR theater room)
+        // Layer 0: Stereo Projection Layer (1024x1024 side-by-side stereo: 3D Environment + 3D Controllers + 3D Laser)
         XrCompositionLayerProjectionView projViews[2] = {
             { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW },
             { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW }
@@ -687,23 +1309,25 @@ bool VxrOpenXrClient::EndFrame(uint64_t display_time_ns) {
         XrCompositionLayerProjection projLayer = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
         if (m_skySwapchain && m_shouldRenderFrame) {
             XrSwapchain skySc = reinterpret_cast<XrSwapchain>(m_skySwapchain);
+            const int32_t halfW = static_cast<int32_t>(m_skyWidth / 2);
+            const int32_t fullH = static_cast<int32_t>(m_skyHeight);
             for (int i = 0; i < 2; ++i) {
                 projViews[i].pose.position = { m_cachedViews[i].position[0], m_cachedViews[i].position[1], m_cachedViews[i].position[2] };
                 projViews[i].pose.orientation = { m_cachedViews[i].orientation[0], m_cachedViews[i].orientation[1], m_cachedViews[i].orientation[2], m_cachedViews[i].orientation[3] };
                 projViews[i].fov = { m_cachedViews[i].fov_left, m_cachedViews[i].fov_right, m_cachedViews[i].fov_top, m_cachedViews[i].fov_bottom };
                 projViews[i].subImage.swapchain = skySc;
-                projViews[i].subImage.imageRect.offset = { 0, 0 };
-                projViews[i].subImage.imageRect.extent = { 64, 64 };
+                projViews[i].subImage.imageRect.offset = { i * halfW, 0 };
+                projViews[i].subImage.imageRect.extent = { halfW, fullH };
                 projViews[i].subImage.imageArrayIndex = 0;
             }
-            projLayer.layerFlags = 0;
+            projLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
             projLayer.space = localSp;
             projLayer.viewCount = 2;
             projLayer.views = projViews;
             layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projLayer);
         }
 
-        // Layer 1: High-Resolution 1280x800 Virtual Desktop Cinema Quad in 3D VR Space
+        // Layer 1: High-Resolution 1280x800 Virtual Desktop Cinema Quad in 3D VR Space at Y = m_screenCenterY
         XrCompositionLayerQuad quadLayer = { XR_TYPE_COMPOSITION_LAYER_QUAD };
         if (m_quadSwapchain && m_shouldRenderFrame) {
             XrSwapchain quadSc = reinterpret_cast<XrSwapchain>(m_quadSwapchain);
@@ -715,7 +1339,7 @@ bool VxrOpenXrClient::EndFrame(uint64_t display_time_ns) {
             quadLayer.subImage.imageRect.extent = { 1280, 800 };
             quadLayer.subImage.imageArrayIndex = 0;
             quadLayer.pose.orientation = { 0.0f, 0.0f, 0.0f, 1.0f };
-            quadLayer.pose.position = { 0.0f, 0.0f, -m_quadDistM };
+            quadLayer.pose.position = { 0.0f, m_screenCenterY, -m_quadDistM };
             quadLayer.size = { m_quadWidthM, m_quadHeightM };
             layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quadLayer);
         }
@@ -749,20 +1373,22 @@ bool VxrOpenXrClient::PollControllerInput(XrControllerInputState* out_state) {
         syncInfo.activeActionSets = &activeAs;
 
         if (XR_SUCCEEDED(xrSyncActions(xrSess, &syncInfo))) {
-            auto getFloat = [&](void* actHandle) -> float {
+            auto getFloatHand = [&](void* actHandle, XrPath subPath) -> float {
                 if (!actHandle) return 0.0f;
                 XrActionStateGetInfo gi = { XR_TYPE_ACTION_STATE_GET_INFO };
                 gi.action = reinterpret_cast<XrAction>(actHandle);
+                gi.subactionPath = subPath;
                 XrActionStateFloat st = { XR_TYPE_ACTION_STATE_FLOAT };
                 if (XR_SUCCEEDED(xrGetActionStateFloat(xrSess, &gi, &st)) && st.isActive) {
                     return st.currentState;
                 }
                 return 0.0f;
             };
-            auto getBool = [&](void* actHandle) -> bool {
+            auto getBoolHand = [&](void* actHandle, XrPath subPath) -> bool {
                 if (!actHandle) return false;
                 XrActionStateGetInfo gi = { XR_TYPE_ACTION_STATE_GET_INFO };
                 gi.action = reinterpret_cast<XrAction>(actHandle);
+                gi.subactionPath = subPath;
                 XrActionStateBoolean st = { XR_TYPE_ACTION_STATE_BOOLEAN };
                 if (XR_SUCCEEDED(xrGetActionStateBoolean(xrSess, &gi, &st)) && st.isActive) {
                     return st.currentState == XR_TRUE;
@@ -770,64 +1396,112 @@ bool VxrOpenXrClient::PollControllerInput(XrControllerInputState* out_state) {
                 return false;
             };
 
-            m_controllerState.trigger_value = getFloat(m_triggerAction);
-            m_controllerState.grip_value    = getFloat(m_squeezeAction);
-            m_controllerState.button_a      = getBool(m_buttonAAction);
-            m_controllerState.button_b      = getBool(m_buttonBAction);
-            m_controllerState.button_menu   = getBool(m_menuAction) || m_controllerState.button_b;
+            const float leftTrig  = getFloatHand(m_triggerAction, m_handPaths[0]);
+            const float rightTrig = getFloatHand(m_triggerAction, m_handPaths[1]);
+            const float anyTrig   = getFloatHand(m_triggerAction, XR_NULL_PATH);
+
+            const float leftGrip  = getFloatHand(m_squeezeAction, m_handPaths[0]);
+            const float rightGrip = getFloatHand(m_squeezeAction, m_handPaths[1]);
+            const float anyGrip   = getFloatHand(m_squeezeAction, XR_NULL_PATH);
+
+            const bool btnX = getBoolHand(m_buttonAAction, m_handPaths[0]);
+            const bool btnA = getBoolHand(m_buttonAAction, m_handPaths[1]) || getBoolHand(m_buttonAAction, XR_NULL_PATH);
+            const bool btnY = getBoolHand(m_buttonBAction, m_handPaths[0]);
+            const bool btnB = getBoolHand(m_buttonBAction, m_handPaths[1]) || getBoolHand(m_buttonBAction, XR_NULL_PATH);
+            const bool btnMenu = getBoolHand(m_menuAction, m_handPaths[0]) || getBoolHand(m_menuAction, XR_NULL_PATH);
+
+            m_controllerState.trigger_value = (std::max)(anyTrig, (std::max)(leftTrig, rightTrig));
+            m_controllerState.grip_value    = (std::max)(anyGrip, (std::max)(leftGrip, rightGrip));
+            m_controllerState.button_a      = btnA || btnX;
+            m_controllerState.button_x      = btnX;
+            m_controllerState.button_b      = btnB;
+            m_controllerState.button_y      = btnY;
+            m_controllerState.button_menu   = btnMenu || btnY;
+
+            m_triggerPressed = (m_controllerState.trigger_value > 0.50f) || btnA || btnX;
+            m_gripPressed    = (m_controllerState.grip_value > 0.50f);
 
             if (m_thumbstickAction) {
-                XrActionStateGetInfo gi = { XR_TYPE_ACTION_STATE_GET_INFO };
-                gi.action = reinterpret_cast<XrAction>(m_thumbstickAction);
-                XrActionStateVector2f st = { XR_TYPE_ACTION_STATE_VECTOR2F };
-                if (XR_SUCCEEDED(xrGetActionStateVector2f(xrSess, &gi, &st)) && st.isActive) {
-                    m_controllerState.thumbstick_x = st.currentState.x;
-                    m_controllerState.thumbstick_y = st.currentState.y;
+                float sx = 0.0f, sy = 0.0f;
+                for (int h = 0; h < 2; ++h) {
+                    XrActionStateGetInfo gi = { XR_TYPE_ACTION_STATE_GET_INFO };
+                    gi.action = reinterpret_cast<XrAction>(m_thumbstickAction);
+                    gi.subactionPath = m_handPaths[h];
+                    XrActionStateVector2f st = { XR_TYPE_ACTION_STATE_VECTOR2F };
+                    if (XR_SUCCEEDED(xrGetActionStateVector2f(xrSess, &gi, &st)) && st.isActive) {
+                        if (std::abs(st.currentState.x) > std::abs(sx)) sx = st.currentState.x;
+                        if (std::abs(st.currentState.y) > std::abs(sy)) sy = st.currentState.y;
+                    }
                 }
+                m_controllerState.thumbstick_x = sx;
+                m_controllerState.thumbstick_y = sy;
+                m_thumbstickX = sx;
+                m_thumbstickY = sy;
             }
 
-            // Locate 6DoF Right Hand (or Left Hand fallback) Aim Pose in LOCAL space
+            // Locate 6DoF poses for BOTH Left (hand=0) and Right (hand=1) controllers in LOCAL space
             XrSpace aimSpaces[2] = {
-                reinterpret_cast<XrSpace>(m_rightAimSpace),
-                reinterpret_cast<XrSpace>(m_leftAimSpace)
+                reinterpret_cast<XrSpace>(m_leftAimSpace),
+                reinterpret_cast<XrSpace>(m_rightAimSpace)
             };
-            bool poseLocated = false;
+            XrControllerPose* handPoses[2] = { &m_leftControllerPose, &m_rightControllerPose };
+
             for (int h = 0; h < 2; ++h) {
+                handPoses[h]->is_tracked = false;
                 if (!aimSpaces[h]) continue;
                 XrSpaceLocation loc = { XR_TYPE_SPACE_LOCATION };
                 if (XR_SUCCEEDED(xrLocateSpace(aimSpaces[h], localSp,
                                                static_cast<XrTime>(m_lastPredictedDisplayTimeNs), &loc))) {
                     if ((loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
                         (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
-                        m_controllerState.ray_origin[0] = loc.pose.position.x;
-                        m_controllerState.ray_origin[1] = loc.pose.position.y;
-                        m_controllerState.ray_origin[2] = loc.pose.position.z;
-
-                        float qx = loc.pose.orientation.x;
-                        float qy = loc.pose.orientation.y;
-                        float qz = loc.pose.orientation.z;
-                        float qw = loc.pose.orientation.w;
-
-                        // Forward vector (-Z) rotated by quaternion q
-                        m_controllerState.ray_direction[0] = -2.0f * (qx * qz + qw * qy);
-                        m_controllerState.ray_direction[1] = -2.0f * (qy * qz - qw * qx);
-                        m_controllerState.ray_direction[2] = -(1.0f - 2.0f * (qx * qx + qy * qy));
-                        m_controllerState.is_active = true;
-                        poseLocated = true;
-                        break;
+                        handPoses[h]->position[0] = loc.pose.position.x;
+                        handPoses[h]->position[1] = loc.pose.position.y;
+                        handPoses[h]->position[2] = loc.pose.position.z;
+                        handPoses[h]->orientation[0] = loc.pose.orientation.x;
+                        handPoses[h]->orientation[1] = loc.pose.orientation.y;
+                        handPoses[h]->orientation[2] = loc.pose.orientation.z;
+                        handPoses[h]->orientation[3] = loc.pose.orientation.w;
+                        handPoses[h]->is_tracked = true;
                     }
                 }
             }
 
-            // If no controller is turned on yet, use head gaze ray from m_cachedViews[0]
-            if (!poseLocated) {
-                m_controllerState.ray_origin[0] = m_cachedViews[0].position[0];
-                m_controllerState.ray_origin[1] = m_cachedViews[0].position[1];
-                m_controllerState.ray_origin[2] = m_cachedViews[0].position[2];
-                float qx = m_cachedViews[0].orientation[0];
-                float qy = m_cachedViews[0].orientation[1];
-                float qz = m_cachedViews[0].orientation[2];
-                float qw = m_cachedViews[0].orientation[3];
+            // Active hand selection: switch to Left if Left trigger/X pressed or only Left tracked; else Right
+            if ((leftTrig > 0.50f || btnX) && m_leftControllerPose.is_tracked) {
+                m_activeHand = 0;
+            } else if ((rightTrig > 0.50f || btnA) && m_rightControllerPose.is_tracked) {
+                m_activeHand = 1;
+            } else if (m_rightControllerPose.is_tracked && !m_leftControllerPose.is_tracked) {
+                m_activeHand = 1;
+            } else if (m_leftControllerPose.is_tracked && !m_rightControllerPose.is_tracked) {
+                m_activeHand = 0;
+            }
+
+            const XrControllerPose& activePose = (m_activeHand == 0) ? m_leftControllerPose : m_rightControllerPose;
+            if (activePose.is_tracked) {
+                m_controllerState.ray_origin[0] = activePose.position[0];
+                m_controllerState.ray_origin[1] = activePose.position[1];
+                m_controllerState.ray_origin[2] = activePose.position[2];
+
+                const float qx = activePose.orientation[0];
+                const float qy = activePose.orientation[1];
+                const float qz = activePose.orientation[2];
+                const float qw = activePose.orientation[3];
+
+                // Forward vector (-Z) rotated by quaternion q
+                m_controllerState.ray_direction[0] = -2.0f * (qx * qz + qw * qy);
+                m_controllerState.ray_direction[1] = -2.0f * (qy * qz - qw * qx);
+                m_controllerState.ray_direction[2] = -(1.0f - 2.0f * (qx * qx + qy * qy));
+                m_controllerState.is_active = true;
+            } else {
+                // If no controller is turned on yet, use head gaze ray from m_headPose
+                m_controllerState.ray_origin[0] = m_headPose.position[0];
+                m_controllerState.ray_origin[1] = m_headPose.position[1];
+                m_controllerState.ray_origin[2] = m_headPose.position[2];
+                const float qx = m_headPose.orientation[0];
+                const float qy = m_headPose.orientation[1];
+                const float qz = m_headPose.orientation[2];
+                const float qw = m_headPose.orientation[3];
                 m_controllerState.ray_direction[0] = -2.0f * (qx * qz + qw * qy);
                 m_controllerState.ray_direction[1] = -2.0f * (qy * qz - qw * qx);
                 m_controllerState.ray_direction[2] = -(1.0f - 2.0f * (qx * qx + qy * qy));
@@ -837,8 +1511,13 @@ bool VxrOpenXrClient::PollControllerInput(XrControllerInputState* out_state) {
     }
 #endif
 
-    m_controllerState.trigger_clicked = (m_controllerState.trigger_value >= 0.50f) || m_controllerState.button_a;
-    m_controllerState.grip_clicked    = (m_controllerState.grip_value >= 0.55f);
+    m_controllerState.trigger_clicked = (m_controllerState.trigger_value > 0.50f) ||
+                                        m_controllerState.button_a ||
+                                        m_controllerState.button_x;
+    m_controllerState.grip_clicked    = (m_controllerState.grip_value > 0.50f);
+    m_triggerPressed = m_controllerState.trigger_clicked;
+    m_gripPressed    = m_controllerState.grip_clicked;
+
     if (out_state) {
         *out_state = m_controllerState;
     }
@@ -847,15 +1526,22 @@ bool VxrOpenXrClient::PollControllerInput(XrControllerInputState* out_state) {
 
 void VxrOpenXrClient::SetControllerInputState(const XrControllerInputState& state) {
     m_controllerState = state;
-    m_controllerState.trigger_clicked = state.trigger_clicked || (state.trigger_value >= 0.55f);
-    m_controllerState.grip_clicked = state.grip_clicked || (state.grip_value >= 0.55f);
+    m_controllerState.trigger_clicked = state.trigger_clicked ||
+                                        (state.trigger_value > 0.50f) ||
+                                        state.button_a ||
+                                        state.button_x;
+    m_controllerState.grip_clicked = state.grip_clicked || (state.grip_value > 0.50f);
+    m_triggerPressed = m_controllerState.trigger_clicked;
+    m_gripPressed    = m_controllerState.grip_clicked;
+    m_thumbstickX    = state.thumbstick_x;
+    m_thumbstickY    = state.thumbstick_y;
 }
 
 bool VxrOpenXrClient::ComputeDesktopPointerUV(float screenDistM, float* outU, float* outV) const {
     if (m_realXrActive) {
-        return ComputeDesktopPointerUV(m_quadDistM, m_quadWidthM, m_quadHeightM, 0.0f, outU, outV);
+        return ComputeDesktopPointerUV(m_quadDistM, m_quadWidthM, m_quadHeightM, m_screenCenterY, outU, outV);
     }
-    return ComputeDesktopPointerUV(screenDistM, 2.0f, 1.125f, 1.50f, outU, outV);
+    return ComputeDesktopPointerUV(screenDistM, 2.0f, 1.125f, m_screenCenterY, outU, outV);
 }
 
 bool VxrOpenXrClient::ComputeDesktopPointerUV(float screenDistM,
@@ -868,46 +1554,133 @@ bool VxrOpenXrClient::ComputeDesktopPointerUV(float screenDistM,
         return false;
     }
 
-    float planeZ = (screenDistM > 0.0f) ? -screenDistM : screenDistM;
-    float dirZ = m_controllerState.ray_direction[2];
+    const float planeZ = (screenDistM > 0.0f) ? -screenDistM : screenDistM;
+    const float dirZ = m_controllerState.ray_direction[2];
     if (std::abs(dirZ) < 1e-6f) {
         *outU = 0.5f;
         *outV = 0.5f;
+        m_hasLaserHit = false;
         return false;
     }
 
-    float t = (planeZ - m_controllerState.ray_origin[2]) / dirZ;
+    const float t = (planeZ - m_controllerState.ray_origin[2]) / dirZ;
     if (t <= 0.0f) {
         *outU = 0.5f;
         *outV = 0.5f;
+        m_hasLaserHit = false;
         return false;
     }
 
-    float hitX = m_controllerState.ray_origin[0] + t * m_controllerState.ray_direction[0];
-    float hitY = m_controllerState.ray_origin[1] + t * m_controllerState.ray_direction[1];
+    const float hitX = m_controllerState.ray_origin[0] + t * m_controllerState.ray_direction[0];
+    const float hitY = m_controllerState.ray_origin[1] + t * m_controllerState.ray_direction[1];
 
-    float rawU = (hitX / screenWidthM) + 0.5f;
-    float rawV = 0.5f - ((hitY - screenCenterY) / screenHeightM);
+    m_laserHitPoint[0] = hitX;
+    m_laserHitPoint[1] = hitY;
+    m_laserHitPoint[2] = planeZ;
 
-    bool inside = (rawU >= 0.0f && rawU <= 1.0f && rawV >= 0.0f && rawV <= 1.0f);
+    const float halfW = screenWidthM * 0.5f;
+    const float halfH = screenHeightM * 0.5f;
+    const float minX = -halfW;
+    const float maxX =  halfW;
+    const float minY = screenCenterY - halfH;
+    const float maxY = screenCenterY + halfH;
+
+    const float rawU = (hitX - minX) / (maxX - minX);
+    const float rawV = (maxY - hitY) / (maxY - minY);
+
+    const bool inside = (rawU >= 0.0f && rawU <= 1.0f && rawV >= 0.0f && rawV <= 1.0f);
+    m_hasLaserHit = inside;
     *outU = (std::max)(0.0f, (std::min)(1.0f, rawU));
     *outV = (std::max)(0.0f, (std::min)(1.0f, rawV));
     return inside;
+}
+
+std::string VxrOpenXrClient::GetDetectedHeadsetModel() const {
+#if defined(__ANDROID__)
+    char devProp[PROP_VALUE_MAX] = {};
+    char modProp[PROP_VALUE_MAX] = {};
+    __system_property_get("ro.product.device", devProp);
+    __system_property_get("ro.product.model", modProp);
+
+    std::string dev(devProp);
+    std::string mod(modProp);
+    for (char& c : dev) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+
+    if (dev.find("eureka") != std::string::npos)    return "Meta Quest 3";
+    if (dev.find("panther") != std::string::npos)   return "Meta Quest 3S";
+    if (dev.find("hollywood") != std::string::npos) return "Meta Quest 2";
+    if (dev.find("seacliff") != std::string::npos)  return "Meta Quest Pro";
+    if (dev.find("monterey") != std::string::npos)  return "Oculus Quest";
+
+    if (!m_xrSystemName.empty()) return m_xrSystemName;
+    if (!mod.empty()) return mod;
+    return "Meta Quest Headset";
+#else
+    if (!m_xrSystemName.empty()) return m_xrSystemName;
+    return "Meta Quest 3";
+#endif
+}
+
+uint32_t VxrOpenXrClient::GetDeviceBatteryPercent() const {
+#if defined(__ANDROID__)
+    static const char* kBatteryPaths[] = {
+        "/sys/class/power_supply/battery/capacity",
+        "/sys/class/power_supply/bms/capacity"
+    };
+    for (const char* path : kBatteryPaths) {
+        std::ifstream f(path);
+        if (f.is_open()) {
+            int pct = 0;
+            if (f >> pct) {
+                if (pct < 1) pct = 1;
+                if (pct > 100) pct = 100;
+                return static_cast<uint32_t>(pct);
+            }
+        }
+    }
+#endif
+    return 100u;
+}
+
+std::string VxrOpenXrClient::GetLocalClockString() const {
+    std::time_t now = std::time(nullptr);
+    std::tm localTm = {};
+#if defined(_WIN32)
+    localtime_s(&localTm, &now);
+#else
+    localtime_r(&now, &localTm);
+#endif
+    int hour12 = localTm.tm_hour % 12;
+    if (hour12 == 0) hour12 = 12;
+    const char* ampm = (localTm.tm_hour >= 12) ? "PM" : "AM";
+    char buf[32] = {};
+    std::snprintf(buf, sizeof(buf), "%d:%02d %s", hour12, localTm.tm_min, ampm);
+    return std::string(buf);
+}
+
+bool VxrOpenXrClient::LoadCustomEnvironmentGlb(const std::string& glbPath) {
+    VxrGltfLoader loader;
+    return loader.LoadFromFile(glbPath, &m_customEnvModel);
 }
 
 void VxrOpenXrClient::Cleanup() {
     EndSession();
 #if defined(__ANDROID__)
     if (m_realXrActive) {
-        if (m_rightAimSpace) { xrDestroySpace(reinterpret_cast<XrSpace>(m_rightAimSpace)); m_rightAimSpace = nullptr; }
-        if (m_leftAimSpace)  { xrDestroySpace(reinterpret_cast<XrSpace>(m_leftAimSpace));  m_leftAimSpace = nullptr; }
-        if (m_actionSet)     { xrDestroyActionSet(reinterpret_cast<XrActionSet>(m_actionSet)); m_actionSet = nullptr; }
-        if (m_quadSwapchain) { xrDestroySwapchain(reinterpret_cast<XrSwapchain>(m_quadSwapchain)); m_quadSwapchain = nullptr; }
-        if (m_skySwapchain)  { xrDestroySwapchain(reinterpret_cast<XrSwapchain>(m_skySwapchain));  m_skySwapchain = nullptr; }
-        if (m_localSpace)    { xrDestroySpace(reinterpret_cast<XrSpace>(m_localSpace)); m_localSpace = nullptr; }
-        if (m_viewSpace)     { xrDestroySpace(reinterpret_cast<XrSpace>(m_viewSpace));  m_viewSpace = nullptr; }
-        if (m_session)       { xrDestroySession(reinterpret_cast<XrSession>(m_session)); m_session = nullptr; }
-        if (m_instance)      { xrDestroyInstance(reinterpret_cast<XrInstance>(m_instance)); m_instance = nullptr; }
+        DestroyStereoSceneResources();
+        if (m_rightGripSpace) { xrDestroySpace(reinterpret_cast<XrSpace>(m_rightGripSpace)); m_rightGripSpace = nullptr; }
+        if (m_leftGripSpace)  { xrDestroySpace(reinterpret_cast<XrSpace>(m_leftGripSpace));  m_leftGripSpace = nullptr; }
+        if (m_rightAimSpace)  { xrDestroySpace(reinterpret_cast<XrSpace>(m_rightAimSpace));  m_rightAimSpace = nullptr; }
+        if (m_leftAimSpace)   { xrDestroySpace(reinterpret_cast<XrSpace>(m_leftAimSpace));   m_leftAimSpace = nullptr; }
+        if (m_actionSet)      { xrDestroyActionSet(reinterpret_cast<XrActionSet>(m_actionSet)); m_actionSet = nullptr; }
+        if (m_quadSwapchain)  { xrDestroySwapchain(reinterpret_cast<XrSwapchain>(m_quadSwapchain)); m_quadSwapchain = nullptr; }
+        if (m_skySwapchain)   { xrDestroySwapchain(reinterpret_cast<XrSwapchain>(m_skySwapchain));  m_skySwapchain = nullptr; }
+        if (m_localSpace)     { xrDestroySpace(reinterpret_cast<XrSpace>(m_localSpace)); m_localSpace = nullptr; }
+        if (m_viewSpace)      { xrDestroySpace(reinterpret_cast<XrSpace>(m_viewSpace));  m_viewSpace = nullptr; }
+        if (m_session)        { xrDestroySession(reinterpret_cast<XrSession>(m_session)); m_session = nullptr; }
+        if (m_instance)       { xrDestroyInstance(reinterpret_cast<XrInstance>(m_instance)); m_instance = nullptr; }
         if (m_eglDisplay) {
             eglMakeCurrent(m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
             if (m_eglContext) eglDestroyContext(m_eglDisplay, m_eglContext);

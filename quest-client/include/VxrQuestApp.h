@@ -2,6 +2,7 @@
 #define VXR_QUEST_APP_H
 
 #include "VxrMediaCodecDecoder.h"
+#include "VxrMultiDecoder.h"
 #include "VxrVulkanRenderer.h"
 #include "VxrOpenXrClient.h"
 #include "VxrHardwareCursor.h"
@@ -24,7 +25,8 @@ struct QuestAppConfig {
 
 /// Main Meta Quest Client Application Coordinator
 /// Integrates OpenXR 6DoF, Vulkan 1.3 Zero-Copy Compositor, AMediaCodec Low-Latency Decoder,
-/// Virtual Desktop 7-Tab In-VR Menu Overlay, and Bidirectional UDP Network Engine.
+/// 4x Parallel AMediaCodec Multi-Monitor Decoder, Virtual Desktop 7-Tab In-VR Menu Overlay,
+/// and Bidirectional UDP Network Engine.
 class VxrQuestApp {
 public:
     VxrQuestApp();
@@ -49,6 +51,7 @@ public:
     const uint32_t* GetCompositedRgbaFrame(uint32_t* out_width, uint32_t* out_height);
 
     VxrMediaCodecDecoder& GetDecoder() { return m_decoder; }
+    VxrMultiDecoder& GetMultiDecoder() { return m_multiDecoder; }
     VxrVulkanRenderer& GetRenderer() { return m_renderer; }
     VxrOpenXrClient& GetOpenXr() { return m_openXr; }
     VxrHardwareCursor& GetCursor() { return m_cursor; }
@@ -61,10 +64,13 @@ public:
 private:
     void DecodeLiveDesktopStrip(const uint8_t* data, size_t size);
     void CompositeFinalRgbaFrame();
+    void ProcessMenuComputerActions();
+    void UpdateRealHardwareTelemetry();
 
     QuestAppConfig m_config;
     bool m_running;
     uint64_t m_totalFramesRendered;
+    uint64_t m_lastBroadcastTimeMs;
     bool m_prevMenuBtnPressed;
     bool m_prevTriggerClicked;
     float m_surfacePointerX;
@@ -73,6 +79,7 @@ private:
     bool m_hasLiveDesktopFrame;
 
     VxrMediaCodecDecoder m_decoder;
+    VxrMultiDecoder m_multiDecoder;
     VxrVulkanRenderer m_renderer;
     VxrOpenXrClient m_openXr;
     VxrHardwareCursor m_cursor;

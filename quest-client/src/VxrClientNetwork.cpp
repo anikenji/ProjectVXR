@@ -1,7 +1,9 @@
 #include "VxrClientNetwork.h"
+#include "VxrVrMenuUi.h"
 #include <iostream>
 #include <cstring>
 #include <algorithm>
+#include <chrono>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -28,6 +30,11 @@ static constexpr VxrRawSocket VXR_INVALID_SOCK = static_cast<VxrRawSocket>(-1);
 #endif
 
 namespace vxr {
+
+static uint64_t GetSteadyClockUs() {
+    auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now).count());
+}
 
 static void ClosePlatformSocket(uintptr_t& sockHandle) {
     VxrRawSocket s = static_cast<VxrRawSocket>(sockHandle);
@@ -56,15 +63,23 @@ static void SetSocketNonBlocking(VxrRawSocket s) {
 VxrClientNetwork::VxrClientNetwork()
     : m_initialized(false)
     , m_connected(false)
+    , m_userRequestedConnect(false)
     , m_streamPort(38810)
+    , m_beaconPort(38811)
     , m_mdnsPort(5353)
-    , m_connectedHostIp("127.0.0.1")
+    , m_connectedHostIp("")
     , m_connectedHostPort(38810)
-    , m_udpSocket(static_cast<uintptr_t>(VXR_INVALID_SOCK))
-    , m_mdnsSocket(static_cast<uintptr_t>(VXR_INVALID_SOCK))
+    , m_localWifiIp("0.0.0.0")
+    , m_subnetBroadcastIp("255.255.255.255")
+    , m_udpSock(static_cast<uintptr_t>(VXR_INVALID_SOCK))
+    , m_beaconSock(static_cast<uintptr_t>(VXR_INVALID_SOCK))
+    , m_mdnsSock(static_cast<uintptr_t>(VXR_INVALID_SOCK))
     , m_packetsReceived(0)
     , m_framesReassembled(0)
     , m_controlPacketsSent(0)
+    , m_lastOutboundTimestampUs(0)
+    , m_lastInboundTimestampUs(0)
+    , m_measuredRttMs(0.0f)
 {
     std::memset(&m_lastControlPacket, 0, sizeof(m_lastControlPacket));
 }
@@ -73,9 +88,49 @@ VxrClientNetwork::~VxrClientNetwork() {
     Cleanup();
 }
 
+std::string VxrClientNetwork::QueryLocalWifiIp() {
+    VxrRawSocket tmpSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (tmpSock == VXR_INVALID_SOCK) {
+        return m_localWifiIp;
+    }
+
+    sockaddr_in remoteAddr = {};
+    remoteAddr.sin_family = AF_INET;
+    remoteAddr.sin_port = htons(53);
+    inet_pton(AF_INET, "8.8.8.8", &remoteAddr.sin_addr);
+
+    if (connect(tmpSock, reinterpret_cast<const sockaddr*>(&remoteAddr), sizeof(remoteAddr)) == 0) {
+        sockaddr_in localAddr = {};
+#ifdef _WIN32
+        int addrLen = sizeof(localAddr);
+#else
+        socklen_t addrLen = sizeof(localAddr);
+#endif
+        if (getsockname(tmpSock, reinterpret_cast<sockaddr*>(&localAddr), &addrLen) == 0) {
+            char ipBuf[64] = {};
+            if (inet_ntop(AF_INET, &localAddr.sin_addr, ipBuf, sizeof(ipBuf)) != nullptr && ipBuf[0] != '\0') {
+                m_localWifiIp = ipBuf;
+                // Compute /24 subnet broadcast address (e.g. "192.168.1.15" -> "192.168.1.255")
+                size_t lastDot = m_localWifiIp.rfind('.');
+                if (lastDot != std::string::npos && m_localWifiIp != "127.0.0.1" && m_localWifiIp != "0.0.0.0") {
+                    m_subnetBroadcastIp = m_localWifiIp.substr(0, lastDot + 1) + "255";
+                }
+            }
+        }
+    }
+
+#ifdef _WIN32
+    closesocket(tmpSock);
+#else
+    close(tmpSock);
+#endif
+    return m_localWifiIp;
+}
+
 bool VxrClientNetwork::Initialize(uint16_t streamPort, uint16_t mdnsPort) {
     Cleanup();
     m_streamPort = streamPort;
+    m_beaconPort = 38811;
     m_mdnsPort = mdnsPort;
 
 #ifdef _WIN32
@@ -84,6 +139,9 @@ bool VxrClientNetwork::Initialize(uint16_t streamPort, uint16_t mdnsPort) {
         return false;
     }
 #endif
+
+    // Detect real local Wi-Fi IPv4 and /24 subnet broadcast IP
+    QueryLocalWifiIp();
 
     // 1. Create non-blocking UDP streaming & control socket (:38810)
     VxrRawSocket udpSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -104,10 +162,30 @@ bool VxrClientNetwork::Initialize(uint16_t streamPort, uint16_t mdnsPort) {
             bindAddr.sin_port = htons(0);
             bind(udpSock, reinterpret_cast<sockaddr*>(&bindAddr), sizeof(bindAddr));
         }
-        m_udpSocket = static_cast<uintptr_t>(udpSock);
+        m_udpSock = static_cast<uintptr_t>(udpSock);
     }
 
-    // 2. Create non-blocking UDP mDNS discovery listener (:5353)
+    // 2. Create non-blocking UDP broadcast beacon discovery listener (:38811)
+    VxrRawSocket beaconSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (beaconSock != VXR_INVALID_SOCK) {
+        int reuse = 1;
+        setsockopt(beaconSock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+#ifdef SO_REUSEPORT
+        setsockopt(beaconSock, SOL_SOCKET, SO_REUSEPORT, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+#endif
+        int bcast = 1;
+        setsockopt(beaconSock, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&bcast), sizeof(bcast));
+        SetSocketNonBlocking(beaconSock);
+
+        sockaddr_in beaconBind = {};
+        beaconBind.sin_family = AF_INET;
+        beaconBind.sin_port = htons(m_beaconPort);
+        beaconBind.sin_addr.s_addr = htonl(INADDR_ANY);
+        bind(beaconSock, reinterpret_cast<sockaddr*>(&beaconBind), sizeof(beaconBind));
+        m_beaconSock = static_cast<uintptr_t>(beaconSock);
+    }
+
+    // 3. Create non-blocking UDP mDNS discovery listener (:5353)
     VxrRawSocket mdnsSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (mdnsSock != VXR_INVALID_SOCK) {
         int reuse = 1;
@@ -115,6 +193,8 @@ bool VxrClientNetwork::Initialize(uint16_t streamPort, uint16_t mdnsPort) {
 #ifdef SO_REUSEPORT
         setsockopt(mdnsSock, SOL_SOCKET, SO_REUSEPORT, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
 #endif
+        int bcast = 1;
+        setsockopt(mdnsSock, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&bcast), sizeof(bcast));
         SetSocketNonBlocking(mdnsSock);
 
         sockaddr_in mdnsBind = {};
@@ -127,33 +207,63 @@ bool VxrClientNetwork::Initialize(uint16_t streamPort, uint16_t mdnsPort) {
             mreq.imr_interface.s_addr = htonl(INADDR_ANY);
             setsockopt(mdnsSock, IPPROTO_IP, IP_ADD_MEMBERSHIP, reinterpret_cast<const char*>(&mreq), sizeof(mreq));
         }
-        m_mdnsSocket = static_cast<uintptr_t>(mdnsSock);
+        m_mdnsSock = static_cast<uintptr_t>(mdnsSock);
     }
 
-    m_initialized = (m_udpSocket != static_cast<uintptr_t>(VXR_INVALID_SOCK));
+    m_initialized = (m_udpSock != static_cast<uintptr_t>(VXR_INVALID_SOCK));
+    m_connected = false;
+    m_userRequestedConnect = false;
     m_packetsReceived = 0;
     m_framesReassembled = 0;
     m_controlPacketsSent = 0;
     m_pendingFrames.clear();
     m_pendingFrameOrder.clear();
 
-    std::cout << "[VXR-Net] Initialized Quest UDP Network Client (streamPort=:" << m_streamPort
+    std::cout << "[VXR-Net] Initialized Quest UDP Network Client (localIp=" << m_localWifiIp
+              << ", subnetBcast=" << m_subnetBroadcastIp
+              << ", streamPort=:" << m_streamPort
+              << ", beaconPort=:" << m_beaconPort
               << ", mdnsPort=:" << m_mdnsPort << ")" << std::endl;
     return m_initialized;
 }
 
 void VxrClientNetwork::Cleanup() {
-    ClosePlatformSocket(m_udpSocket);
-    ClosePlatformSocket(m_mdnsSocket);
+    ClosePlatformSocket(m_udpSock);
+    ClosePlatformSocket(m_beaconSock);
+    ClosePlatformSocket(m_mdnsSock);
     m_pendingFrames.clear();
     m_pendingFrameOrder.clear();
     m_connected = false;
+    m_userRequestedConnect = false;
     if (m_initialized) {
 #ifdef _WIN32
         WSACleanup();
 #endif
         m_initialized = false;
     }
+}
+
+void VxrClientNetwork::Disconnect() {
+    m_connected = false;
+    m_userRequestedConnect = false;
+    m_connectedHostIp.clear();
+}
+
+void VxrClientNetwork::RecordHostArrivalTiming() {
+    uint64_t nowUs = GetSteadyClockUs();
+    if (m_lastOutboundTimestampUs > 0 && nowUs >= m_lastOutboundTimestampUs) {
+        float rttMs = static_cast<float>(nowUs - m_lastOutboundTimestampUs) / 1000.0f;
+        if (rttMs > 0.05f && rttMs < 500.0f) {
+            m_measuredRttMs = (m_measuredRttMs <= 0.01f) ? rttMs : (m_measuredRttMs * 0.8f + rttMs * 0.2f);
+            m_lastOutboundTimestampUs = 0;
+        }
+    } else if (m_lastInboundTimestampUs > 0 && nowUs > m_lastInboundTimestampUs) {
+        float deltaMs = static_cast<float>(nowUs - m_lastInboundTimestampUs) / 1000.0f;
+        if (deltaMs > 0.1f && deltaMs < 100.0f && m_measuredRttMs <= 0.01f) {
+            m_measuredRttMs = deltaMs;
+        }
+    }
+    m_lastInboundTimestampUs = nowUs;
 }
 
 bool VxrClientNetwork::ReassembleFrame(const uint8_t* packetData, size_t packetLen, ReassembledVideoFrame* outFrame) {
@@ -302,9 +412,98 @@ bool VxrClientNetwork::ReassembleFrame(const uint8_t* packetData, size_t packetL
     return false;
 }
 
+bool VxrClientNetwork::HandleIncomingControlOrBeaconPacket(const uint8_t* rxBuf, size_t len, const char* senderIp) {
+    if (!rxBuf || len == 0) {
+        return false;
+    }
+
+    // 1. Check for binary VXR_HOST_INFO_MAGIC (0x56585248 "VXRH")
+    if (len >= 4) {
+        uint32_t magic = 0;
+        std::memcpy(&magic, rxBuf, 4);
+        if (magic == VXR_HOST_INFO_MAGIC) {
+            RecordHostArrivalTiming();
+
+            DiscoveredHostInfo hInfo = {};
+            hInfo.ip_address = (senderIp && senderIp[0] != '\0') ? senderIp : "127.0.0.1";
+            hInfo.computer_name = "VXR-PC";
+            hInfo.port = 38810;
+            hInfo.ping_ms = (m_measuredRttMs >= 1.0f) ? static_cast<uint32_t>(m_measuredRttMs) : 2;
+
+            if (len >= 80) {
+                uint16_t hostPort = 0;
+                std::memcpy(&hostPort, rxBuf + 4, sizeof(uint16_t));
+                if (hostPort > 0) {
+                    hInfo.port = hostPort;
+                }
+                char compName[65] = {};
+                std::memcpy(compName, rxBuf + 16, 64);
+                if (compName[0] != '\0') {
+                    hInfo.computer_name = compName;
+                }
+            }
+            if (len >= sizeof(VxrHostInfoWirePacket)) {
+                const VxrHostInfoWirePacket* wire = reinterpret_cast<const VxrHostInfoWirePacket*>(rxBuf);
+                char gpuBuf[65] = {};
+                char codecBuf[33] = {};
+                std::memcpy(gpuBuf, wire->gpu_name, 64);
+                std::memcpy(codecBuf, wire->codec_name, 32);
+                hInfo.gpu_name = gpuBuf;
+                hInfo.codec_name = codecBuf;
+            }
+
+            bool found = false;
+            for (auto& ex : m_discoveredHosts) {
+                if (ex.ip_address == hInfo.ip_address) {
+                    ex = hInfo;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                m_discoveredHosts.push_back(hInfo);
+            }
+
+            // Only transition m_connected = true if the user requested a connection to this unicast PC IP
+            if (m_userRequestedConnect && !m_connectedHostIp.empty() && hInfo.ip_address == m_connectedHostIp) {
+                m_connected = true;
+            }
+            return true;
+        }
+    }
+
+    // 2. Check for "VXR_ACK_OK"
+    if (len >= 10 && std::memcmp(rxBuf, "VXR_ACK_OK", 10) == 0) {
+        RecordHostArrivalTiming();
+        if (m_userRequestedConnect) {
+            m_connected = true;
+            if (senderIp && senderIp[0] != '\0' && m_connectedHostIp.empty()) {
+                m_connectedHostIp = senderIp;
+            }
+        }
+        return true;
+    }
+
+    // 3. Check for text beacon "VXR_MDNS_BEACON:"
+    DiscoveredHostInfo beaconHost = {};
+    if (ParseMdnsBeacon(reinterpret_cast<const char*>(rxBuf), len, senderIp, &beaconHost)) {
+        RecordHostArrivalTiming();
+        return true;
+    }
+
+    return false;
+}
+
 bool VxrClientNetwork::PollNetwork(ReassembledVideoFrame* outFrame) {
-    VxrRawSocket s = static_cast<VxrRawSocket>(m_udpSocket);
-    if (!m_initialized || s == VXR_INVALID_SOCK) {
+    if (!m_initialized) {
+        return false;
+    }
+
+    // Also poll m_beaconSock (:38811) and m_mdnsSock (:5353) for host discovery packets
+    PollMdnsDiscovery(nullptr);
+
+    VxrRawSocket s = static_cast<VxrRawSocket>(m_udpSock);
+    if (s == VXR_INVALID_SOCK) {
         return false;
     }
 
@@ -325,49 +524,17 @@ bool VxrClientNetwork::PollNetwork(ReassembledVideoFrame* outFrame) {
         char senderIp[64] = {};
         inet_ntop(AF_INET, &fromAddr.sin_addr, senderIp, sizeof(senderIp));
 
-        if (r >= 4) {
-            uint32_t magic = 0;
-            std::memcpy(&magic, rxBuf, 4);
-            // VXR_HOST_INFO_MAGIC = 0x56585248 ("VXRH")
-            if (magic == 0x56585248u) {
-                m_connected = true;
-                if (senderIp[0] != '\0') {
-                    m_connectedHostIp = senderIp;
-                }
-                if (r >= 80) {
-                    char compName[65] = {};
-                    std::memcpy(compName, rxBuf + 16, 64);
-                    DiscoveredHostInfo hInfo = {};
-                    hInfo.ip_address = m_connectedHostIp;
-                    hInfo.computer_name = (compName[0] != '\0') ? compName : "VXR-PC";
-                    hInfo.port = m_connectedHostPort;
-                    hInfo.ping_ms = 2;
-                    bool found = false;
-                    for (auto& ex : m_discoveredHosts) {
-                        if (ex.ip_address == hInfo.ip_address) {
-                            ex = hInfo;
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) m_discoveredHosts.push_back(hInfo);
-                }
-                continue;
-            }
-        }
-
-        if (r >= 10 && std::memcmp(rxBuf, "VXR_ACK_OK", 10) == 0) {
-            m_connected = true;
-            if (senderIp[0] != '\0') {
-                m_connectedHostIp = senderIp;
-            }
+        if (HandleIncomingControlOrBeaconPacket(rxBuf, static_cast<size_t>(r), senderIp)) {
             continue;
         }
 
         if (outFrame && ReassembleFrame(rxBuf, static_cast<size_t>(r), outFrame)) {
-            m_connected = true;
-            if (senderIp[0] != '\0' && (m_connectedHostIp == "127.0.0.1" || m_connectedHostIp == "255.255.255.255")) {
-                m_connectedHostIp = senderIp;
+            RecordHostArrivalTiming();
+            if (m_userRequestedConnect) {
+                m_connected = true;
+                if (senderIp[0] != '\0' && m_connectedHostIp.empty()) {
+                    m_connectedHostIp = senderIp;
+                }
             }
             return true;
         }
@@ -386,17 +553,19 @@ bool VxrClientNetwork::ParseMdnsBeacon(const char* beaconStr, size_t len, const 
     }
 
     outHost->ip_address = (senderIp && senderIp[0]) ? senderIp : "127.0.0.1";
-    outHost->computer_name = "DESKTOP-VXR-HOST";
-    outHost->meta_account = "Phuong1226";
+    outHost->computer_name = "VXR-PC";
+    outHost->meta_account = "";
     outHost->port = 38810;
-    outHost->ping_ms = 2;
+    outHost->ping_ms = (m_measuredRttMs >= 1.0f) ? static_cast<uint32_t>(m_measuredRttMs) : 2;
 
     size_t userPos = msg.find("user=");
     if (userPos != std::string::npos) {
         size_t start = userPos + 5;
         size_t end = msg.find(';', start);
         outHost->meta_account = (end != std::string::npos) ? msg.substr(start, end - start) : msg.substr(start);
-        outHost->computer_name = outHost->meta_account + "-PC";
+        if (!outHost->meta_account.empty()) {
+            outHost->computer_name = outHost->meta_account + "-PC";
+        }
     }
 
     size_t hostPos = msg.find("host=");
@@ -419,8 +588,11 @@ bool VxrClientNetwork::ParseMdnsBeacon(const char* beaconStr, size_t len, const 
 
     bool updated = false;
     for (auto& existing : m_discoveredHosts) {
-        if (existing.ip_address == outHost->ip_address && existing.port == outHost->port) {
-            existing = *outHost;
+        if (existing.ip_address == outHost->ip_address) {
+            existing.computer_name = outHost->computer_name;
+            existing.meta_account = outHost->meta_account;
+            existing.port = outHost->port;
+            existing.ping_ms = outHost->ping_ms;
             updated = true;
             break;
         }
@@ -432,33 +604,38 @@ bool VxrClientNetwork::ParseMdnsBeacon(const char* beaconStr, size_t len, const 
 }
 
 bool VxrClientNetwork::PollMdnsDiscovery(std::vector<DiscoveredHostInfo>* outHosts) {
-    VxrRawSocket s = static_cast<VxrRawSocket>(m_mdnsSocket);
-    if (!m_initialized || s == VXR_INVALID_SOCK) {
+    if (!m_initialized) {
         return false;
     }
 
     bool foundNew = false;
-    char rxBuf[1024];
-    for (int iter = 0; iter < 16; ++iter) {
-        sockaddr_in fromAddr = {};
+    uintptr_t socks[2] = { m_mdnsSock, m_beaconSock };
+
+    for (int sIdx = 0; sIdx < 2; ++sIdx) {
+        VxrRawSocket s = static_cast<VxrRawSocket>(socks[sIdx]);
+        if (s == VXR_INVALID_SOCK) continue;
+
+        uint8_t rxBuf[1024];
+        for (int iter = 0; iter < 16; ++iter) {
+            sockaddr_in fromAddr = {};
 #ifdef _WIN32
-        int fromLen = sizeof(fromAddr);
+            int fromLen = sizeof(fromAddr);
 #else
-        socklen_t fromLen = sizeof(fromAddr);
+            socklen_t fromLen = sizeof(fromAddr);
 #endif
-        int r = recvfrom(s, rxBuf, sizeof(rxBuf) - 1, 0,
-                         reinterpret_cast<sockaddr*>(&fromAddr), &fromLen);
-        if (r <= 0) {
-            break;
-        }
-        rxBuf[r] = '\0';
+            int r = recvfrom(s, reinterpret_cast<char*>(rxBuf), sizeof(rxBuf) - 1, 0,
+                             reinterpret_cast<sockaddr*>(&fromAddr), &fromLen);
+            if (r <= 0) {
+                break;
+            }
+            rxBuf[r] = 0;
 
-        char ipStr[64] = {};
-        inet_ntop(AF_INET, &fromAddr.sin_addr, ipStr, sizeof(ipStr));
+            char ipStr[64] = {};
+            inet_ntop(AF_INET, &fromAddr.sin_addr, ipStr, sizeof(ipStr));
 
-        DiscoveredHostInfo info;
-        if (ParseMdnsBeacon(rxBuf, static_cast<size_t>(r), ipStr, &info)) {
-            foundNew = true;
+            if (HandleIncomingControlOrBeaconPacket(rxBuf, static_cast<size_t>(r), ipStr)) {
+                foundNew = true;
+            }
         }
     }
 
@@ -468,12 +645,57 @@ bool VxrClientNetwork::PollMdnsDiscovery(std::vector<DiscoveredHostInfo>* outHos
     return foundNew;
 }
 
+bool VxrClientNetwork::SendBroadcastDiscovery(const char* headsetModelName, uint16_t port) {
+    if (m_localWifiIp == "0.0.0.0" || m_localWifiIp.empty()) {
+        QueryLocalWifiIp();
+    }
+
+    VxrControlDiscoverPacket discPkt = {};
+    discPkt.hdr.magic = VXR_UDP_CTRL_MAGIC; // 0x56585243 ("VXRC")
+    discPkt.hdr.cmd_type = 1;               // VXR_CMD_DISCOVER
+    const char* model = (headsetModelName && headsetModelName[0] != '\0') ? headsetModelName : "Meta Quest";
+    std::strncpy(discPkt.headset_name, model, sizeof(discPkt.headset_name) - 1);
+
+    m_controlPacketsSent++;
+    m_lastOutboundTimestampUs = GetSteadyClockUs();
+
+    VxrRawSocket s = static_cast<VxrRawSocket>(m_udpSock);
+    if (!m_initialized || s == VXR_INVALID_SOCK) {
+        return false;
+    }
+
+    uint16_t targetPort = (port > 0) ? port : m_streamPort;
+
+    // 1. Send to computed /24 subnet broadcast (e.g. 192.168.1.255:38810)
+    if (!m_subnetBroadcastIp.empty() && m_subnetBroadcastIp != "255.255.255.255") {
+        sockaddr_in subAddr = {};
+        subAddr.sin_family = AF_INET;
+        subAddr.sin_port = htons(targetPort);
+        if (inet_pton(AF_INET, m_subnetBroadcastIp.c_str(), &subAddr.sin_addr) == 1) {
+            sendto(s, reinterpret_cast<const char*>(&discPkt), sizeof(discPkt), 0,
+                   reinterpret_cast<const sockaddr*>(&subAddr), sizeof(subAddr));
+        }
+    }
+
+    // 2. Send to global limited broadcast (255.255.255.255:38810)
+    sockaddr_in bcastAddr = {};
+    bcastAddr.sin_family = AF_INET;
+    bcastAddr.sin_port = htons(targetPort);
+    inet_pton(AF_INET, "255.255.255.255", &bcastAddr.sin_addr);
+    int sent = sendto(s, reinterpret_cast<const char*>(&discPkt), sizeof(discPkt), 0,
+                      reinterpret_cast<const sockaddr*>(&bcastAddr), sizeof(bcastAddr));
+
+    // IMPORTANT: Never set m_connected = true on broadcast discovery!
+    return (sent == static_cast<int>(sizeof(discPkt)));
+}
+
 bool VxrClientNetwork::SendControlPacketInternal(const VxrClientControlPacket& pkt) {
     m_lastControlPacket = pkt;
     m_controlPacketsSent++;
+    m_lastOutboundTimestampUs = GetSteadyClockUs();
 
-    VxrRawSocket s = static_cast<VxrRawSocket>(m_udpSocket);
-    if (!m_initialized || s == VXR_INVALID_SOCK) {
+    VxrRawSocket s = static_cast<VxrRawSocket>(m_udpSock);
+    if (!m_initialized || s == VXR_INVALID_SOCK || m_connectedHostIp.empty()) {
         return true;
     }
 
@@ -481,7 +703,7 @@ bool VxrClientNetwork::SendControlPacketInternal(const VxrClientControlPacket& p
     destAddr.sin_family = AF_INET;
     destAddr.sin_port = htons(m_connectedHostPort);
     if (inet_pton(AF_INET, m_connectedHostIp.c_str(), &destAddr.sin_addr) != 1) {
-        inet_pton(AF_INET, "127.0.0.1", &destAddr.sin_addr);
+        return false;
     }
 
     int sent = sendto(s, reinterpret_cast<const char*>(&pkt), sizeof(pkt), 0,
@@ -489,37 +711,50 @@ bool VxrClientNetwork::SendControlPacketInternal(const VxrClientControlPacket& p
     return (sent == static_cast<int>(sizeof(pkt)));
 }
 
-bool VxrClientNetwork::SendDiscoverAndConnect(const char* hostIp, uint16_t port) {
-    bool isBroadcast = (hostIp && std::strcmp(hostIp, "255.255.255.255") == 0);
-    if (hostIp && hostIp[0] != '\0' && !isBroadcast) {
-        m_connectedHostIp = hostIp;
+bool VxrClientNetwork::SendDiscoverAndConnect(const char* hostIp, uint16_t port, const char* headsetModelName) {
+    if (!hostIp || hostIp[0] == '\0') {
+        return false;
     }
+
+    bool isBroadcast = (std::strcmp(hostIp, "255.255.255.255") == 0) ||
+                       (m_subnetBroadcastIp == hostIp);
+    if (isBroadcast) {
+        return SendBroadcastDiscovery(headsetModelName, port);
+    }
+
+    m_connectedHostIp = hostIp;
     if (port > 0) {
         m_connectedHostPort = port;
     }
+    m_userRequestedConnect = true;
+    m_lastOutboundTimestampUs = GetSteadyClockUs();
 
-    VxrClientControlPacket pkt = {};
-    pkt.magic = VXR_UDP_CTRL_MAGIC; // 0x56585243 ("VXRC")
-    pkt.cmd_type = 1;
+    // Send 72-byte VxrControlDiscoverPacket with the real headset model name to the unicast PC IP
+    VxrControlDiscoverPacket discPkt = {};
+    discPkt.hdr.magic = VXR_UDP_CTRL_MAGIC; // 0x56585243 ("VXRC")
+    discPkt.hdr.cmd_type = 1;               // VXR_CMD_CONNECT
+    const char* model = (headsetModelName && headsetModelName[0] != '\0') ? headsetModelName : "Meta Quest";
+    std::strncpy(discPkt.headset_name, model, sizeof(discPkt.headset_name) - 1);
 
-    if (isBroadcast) {
-        VxrRawSocket s = static_cast<VxrRawSocket>(m_udpSocket);
-        if (m_initialized && s != VXR_INVALID_SOCK) {
-            sockaddr_in bcastAddr = {};
-            bcastAddr.sin_family = AF_INET;
-            bcastAddr.sin_port = htons(m_connectedHostPort);
-            inet_pton(AF_INET, "255.255.255.255", &bcastAddr.sin_addr);
-            sendto(s, reinterpret_cast<const char*>(&pkt), sizeof(pkt), 0,
-                   reinterpret_cast<const sockaddr*>(&bcastAddr), sizeof(bcastAddr));
-        }
-        return true;
+    m_lastControlPacket.magic = VXR_UDP_CTRL_MAGIC;
+    m_lastControlPacket.cmd_type = 1;
+    m_controlPacketsSent++;
+
+    VxrRawSocket s = static_cast<VxrRawSocket>(m_udpSock);
+    if (!m_initialized || s == VXR_INVALID_SOCK) {
+        return false;
     }
 
-    bool ok = SendControlPacketInternal(pkt);
-    if (ok) {
-        m_connected = true;
+    sockaddr_in destAddr = {};
+    destAddr.sin_family = AF_INET;
+    destAddr.sin_port = htons(m_connectedHostPort);
+    if (inet_pton(AF_INET, m_connectedHostIp.c_str(), &destAddr.sin_addr) != 1) {
+        return false;
     }
-    return ok;
+
+    int sent = sendto(s, reinterpret_cast<const char*>(&discPkt), sizeof(discPkt), 0,
+                      reinterpret_cast<const sockaddr*>(&destAddr), sizeof(destAddr));
+    return (sent == static_cast<int>(sizeof(discPkt)));
 }
 
 bool VxrClientNetwork::SendDesktopMouseInput(float normX, float normY, uint8_t buttonMask, int16_t wheelDelta) {
@@ -551,6 +786,18 @@ bool VxrClientNetwork::SendClientStreamingSettings(uint32_t desktopBitrateMbps,
     pkt.ssw_mode = sswMode;
     pkt.enable_sgsr = enableSgsr ? 1 : 0;
     return SendControlPacketInternal(pkt);
+}
+
+bool VxrClientNetwork::SendClientSettings(const VrMenuSettings& settings) {
+    return SendClientStreamingSettings(
+        settings.desktop_bitrate_mbps,
+        settings.vr_bitrate_mbps,
+        settings.vr_graphics_quality,
+        settings.vr_frame_rate,
+        settings.sharpening_pct,
+        static_cast<uint8_t>(settings.ssw_mode),
+        settings.snapdragon_sgsr
+    );
 }
 
 bool VxrClientNetwork::SendLaunchSteamVr() {

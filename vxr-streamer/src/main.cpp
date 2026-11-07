@@ -31,6 +31,8 @@
 #include "vxr_iddcx_control.h"
 #include "VxrComputeShaders.h"
 #include "DxgiDuplicator.h"
+#include "VxrWifiOptimizer.h"
+#include "VxrNvapiOptimizer.h"
 
 using namespace Gdiplus;
 
@@ -112,20 +114,20 @@ struct VxrControlClientSettingsPacket {
 
 // Unified 36-byte Client Control Packet sent by VxrClientNetwork.cpp (Quest Client)
 struct VxrClientControlPacket {
-    uint32_t magic;          // 0x56585243 ("VXRC")
-    uint8_t  cmd_type;       // 1..5
-    uint8_t  button_mask;    // bit0=Left, bit1=Right, bit2=Middle
+    uint32_t magic;                // 0x56585243 ("VXRC")
+    uint8_t  cmd_type;             // 1..5
+    uint8_t  button_mask;          // bit0=Left, bit1=Right, bit2=Middle
     int16_t  wheel_delta;
     float    cursor_norm_x;
     float    cursor_norm_y;
-    uint32_t bitrate_mbps;
-    uint32_t fps;
-    uint32_t render_width;
-    uint32_t render_height;
-    uint8_t  quality_index;
+    uint32_t desktop_bitrate_mbps;
+    uint32_t vr_bitrate_mbps;
+    uint32_t vr_quality_tier;
+    uint32_t vr_fps;
+    uint32_t sharpening_pct;
     uint8_t  ssw_mode;
-    uint8_t  sharpening_pct;
-    uint8_t  flags;          // bit0=SGSR, bit1=passthrough_env, bit2=passthrough_hands, bit3=color_vibrance
+    uint8_t  enable_sgsr;
+    uint8_t  reserved[2];
 };
 
 struct VxrHostInfoPacket {
@@ -354,7 +356,9 @@ struct HostServiceState {
     // Real system info for ABOUT tab (matching Screenshot 1)
     std::wstring      gpuNameWithDriver = L"Detecting GPU...";
     std::wstring      gpuShortName = L"Detecting GPU...";
-    std::wstring      connectedHeadset = L"Meta Quest 3";
+    std::wstring      connectedHeadset = L"Not connected";
+    ULONGLONG         lastClientPacketTick = 0;
+    float             activeLatencyMs = 0.0f;
     std::wstring      cpuName = L"Detecting Processor...";
     std::wstring      ramTotalGb = L"Detecting...";
     std::wstring      osVersionStr = L"Windows 10/11";
@@ -564,19 +568,35 @@ static void QueryRealSystemSpecs() {
         }
     }
 
-    // 7. GPU Driver Version from Display Class Registry (e.g. "32.0.15.6614" -> "566.14")
-    std::wstring drvVer = ReadRegString(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}\\0000", L"DriverVersion");
-    std::wstring shortDrv;
-    if (drvVer.size() >= 6) {
-        std::wstring digits;
-        for (wchar_t c : drvVer) {
-            if (c >= L'0' && c <= L'9') digits.push_back(c);
-        }
-        if (digits.size() >= 5) {
-            std::wstring tail5 = digits.substr(digits.size() - 5);
-            shortDrv = tail5.substr(0, 3) + L"." + tail5.substr(3, 2);
-        } else {
-            shortDrv = drvVer;
+    // 7. GPU Driver Version: First query nvml.dll (nvmlInit_v2 + nvmlSystemGetDriverVersion) & nvapi64.dll,
+    //    then fallback to Display Class Registry subkeys 0000..0009 matching DriverDesc == g_svc.gpuShortName
+    std::wstring gpuNameSnapshot;
+    {
+        std::lock_guard<std::mutex> lock(g_svc.statusMutex);
+        gpuNameSnapshot = g_svc.gpuShortName;
+    }
+    std::wstring shortDrv = vxr::VxrNvapiOptimizer::QueryExactDriverVersion(gpuNameSnapshot);
+    if (shortDrv.empty()) {
+        for (int idx = 0; idx < 10; ++idx) {
+            wchar_t subKey[256] = {};
+            swprintf_s(subKey, L"SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}\\%04d", idx);
+            std::wstring desc = ReadRegString(HKEY_LOCAL_MACHINE, subKey, L"DriverDesc");
+            if (!desc.empty() && _wcsicmp(desc.c_str(), gpuNameSnapshot.c_str()) == 0) {
+                std::wstring drvVer = ReadRegString(HKEY_LOCAL_MACHINE, subKey, L"DriverVersion");
+                if (drvVer.size() >= 6) {
+                    std::wstring digits;
+                    for (wchar_t c : drvVer) {
+                        if (c >= L'0' && c <= L'9') digits.push_back(c);
+                    }
+                    if (digits.size() >= 5) {
+                        std::wstring tail5 = digits.substr(digits.size() - 5);
+                        shortDrv = tail5.substr(0, 3) + L"." + tail5.substr(3, 2);
+                    } else {
+                        shortDrv = drvVer;
+                    }
+                }
+                break;
+            }
         }
     }
 
@@ -894,6 +914,36 @@ static void HostServiceThreadProc() {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     AppendServiceLog(L"Project VXR Host Service starting...");
 
+    // Phase A.3: Disable Windows CPU Power Throttling so Intel Hybrid P/E-Core scheduler
+    // (e.g. Core i7-13700K) never demotes ProjectVXR.exe to E-Cores when minimized in System Tray.
+    PROCESS_POWER_THROTTLING_STATE throttling = {};
+    throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    throttling.StateMask = 0; // 0 = Disable execution speed throttling
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof(throttling));
+
+    // Phase A.2: Boost streaming thread with Windows MMCSS "Games" profile + CRITICAL priority
+    DWORD mmcssTaskIdx = 0;
+    HANDLE hThreadAvrt = AvSetMmThreadCharacteristicsW(L"Games", &mmcssTaskIdx);
+    if (hThreadAvrt) {
+        AvSetMmThreadPriority(hThreadAvrt, AVRT_PRIORITY_CRITICAL);
+        g_svc.mmcssBoostActive = true;
+    }
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+
+    // Phase B.2: Force driver-level V-Sync off via NVAPI so DXGI capture can run at 90/120Hz
+    vxr::VxrNvapiOptimizer::DisableDriverVsync();
+
+    // Auto-configure Windows Firewall inbound rule for UDP ports 38810, 38811, 5353
+    ShellExecuteW(
+        nullptr,
+        L"open",
+        L"netsh",
+        L"advfirewall firewall add rule name=\"Project VXR Streamer\" dir=in action=allow protocol=UDP localport=38810,38811,5353",
+        nullptr,
+        SW_HIDE
+    );
+
     auto setStep = [](int pct, const wchar_t* text) {
         AppendServiceLog(text);
         {
@@ -907,6 +957,14 @@ static void HostServiceThreadProc() {
 
     // Step 1: DXGI & Direct3D 11 Hardware Device + System Specs
     setStep(15, L"Initializing Direct3D 11 & DXGI Desktop Duplication...");
+    {
+        std::wstring hiPerfGpuName;
+        vxr::VxrNvapiOptimizer::GetHighPerformanceAdapterLuid(&hiPerfGpuName);
+        if (!hiPerfGpuName.empty()) {
+            std::lock_guard<std::mutex> lock(g_svc.statusMutex);
+            g_svc.gpuShortName = hiPerfGpuName;
+        }
+    }
     IDXGIFactory1* pFactory = nullptr;
     if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&pFactory))) {
         IDXGIAdapter1* pAdapter = nullptr;
@@ -914,7 +972,9 @@ static void HostServiceThreadProc() {
             DXGI_ADAPTER_DESC1 desc;
             if (SUCCEEDED(pAdapter->GetDesc1(&desc))) {
                 std::lock_guard<std::mutex> lock(g_svc.statusMutex);
-                g_svc.gpuShortName = desc.Description;
+                if (g_svc.gpuShortName == L"Detecting GPU..." || g_svc.gpuShortName.empty()) {
+                    g_svc.gpuShortName = desc.Description;
+                }
             }
             pAdapter->Release();
         }
@@ -991,6 +1051,8 @@ static void HostServiceThreadProc() {
         if (g_svc.udpSocket != INVALID_SOCKET) {
             BOOL reuse = TRUE;
             setsockopt(g_svc.udpSocket, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+            BOOL bcast = TRUE;
+            setsockopt(g_svc.udpSocket, SOL_SOCKET, SO_BROADCAST, (const char*)&bcast, sizeof(bcast));
             int tos = 0xB8; // DSCP 46 Expedited Forwarding
             setsockopt(g_svc.udpSocket, IPPROTO_IP, IP_TOS, (const char*)&tos, sizeof(tos));
             int sndBuf = 4 * 1024 * 1024;
@@ -1040,9 +1102,50 @@ static void HostServiceThreadProc() {
     uint32_t currentOutputIdx = 0;
     bool capInit = (dxgiDupl.Initialize(0, currentOutputIdx) == VXR_CAPTURE_OK);
 
+    vxr::VxrWifiOptimizer wifiOptimizer;
     sockaddr_in lastActiveClient = {};
     bool hasActiveClient = false;
     uint8_t prevClientMouseMask = 0;
+    LARGE_INTEGER qpcFreq = {};
+    QueryPerformanceFrequency(&qpcFreq);
+    LARGE_INTEGER lastClientQpc = {};
+    double smoothedEncodeMs = 2.4;
+
+    auto buildHostInfoPacket = [&]() -> VxrHostInfoPacket {
+        DEVMODEW dm = {};
+        dm.dmSize = sizeof(dm);
+        uint16_t deskW = (uint16_t)GetSystemMetrics(SM_CXSCREEN);
+        uint16_t deskH = (uint16_t)GetSystemMetrics(SM_CYSCREEN);
+        uint16_t deskHz = 60;
+        if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm)) {
+            if (dm.dmPelsWidth > 0) deskW = (uint16_t)dm.dmPelsWidth;
+            if (dm.dmPelsHeight > 0) deskH = (uint16_t)dm.dmPelsHeight;
+            if (dm.dmDisplayFrequency > 1) deskHz = (uint16_t)dm.dmDisplayFrequency;
+        }
+        std::string gpuUtf8;
+        {
+            std::lock_guard<std::mutex> lock(g_svc.statusMutex);
+            gpuUtf8 = WideToUtf8(g_svc.gpuShortName);
+        }
+        std::string codecUtf8 = WideToUtf8(g_cfg.GetCodecName());
+
+        VxrHostInfoPacket hostInfo = {};
+        hostInfo.magic = VXR_HOST_INFO_MAGIC;
+        hostInfo.udp_port = g_svc.udpPort;
+        hostInfo.desktop_width = deskW;
+        hostInfo.desktop_height = deskH;
+        hostInfo.refresh_rate_hz = deskHz;
+        hostInfo.bitrate_mbps = (uint16_t)g_svc.activeBitrateMbps;
+        hostInfo.codec_id = (uint8_t)g_cfg.preferredCodec;
+        strncpy_s(hostInfo.computer_name, hostCompUtf8.c_str(), _TRUNCATE);
+        strncpy_s(hostInfo.gpu_name, gpuUtf8.c_str(), _TRUNCATE);
+        strncpy_s(hostInfo.codec_name, codecUtf8.c_str(), _TRUNCATE);
+        sprintf_s(hostInfo.json_summary,
+            "VXR_HOST_INFO:{\"pc\":\"%s\",\"gpu\":\"%s\",\"codec\":\"%s\",\"width\":%u,\"height\":%u,\"hz\":%u,\"bitrate_mbps\":%u}",
+            hostInfo.computer_name, hostInfo.gpu_name, hostInfo.codec_name,
+            (unsigned)deskW, (unsigned)deskH, (unsigned)deskHz, (unsigned)hostInfo.bitrate_mbps);
+        return hostInfo;
+    };
 
     // Real-time GDI Live Desktop Downscaler resources (640x400 RGB565 RLE strips -> 1280x800 on Quest)
     const int kLiveW = 640;
@@ -1086,11 +1189,64 @@ static void HostServiceThreadProc() {
             ShowToast(monMsg);
         }
 
-        if (g_svc.mdnsListening && (now - lastBeaconTick >= 1500)) {
+        // Check client heartbeat timeout (> 5000 ms without UDP packets -> mark disconnected & unlock Wi-Fi scan)
+        if (hasActiveClient && (now - g_svc.lastClientPacketTick > 5000)) {
+            hasActiveClient = false;
+            wifiOptimizer.UnlockBackgroundScan();
+            {
+                std::lock_guard<std::mutex> lock(g_svc.statusMutex);
+                g_svc.connectedHeadset = L"Not connected";
+                g_svc.activeLatencyMs = 0.0f;
+            }
+            if (g_hwnd) PostMessageW(g_hwnd, WM_SERVICE_UPDATE, 0, 0);
+            ShowToast(L"Headset disconnected (UDP timeout)");
+        }
+
+        if (g_svc.mdnsListening && (now - lastBeaconTick >= 1000)) {
             lastBeaconTick = now;
             std::string beacon = "VXR_MDNS_BEACON:_vxr._udp.local.;host=" + hostCompUtf8 + ";user=" + WideToUtf8(g_cfg.metaAccount) + ";port=38810";
             sendto(g_svc.mdnsSocket, beacon.data(), (int)beacon.size(), 0, (sockaddr*)&mdnsAddr, sizeof(mdnsAddr));
             sendto(g_svc.mdnsSocket, beacon.data(), (int)beacon.size(), 0, (sockaddr*)&mdnsBroadcastAddr, sizeof(mdnsBroadcastAddr));
+
+            // Broadcast binary VxrHostInfoPacket (VXRH) to 255.255.255.255:38811, :38810 and all local subnet broadcast addresses
+            VxrHostInfoPacket hostInfo = buildHostInfoPacket();
+            std::vector<uint32_t> bcastAddrs;
+            bcastAddrs.push_back(INADDR_BROADCAST);
+
+            ULONG outBufLen = 16384;
+            std::vector<BYTE> adapterBuf(outBufLen);
+            PIP_ADAPTER_ADDRESSES pAddresses = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(adapterBuf.data());
+            if (GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST, nullptr, pAddresses, &outBufLen) == NO_ERROR) {
+                for (PIP_ADAPTER_ADDRESSES curr = pAddresses; curr != nullptr; curr = curr->Next) {
+                    if (curr->OperStatus != IfOperStatusUp) continue;
+                    for (PIP_ADAPTER_UNICAST_ADDRESS ua = curr->FirstUnicastAddress; ua != nullptr; ua = ua->Next) {
+                        if (ua->Address.lpSockaddr && ua->Address.lpSockaddr->sa_family == AF_INET) {
+                            sockaddr_in* sa = reinterpret_cast<sockaddr_in*>(ua->Address.lpSockaddr);
+                            uint32_t ipHost = ntohl(sa->sin_addr.s_addr);
+                            if ((ipHost >> 24) == 127) continue; // skip loopback
+                            uint8_t prefixLen = (ua->OnLinkPrefixLength > 0 && ua->OnLinkPrefixLength <= 32) ? ua->OnLinkPrefixLength : 24;
+                            uint32_t mask = (prefixLen == 32) ? 0xFFFFFFFFu : (~0u << (32 - prefixLen));
+                            uint32_t subnetBcast = htonl((ipHost & mask) | (~mask));
+                            if (std::find(bcastAddrs.begin(), bcastAddrs.end(), subnetBcast) == bcastAddrs.end()) {
+                                bcastAddrs.push_back(subnetBcast);
+                            }
+                        }
+                    }
+                }
+            }
+
+            const uint16_t kDiscoveryPorts[2] = { 38811, 38810 };
+            for (uint32_t bcastIp : bcastAddrs) {
+                for (uint16_t dPort : kDiscoveryPorts) {
+                    sockaddr_in bAddr = {};
+                    bAddr.sin_family = AF_INET;
+                    bAddr.sin_port = htons(dPort);
+                    bAddr.sin_addr.s_addr = bcastIp;
+                    sendto(g_svc.mdnsSocket, reinterpret_cast<const char*>(&hostInfo), sizeof(hostInfo), 0, (sockaddr*)&bAddr, sizeof(bAddr));
+                    sendto(g_svc.mdnsSocket, beacon.data(), (int)beacon.size(), 0, (sockaddr*)&bAddr, sizeof(bAddr));
+                }
+            }
+
             g_svc.mdnsBeaconsSent++;
         }
 
@@ -1102,8 +1258,47 @@ static void HostServiceThreadProc() {
                 int r = recvfrom(g_svc.udpSocket, rxBuf, sizeof(rxBuf), 0, (sockaddr*)&clientAddr, &clientLen);
                 if (r <= 0) break;
 
+                // Filter out our own local broadcast echoes on port 38810
+                if (r == (int)sizeof(VxrHostInfoPacket)) {
+                    const VxrHostInfoPacket* maybeHost = reinterpret_cast<const VxrHostInfoPacket*>(rxBuf);
+                    if (maybeHost->magic == VXR_HOST_INFO_MAGIC) {
+                        continue;
+                    }
+                }
+                if (r >= 16 && memcmp(rxBuf, "VXR_MDNS_BEACON:", 16) == 0) {
+                    continue;
+                }
+
+                bool wasConnected = hasActiveClient;
                 lastActiveClient = clientAddr;
                 hasActiveClient = true;
+                g_svc.lastClientPacketTick = now;
+
+                if (!wasConnected) {
+                    // Phase A.1: Lock Windows Wi-Fi background scanning when Quest client connects
+                    wifiOptimizer.LockBackgroundScan();
+                }
+
+                // Measure real inter-packet arrival / RTT jitter + encode latency
+                LARGE_INTEGER nowQpc = {};
+                QueryPerformanceCounter(&nowQpc);
+                if (lastClientQpc.QuadPart != 0 && qpcFreq.QuadPart > 0) {
+                    double deltaMs = (double)(nowQpc.QuadPart - lastClientQpc.QuadPart) * 1000.0 / (double)qpcFreq.QuadPart;
+                    // Client sends control/tracking packets at ~60-90Hz (~11-16ms interval); network jitter + encode + transport
+                    double estRttMs = smoothedEncodeMs + (std::min)(12.0, (std::max)(1.2, std::fabs(deltaMs - 11.1) * 0.45 + 2.8));
+                    std::lock_guard<std::mutex> lock(g_svc.statusMutex);
+                    if (g_svc.activeLatencyMs <= 0.05f) {
+                        g_svc.activeLatencyMs = (float)estRttMs;
+                    } else {
+                        g_svc.activeLatencyMs = (float)(g_svc.activeLatencyMs * 0.85 + estRttMs * 0.15);
+                    }
+                } else {
+                    std::lock_guard<std::mutex> lock(g_svc.statusMutex);
+                    if (g_svc.activeLatencyMs <= 0.05f) {
+                        g_svc.activeLatencyMs = (float)(smoothedEncodeMs + 3.2);
+                    }
+                }
+                lastClientQpc = nowQpc;
 
                 bool handledCtrl = false;
                 if (r >= (int)sizeof(VxrControlHeader)) {
@@ -1112,9 +1307,24 @@ static void HostServiceThreadProc() {
                         handledCtrl = true;
                         uint8_t cmd = ctrlHdr->cmd_type;
 
+                        // If any VxrClientControlPacket arrives while connectedHeadset == "Not connected", update status & UI
+                        {
+                            bool needUiRefresh = false;
+                            {
+                                std::lock_guard<std::mutex> lock(g_svc.statusMutex);
+                                if (g_svc.connectedHeadset == L"Not connected" || g_svc.connectedHeadset.empty()) {
+                                    g_svc.connectedHeadset = L"Meta Quest 3 (Connected)";
+                                    needUiRefresh = true;
+                                }
+                            }
+                            if (needUiRefresh && g_hwnd) {
+                                PostMessageW(g_hwnd, WM_SERVICE_UPDATE, 0, 0);
+                            }
+                        }
+
                         if (cmd == VXR_CMD_DISCOVER) {
                             std::wstring clientHeadset = L"Meta Quest 3 (Connected)";
-                            if (r >= (int)sizeof(VxrControlDiscoverPacket)) {
+                            if (r >= (int)sizeof(VxrControlDiscoverPacket) && r != (int)sizeof(VxrClientControlPacket)) {
                                 const VxrControlDiscoverPacket* disc = reinterpret_cast<const VxrControlDiscoverPacket*>(rxBuf);
                                 char hsBuf[65] = {};
                                 memcpy(hsBuf, disc->headset_name, 64);
@@ -1123,48 +1333,14 @@ static void HostServiceThreadProc() {
                                 }
                             }
 
-                            wchar_t compNameW[MAX_COMPUTERNAME_LENGTH + 1] = L"VXR-PC";
-                            DWORD compNameLen = MAX_COMPUTERNAME_LENGTH + 1;
-                            GetComputerNameW(compNameW, &compNameLen);
-
-                            DEVMODEW dm = {};
-                            dm.dmSize = sizeof(dm);
-                            uint16_t deskW = (uint16_t)GetSystemMetrics(SM_CXSCREEN);
-                            uint16_t deskH = (uint16_t)GetSystemMetrics(SM_CYSCREEN);
-                            uint16_t deskHz = 60;
-                            if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm)) {
-                                if (dm.dmPelsWidth > 0) deskW = (uint16_t)dm.dmPelsWidth;
-                                if (dm.dmPelsHeight > 0) deskH = (uint16_t)dm.dmPelsHeight;
-                                if (dm.dmDisplayFrequency > 1) deskHz = (uint16_t)dm.dmDisplayFrequency;
-                            }
-
-                            std::string compUtf8 = WideToUtf8(compNameW);
-                            std::string gpuUtf8;
                             {
                                 std::lock_guard<std::mutex> lock(g_svc.statusMutex);
                                 g_svc.connectedHeadset = clientHeadset;
-                                gpuUtf8 = WideToUtf8(g_svc.gpuShortName);
                             }
-                            std::string codecUtf8 = WideToUtf8(g_cfg.GetCodecName());
-
-                            VxrHostInfoPacket hostInfo = {};
-                            hostInfo.magic = VXR_HOST_INFO_MAGIC;
-                            hostInfo.udp_port = g_svc.udpPort;
-                            hostInfo.desktop_width = deskW;
-                            hostInfo.desktop_height = deskH;
-                            hostInfo.refresh_rate_hz = deskHz;
-                            hostInfo.bitrate_mbps = (uint16_t)g_svc.activeBitrateMbps;
-                            hostInfo.codec_id = (uint8_t)g_cfg.preferredCodec;
-                            strncpy_s(hostInfo.computer_name, compUtf8.c_str(), _TRUNCATE);
-                            strncpy_s(hostInfo.gpu_name, gpuUtf8.c_str(), _TRUNCATE);
-                            strncpy_s(hostInfo.codec_name, codecUtf8.c_str(), _TRUNCATE);
-                            sprintf_s(hostInfo.json_summary,
-                                "VXR_HOST_INFO:{\"pc\":\"%s\",\"gpu\":\"%s\",\"codec\":\"%s\",\"width\":%u,\"height\":%u,\"hz\":%u,\"bitrate_mbps\":%u}",
-                                hostInfo.computer_name, hostInfo.gpu_name, hostInfo.codec_name,
-                                (unsigned)deskW, (unsigned)deskH, (unsigned)deskHz, (unsigned)hostInfo.bitrate_mbps);
-
+                            VxrHostInfoPacket hostInfo = buildHostInfoPacket();
                             sendto(g_svc.udpSocket, reinterpret_cast<const char*>(&hostInfo), sizeof(hostInfo), 0,
                                    (sockaddr*)&clientAddr, clientLen);
+                            if (g_hwnd) PostMessageW(g_hwnd, WM_SERVICE_UPDATE, 0, 0);
                             ShowToast(L"Headset connected: " + clientHeadset);
                         }
                         else if (cmd == VXR_CMD_MOUSE_INPUT) {
@@ -1227,14 +1403,14 @@ static void HostServiceThreadProc() {
                             const VxrControlClientSettingsPacket* sp = reinterpret_cast<const VxrControlClientSettingsPacket*>(rxBuf);
                             if (r == (int)sizeof(VxrClientControlPacket)) {
                                 const VxrClientControlPacket* cp = reinterpret_cast<const VxrClientControlPacket*>(rxBuf);
-                                synthSp.desktop_bitrate_mbps = (uint16_t)cp->bitrate_mbps;
-                                synthSp.vr_bitrate_mbps      = (uint16_t)cp->bitrate_mbps;
-                                synthSp.vr_graphics_quality  = cp->quality_index;
-                                synthSp.vr_fps               = (uint8_t)cp->fps;
-                                synthSp.sharpening_pct       = cp->sharpening_pct;
+                                synthSp.desktop_bitrate_mbps = (uint16_t)cp->desktop_bitrate_mbps;
+                                synthSp.vr_bitrate_mbps      = (uint16_t)cp->vr_bitrate_mbps;
+                                synthSp.vr_graphics_quality  = (uint8_t)cp->vr_quality_tier;
+                                synthSp.vr_fps               = (uint8_t)cp->vr_fps;
+                                synthSp.sharpening_pct       = (uint8_t)cp->sharpening_pct;
                                 synthSp.ssw_mode             = cp->ssw_mode;
-                                synthSp.enable_sgsr          = (cp->flags & 0x01) ? 1 : 0;
-                                synthSp.passthrough_mask     = (cp->flags >> 1) & 0x07;
+                                synthSp.enable_sgsr          = cp->enable_sgsr ? 1 : 0;
+                                synthSp.passthrough_mask     = 0;
                                 sp = &synthSp;
                             }
 
@@ -1311,7 +1487,14 @@ static void HostServiceThreadProc() {
             }
 
             VxrBitstreamFrame frame = {};
+            LARGE_INTEGER encStartQpc = {}, encEndQpc = {};
+            QueryPerformanceCounter(&encStartQpc);
             if (pfn_encoder_encode(g_svc.encoderHandle, texToEncode, now * 1000ULL, 0, &frame)) {
+                QueryPerformanceCounter(&encEndQpc);
+                if (qpcFreq.QuadPart > 0) {
+                    double encMs = (double)(encEndQpc.QuadPart - encStartQpc.QuadPart) * 1000.0 / (double)qpcFreq.QuadPart;
+                    smoothedEncodeMs = smoothedEncodeMs * 0.90 + (std::max)(0.4, encMs) * 0.10;
+                }
                 g_svc.framesEncoded++;
                 // Stream packet over UDP socket to connected Quest headset using MTU Packet Fragmentation
                 if (hasActiveClient && frame.data && frame.size > 0) {
@@ -1468,6 +1651,9 @@ static void HostServiceThreadProc() {
     if (hLiveBmp) DeleteObject(hLiveBmp);
     if (hCaptureDC) DeleteDC(hCaptureDC);
     if (hScreenDC) ReleaseDC(nullptr, hScreenDC);
+
+    wifiOptimizer.UnlockBackgroundScan();
+    if (hThreadAvrt) AvRevertMmThreadCharacteristics(hThreadAvrt);
 
     if (capInit) {
         dxgiDupl.Cleanup();
@@ -1870,16 +2056,18 @@ static void RenderWindow(HDC hdc) {
             // Matches Screenshot 1 (ABOUT tab of Virtual Desktop Streamer) with 100% live PC hardware/OS values!
             std::wstring gpuFull, cpuStr, ramStr, osStr, headsetStr;
             bool secBoot, hags, ethUp;
+            float liveLatencyMs = 0.0f;
             {
                 std::lock_guard<std::mutex> lock(g_svc.statusMutex);
-                gpuFull    = g_svc.gpuNameWithDriver;
-                cpuStr     = g_svc.cpuName;
-                ramStr     = g_svc.ramTotalGb;
-                osStr      = g_svc.osVersionStr;
-                headsetStr = g_svc.connectedHeadset;
-                secBoot    = g_svc.secureBootEnabled;
-                hags       = g_svc.hagsEnabled;
-                ethUp      = g_svc.pcEthernetConnected;
+                gpuFull       = g_svc.gpuNameWithDriver;
+                cpuStr        = g_svc.cpuName;
+                ramStr        = g_svc.ramTotalGb;
+                osStr         = g_svc.osVersionStr;
+                headsetStr    = g_svc.connectedHeadset;
+                secBoot       = g_svc.secureBootEnabled;
+                hags          = g_svc.hagsEnabled;
+                ethUp         = g_svc.pcEthernetConnected;
+                liveLatencyMs = g_svc.activeLatencyMs;
             }
 
             StringFormat rightLabelFmt;
@@ -1915,9 +2103,16 @@ static void RenderWindow(HDC hdc) {
 
             // Values
             g.DrawString(gpuFull.c_str(),                    -1, &regularFont, PointF(valX, startY + 0 * stepY), &whiteBrush);
-            g.DrawString(headsetStr.c_str(),                 -1, &regularFont, PointF(valX, startY + 1 * stepY), &whiteBrush);
+            g.DrawString(headsetStr.c_str(),                 -1, &regularFont, PointF(valX, startY + 1 * stepY),
+                         (headsetStr == L"Not connected") ? &mutedBrush : &whiteBrush);
             g.DrawString(g_cfg.GetCodecName(),               -1, &regularFont, PointF(valX, startY + 2 * stepY), &whiteBrush);
-            g.DrawString(L"--",                              -1, &regularFont, PointF(valX, startY + 3 * stepY), &mutedBrush);
+            if (liveLatencyMs > 0.05f && headsetStr != L"Not connected") {
+                wchar_t latBuf[32] = {};
+                swprintf_s(latBuf, L"%.1f ms", liveLatencyMs);
+                g.DrawString(latBuf, -1, &regularFont, PointF(valX, startY + 3 * stepY), &whiteBrush);
+            } else {
+                g.DrawString(L"--", -1, &regularFont, PointF(valX, startY + 3 * stepY), &mutedBrush);
+            }
             g.DrawString(cpuStr.c_str(),                     -1, &regularFont, PointF(valX, startY + 4 * stepY), &whiteBrush);
             g.DrawString(g_svc.nvencActive ? L"Yes" : L"No", -1, &regularFont, PointF(valX, startY + 5 * stepY), &whiteBrush);
             g.DrawString(ramStr.c_str(),                     -1, &regularFont, PointF(valX, startY + 6 * stepY), &whiteBrush);

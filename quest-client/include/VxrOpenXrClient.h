@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <string>
 #include <vector>
+#include "VxrGltfLoader.h"
 
 namespace vxr {
 
@@ -26,6 +27,12 @@ struct XrEyeView {
     float fov_right;
     float fov_top;
     float fov_bottom;
+};
+
+struct XrControllerPose {
+    float position[3];
+    float orientation[4]; // x, y, z, w
+    bool  is_tracked;
 };
 
 struct XrControllerInputState {
@@ -52,7 +59,7 @@ struct OpenXrClientConfig {
     uint32_t display_refresh_rate; // 72, 90, 120 Hz
 };
 
-/// OpenXR Mobile Client managing session lifecycles, 6DoF tracking, controller input, and frame timing
+/// OpenXR Mobile Client managing session lifecycles, 6DoF tracking, 3D stereo controllers, and frame timing
 class VxrOpenXrClient {
 public:
     VxrOpenXrClient();
@@ -83,6 +90,7 @@ public:
     bool LocateViews(uint64_t display_time_ns, XrEyeView out_views[2]);
 
     /// Uploads the 1280x800 RGBA8888 composited UI/Desktop frame into the OpenXR Quad Swapchain
+    /// and renders the 3D Stereo Environment + 3D Quest Touch Controllers + 3D Laser Beam
     void SubmitQuadSwapchainRgba(const uint32_t* rgbaPixels,
                                  uint32_t width,
                                  uint32_t height,
@@ -112,6 +120,34 @@ public:
                                  float* outU,
                                  float* outV) const;
 
+    /// Real hardware model detection on Android via system properties & XrSystemProperties
+    std::string GetDetectedHeadsetModel() const;
+
+    /// Real battery percentage [1..100] from /sys/class/power_supply/battery/capacity
+    uint32_t GetDeviceBatteryPercent() const;
+
+    /// Real formatted local time string "H:MM AM/PM"
+    std::string GetLocalClockString() const;
+
+    /// Loads a custom binary .glb 3D room model into the stereo environment renderer
+    bool LoadCustomEnvironmentGlb(const std::string& glbPath);
+
+    void SetPassthroughEnabled(bool enabled) { m_passthroughEnabled = enabled; }
+    bool IsPassthroughEnabled() const { return m_passthroughEnabled; }
+
+    void TriggerRecenter() { m_recenterHeld = true; }
+    float GetScreenCenterY() const { return m_screenCenterY; }
+    int GetActiveHand() const { return m_activeHand; }
+    const XrControllerPose& GetLeftControllerPose() const { return m_leftControllerPose; }
+    const XrControllerPose& GetRightControllerPose() const { return m_rightControllerPose; }
+    void GetLaserHitPoint(float outHit[3]) const {
+        if (outHit) {
+            outHit[0] = m_laserHitPoint[0];
+            outHit[1] = m_laserHitPoint[1];
+            outHit[2] = m_laserHitPoint[2];
+        }
+    }
+
     OpenXrSessionState GetSessionState() const { return m_sessionState; }
     bool IsSessionRunning() const { return m_sessionRunning; }
     bool IsRealRuntimeActive() const { return m_realXrActive; }
@@ -120,18 +156,25 @@ public:
     uint32_t GetRefreshRate() const { return m_config.display_refresh_rate; }
     uint64_t GetFrameIndex() const { return m_frameIndex; }
     bool IsLoaderPresent() const { return m_loaderHandle != nullptr || m_realXrActive; }
+    bool IsFbRenderModelSupported() const { return m_fbRenderModelSupported; }
 
 private:
     void PollXrEvents();
+    void InitStereoSceneResources();
+    void DestroyStereoSceneResources();
+    void RenderStereoEnvironmentAndControllers(uint32_t skyTexId);
 
     OpenXrClientConfig m_config;
     bool m_initialized;
     bool m_sessionRunning;
     bool m_realXrActive;
     bool m_shouldRenderFrame;
+    bool m_fbRenderModelSupported;
+    bool m_passthroughEnabled;
     OpenXrSessionState m_sessionState;
     uint64_t m_frameIndex;
     uint64_t m_lastPredictedDisplayTimeNs;
+    std::string m_xrSystemName;
 
     void* m_javaVm;
     void* m_activityClazz;
@@ -143,6 +186,11 @@ private:
     void* m_localSpace;
     void* m_viewSpace;
 
+    // Coordinate space anchoring in XR_REFERENCE_SPACE_TYPE_LOCAL
+    float m_screenCenterY;
+    bool  m_screenAnchorInitialized;
+    bool  m_recenterHeld;
+
     // EGL / GLES3 context & OpenXR swapchain state (used on Android OpenXR)
     void* m_eglDisplay;
     void* m_eglConfig;
@@ -150,6 +198,14 @@ private:
     void* m_eglSurface;
     void* m_quadSwapchain;
     void* m_skySwapchain;
+    uint32_t m_skyWidth;
+    uint32_t m_skyHeight;
+    uint32_t m_skyFbo;
+    uint32_t m_skyDepthRbo;
+    uint32_t m_sceneProgram;
+    int32_t  m_uViewProjLoc;
+    int32_t  m_uModelLoc;
+    int32_t  m_uColorLoc;
     std::vector<uint32_t> m_quadSwapchainTexIds;
     std::vector<uint32_t> m_skySwapchainTexIds;
     std::vector<uint32_t> m_flippedUploadBuffer;
@@ -160,6 +216,7 @@ private:
     // OpenXR Action Set & Touch Controller handles
     void* m_actionSet;
     void* m_aimPoseAction;
+    void* m_gripPoseAction;
     void* m_triggerAction;
     void* m_squeezeAction;
     void* m_thumbstickAction;
@@ -168,8 +225,23 @@ private:
     void* m_menuAction;
     void* m_rightAimSpace;
     void* m_leftAimSpace;
+    void* m_rightGripSpace;
+    void* m_leftGripSpace;
     uint64_t m_handPaths[2];
 
+    // Controller tracking, active hand selection, and 3D laser intersection
+    int   m_activeHand; // 0 = Left, 1 = Right
+    bool  m_triggerPressed;
+    bool  m_gripPressed;
+    float m_thumbstickX;
+    float m_thumbstickY;
+    XrControllerPose m_leftControllerPose;
+    XrControllerPose m_rightControllerPose;
+    XrEyeView m_headPose;
+    mutable float m_laserHitPoint[3];
+    mutable bool  m_hasLaserHit;
+
+    GltfModel m_customEnvModel;
     XrEyeView m_cachedViews[2];
     XrControllerInputState m_controllerState;
 };

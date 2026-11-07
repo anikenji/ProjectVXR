@@ -10,6 +10,8 @@ include_directories(
 
 set(CLIENT_SOURCES
     src/VxrMediaCodecDecoder.cpp
+    src/VxrMultiDecoder.cpp
+    src/VxrGltfLoader.cpp
     src/VxrVulkanRenderer.cpp
     src/VxrHardwareCursor.cpp
     src/VxrOpenXrClient.cpp
@@ -68,6 +70,8 @@ else()
     add_executable(test_quest_client
         tests/test_quest_client.cpp
         src/VxrMediaCodecDecoder.cpp
+        src/VxrMultiDecoder.cpp
+        src/VxrGltfLoader.cpp
         src/VxrVulkanRenderer.cpp
         src/VxrHardwareCursor.cpp
         src/VxrOpenXrClient.cpp

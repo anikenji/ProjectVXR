@@ -13,6 +13,7 @@ set(ENCODER_SOURCES
     src/VxrNvencEncoder.cpp
     src/VxrAmfEncoder.cpp
     src/VxrVideoEncoder.cpp
+    src/VxrNvapiOptimizer.cpp
     src/vxr_encoder.cpp
 )
 
@@ -24,6 +25,7 @@ add_library(vxr_encoder SHARED
 target_link_libraries(vxr_encoder PUBLIC
     d3d11
     dxgi
+    advapi32
 )
 
 target_compile_definitions(vxr_encoder PRIVATE
@@ -46,6 +48,7 @@ add_executable(test_encoder
 target_link_libraries(test_encoder PRIVATE
     d3d11
     dxgi
+    advapi32
 )
 
 target_compile_definitions(test_encoder PRIVATE

@@ -783,12 +783,15 @@ void VxrVrMenuUi::RenderComputersTab(uint32_t* buf, uint32_t bw, uint32_t bh, in
         DrawText5x7(buf, bw, bh, monX + 64, cardY + 46, subInfo, 1, COLOR_TEXT_SECONDARY);
 
         // Status indicator
-        const char* statusStr = pc.connected ? "Connected - Live Desktop Ready" : (pc.available ? "Available" : "Offline");
+        const char* statusStr = pc.connected ? "Connected - Live Desktop Ready" : (pc.available ? "Available - Click Connect" : "Offline");
         uint32_t statusColor = pc.connected ? COLOR_STATUS_GREEN : (pc.available ? COLOR_TEXT_SECONDARY : COLOR_DANGER_RED);
         DrawCircleFill(buf, bw, bh, monX + 68, cardY + 67, 4, statusColor);
         DrawText5x7(buf, bw, bh, monX + 78, cardY + 64, statusStr, 1, statusColor);
 
-        if (pc.connected) {
+        if (!pc.connected) {
+            // Allow clicking anywhere on the PC card row to connect when not yet connected
+            RegisterHitBox(HIT_COMPUTER_TOGGLE_CONNECT, cardX, cardY, cardW, cardH, bw, bh, static_cast<int32_t>(i));
+        } else {
             DrawButton(buf, bw, bh, cardX + cardW - 268, cardY + 26, 118, 36, "View Desktop", true,
                        HIT_BTN_VIEW_DESKTOP, static_cast<int32_t>(i));
         }
@@ -1387,8 +1390,17 @@ bool VxrVrMenuUi::HandleHitAction(const VrUiHitBox& box, float normX, float norm
                 pc.connected = !pc.connected;
                 m_settings.is_pc_connected = pc.connected;
                 if (pc.connected) {
+                    for (size_t j = 0; j < m_computers.size(); ++j) {
+                        if (j != static_cast<size_t>(box.param)) {
+                            m_computers[j].connected = false;
+                        }
+                    }
                     m_settings.connected_hostname = pc.hostname;
-                    m_settings.local_ip = pc.ip_address;
+                    m_settings.connect_computer_index = box.param;
+                    m_settings.disconnect_computer_requested = false;
+                } else {
+                    m_settings.connect_computer_index = -1;
+                    m_settings.disconnect_computer_requested = true;
                 }
                 MarkSettingsDirty();
                 return true;

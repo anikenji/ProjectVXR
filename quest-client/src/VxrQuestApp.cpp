@@ -1,18 +1,130 @@
 #include "VxrQuestApp.h"
 #include <iostream>
 #include <cstring>
+#include <cstdio>
+#include <ctime>
+#include <chrono>
+#include <fstream>
 #include <algorithm>
+#include <type_traits>
+
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
 
 namespace vxr {
+
+namespace {
 
 static constexpr uint32_t MENU_OVERLAY_W = 1280;
 static constexpr uint32_t MENU_OVERLAY_H = 800;
 static constexpr uint32_t PERF_HUD_W     = 480;
 static constexpr uint32_t PERF_HUD_H     = 220;
 
+static uint64_t GetSteadyTimeMs() {
+    auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
+}
+
+// SFINAE detection so VxrQuestApp calls m_openXr.GetDetectedHeadsetModel() / GetDeviceBatteryPercent() /
+// GetLocalClockString() when present on VxrOpenXrClient, and falls back to direct real OS queries otherwise.
+template <typename T, typename = void>
+struct HasGetDetectedHeadsetModel : std::false_type {};
+template <typename T>
+struct HasGetDetectedHeadsetModel<T, std::void_t<decltype(std::declval<const T&>().GetDetectedHeadsetModel())>> : std::true_type {};
+
+template <typename T, typename = void>
+struct HasGetDeviceBatteryPercent : std::false_type {};
+template <typename T>
+struct HasGetDeviceBatteryPercent<T, std::void_t<decltype(std::declval<const T&>().GetDeviceBatteryPercent())>> : std::true_type {};
+
+template <typename T, typename = void>
+struct HasGetLocalClockString : std::false_type {};
+template <typename T>
+struct HasGetLocalClockString<T, std::void_t<decltype(std::declval<const T&>().GetLocalClockString())>> : std::true_type {};
+
+template <typename XrClientT>
+static std::string QueryRealHeadsetModel(const XrClientT& xr) {
+    if constexpr (HasGetDetectedHeadsetModel<XrClientT>::value) {
+        std::string model = xr.GetDetectedHeadsetModel();
+        if (!model.empty()) {
+            return model;
+        }
+    }
+#ifdef __ANDROID__
+    char modelProp[PROP_VALUE_MAX] = {};
+    char deviceProp[PROP_VALUE_MAX] = {};
+    __system_property_get("ro.product.model", modelProp);
+    __system_property_get("ro.product.device", deviceProp);
+    std::string dev(deviceProp);
+    std::string mod(modelProp);
+    if (dev == "hollywood" || mod.find("Quest 2") != std::string::npos) {
+        return "Meta Quest 2";
+    }
+    if (dev == "eureka" || mod.find("Quest 3") != std::string::npos) {
+        return "Meta Quest 3";
+    }
+    if (dev == "panther" || mod.find("Quest 3S") != std::string::npos) {
+        return "Meta Quest 3S";
+    }
+    if (dev == "seacliff" || mod.find("Quest Pro") != std::string::npos) {
+        return "Meta Quest Pro";
+    }
+    if (!mod.empty()) {
+        return mod;
+    }
+#endif
+    return "Meta Quest";
+}
+
+template <typename XrClientT>
+static uint32_t QueryRealBatteryPercent(const XrClientT& xr) {
+    if constexpr (HasGetDeviceBatteryPercent<XrClientT>::value) {
+        return static_cast<uint32_t>(xr.GetDeviceBatteryPercent());
+    }
+#ifdef __ANDROID__
+    std::ifstream capFile("/sys/class/power_supply/battery/capacity");
+    if (capFile.is_open()) {
+        int pct = 0;
+        if (capFile >> pct) {
+            if (pct >= 0 && pct <= 100) {
+                return static_cast<uint32_t>(pct);
+            }
+        }
+    }
+#endif
+    return 100;
+}
+
+template <typename XrClientT>
+static std::string QueryRealLocalClock(const XrClientT& xr) {
+    if constexpr (HasGetLocalClockString<XrClientT>::value) {
+        std::string clk = xr.GetLocalClockString();
+        if (!clk.empty()) {
+            return clk;
+        }
+    }
+    std::time_t now = std::time(nullptr);
+    std::tm tmLocal = {};
+#ifdef _WIN32
+    localtime_s(&tmLocal, &now);
+#else
+    localtime_r(&now, &tmLocal);
+#endif
+    int hour12 = tmLocal.tm_hour % 12;
+    if (hour12 == 0) hour12 = 12;
+    const char* ampm = (tmLocal.tm_hour >= 12) ? "PM" : "AM";
+    char buf[32] = {};
+    std::snprintf(buf, sizeof(buf), "%d:%02d %s", hour12, tmLocal.tm_min, ampm);
+    return std::string(buf);
+}
+
+} // anonymous namespace
+
 VxrQuestApp::VxrQuestApp()
     : m_running(false)
     , m_totalFramesRendered(0)
+    , m_lastBroadcastTimeMs(0)
     , m_prevMenuBtnPressed(false)
     , m_prevTriggerClicked(false)
     , m_surfacePointerX(0.5f)
@@ -20,7 +132,7 @@ VxrQuestApp::VxrQuestApp()
     , m_hasSurfacePointer(false)
     , m_hasLiveDesktopFrame(false)
 {
-    memset(&m_config, 0, sizeof(m_config));
+    std::memset(&m_config, 0, sizeof(m_config));
 }
 
 VxrQuestApp::~VxrQuestApp() {
@@ -31,11 +143,12 @@ bool VxrQuestApp::Initialize(const QuestAppConfig& config) {
     Shutdown();
     m_config = config;
 
-    // 1. Initialize AMediaCodec hardware video decoder
+    // 1. Initialize primary AMediaCodec hardware video decoder & 4x Multi-Monitor Stream 0
     if (!m_decoder.Initialize(config.preferred_codec, config.stream_width, config.stream_height, config.target_fps)) {
         std::cerr << "[VXR-App] Failed to initialize AMediaCodec decoder!" << std::endl;
         return false;
     }
+    m_multiDecoder.InitializeStream(0, config.preferred_codec, config.stream_width, config.stream_height, config.target_fps);
 
     // 2. Initialize Vulkan 1.3 renderer with AHardwareBuffer zero-copy import & overlay quads
     VulkanRendererConfig vkConfig = {};
@@ -62,8 +175,13 @@ bool VxrQuestApp::Initialize(const QuestAppConfig& config) {
         return false;
     }
 
-    // 4. Initialize Virtual Desktop 7-Tab In-VR Menu UI & RGBA Framebuffers
+    // 4. Initialize UDP Network Client (:38810 video/control, :38811 beacon, :5353 mDNS discovery)
+    m_network.Initialize(38810, 5353);
+
+    // 5. Initialize Virtual Desktop 7-Tab In-VR Menu UI & RGBA Framebuffers
     m_vrMenu.Initialize();
+    UpdateRealHardwareTelemetry();
+
     m_menuRgbaBuffer.assign(MENU_OVERLAY_W * MENU_OVERLAY_H, 0xFF161210u);
     m_desktopRgbaBuffer.assign(MENU_OVERLAY_W * MENU_OVERLAY_H, 0xFF1E1914u);
     m_compositedRgbaBuffer.assign(MENU_OVERLAY_W * MENU_OVERLAY_H, 0xFF161210u);
@@ -79,11 +197,9 @@ bool VxrQuestApp::Initialize(const QuestAppConfig& config) {
     m_vrMenu.RenderPerformanceOverlayToRgba(m_perfHudRgbaBuffer.data(), PERF_HUD_W, PERF_HUD_H, initialPerf);
     m_renderer.UpdatePerformanceHudTexture(m_perfHudRgbaBuffer.data(), PERF_HUD_W, PERF_HUD_H);
 
-    // 5. Initialize UDP Network Client (:38810 video/control & :5353 mDNS discovery)
-    m_network.Initialize(38810, 5353);
-
     m_running = true;
     m_totalFramesRendered = 0;
+    m_lastBroadcastTimeMs = 0;
     m_prevMenuBtnPressed = false;
     m_prevTriggerClicked = false;
     m_surfacePointerX = 0.5f;
@@ -95,11 +211,40 @@ bool VxrQuestApp::Initialize(const QuestAppConfig& config) {
 
     std::cout << "[VXR-App] Meta Quest Client Pipeline initialized successfully: "
               << config.stream_width << "x" << config.stream_height << " @ " << config.target_fps << "Hz"
-              << ", Zero-Copy: " << (config.enable_zero_copy ? "ENABLED" : "DISABLED")
-              << ", SpaceWarp: " << (config.enable_space_warp ? "ENABLED" : "DISABLED")
+              << ", Headset: " << m_vrMenu.GetSettings().headset_model
+              << ", Local Wi-Fi IP: " << m_vrMenu.GetSettings().local_ip
               << ", In-VR Menu (7 Tabs): READY" << std::endl;
 
     return true;
+}
+
+void VxrQuestApp::UpdateRealHardwareTelemetry() {
+    VrMenuSettings& cfg = m_vrMenu.GetSettingsMutable();
+    cfg.headset_model = QueryRealHeadsetModel(m_openXr);
+    cfg.battery_pct   = QueryRealBatteryPercent(m_openXr);
+    cfg.clock_text    = QueryRealLocalClock(m_openXr);
+    cfg.local_ip      = m_network.GetLocalWifiIp();
+}
+
+void VxrQuestApp::ProcessMenuComputerActions() {
+    VrMenuSettings& cfg = m_vrMenu.GetSettingsMutable();
+    const auto& comps = m_vrMenu.GetComputers();
+
+    if (cfg.disconnect_computer_requested) {
+        cfg.disconnect_computer_requested = false;
+        m_network.Disconnect();
+        return;
+    }
+
+    if (cfg.connect_computer_index >= 0 && static_cast<size_t>(cfg.connect_computer_index) < comps.size()) {
+        const VrComputerEntry& pc = comps[static_cast<size_t>(cfg.connect_computer_index)];
+        cfg.connect_computer_index = -1;
+        if (!pc.ip_address.empty()) {
+            std::string hsModel = QueryRealHeadsetModel(m_openXr);
+            m_network.SendDiscoverAndConnect(pc.ip_address.c_str(), 38810, hsModel.c_str());
+            m_network.SendClientSettings(m_vrMenu.GetSettings());
+        }
+    }
 }
 
 bool VxrQuestApp::FeedVideoData(const uint8_t* data, size_t size, uint64_t pts_us, bool is_keyframe) {
@@ -112,15 +257,28 @@ void VxrQuestApp::UpdateHardwareCursor(float norm_x, float norm_y, bool visible)
 }
 
 void VxrQuestApp::DecodeLiveDesktopStrip(const uint8_t* data, size_t size) {
-    // 8-byte header: [uint16_t srcW, uint16_t srcH, uint16_t yStart, uint16_t stripH]
+    // 8-byte header from ProjectVXR.exe:
+    // ['V','X', uint16_t srcW (640), uint16_t yStart, uint16_t stripH]
     if (!data || size < 8) return;
-    const uint16_t* u16 = reinterpret_cast<const uint16_t*>(data);
-    size_t countU16 = size / sizeof(uint16_t);
 
-    uint16_t srcW   = u16[0];
-    uint16_t srcH   = u16[1];
-    uint16_t yStart = u16[2];
-    uint16_t stripH = u16[3];
+    uint16_t srcW   = 0;
+    uint16_t srcH   = 400;
+    uint16_t yStart = 0;
+    uint16_t stripH = 0;
+    bool isByteTripletRle = (data[0] == 'V' && data[1] == 'X');
+
+    if (isByteTripletRle) {
+        srcW   = static_cast<uint16_t>(data[2]) | (static_cast<uint16_t>(data[3]) << 8);
+        yStart = static_cast<uint16_t>(data[4]) | (static_cast<uint16_t>(data[5]) << 8);
+        stripH = static_cast<uint16_t>(data[6]) | (static_cast<uint16_t>(data[7]) << 8);
+        srcH   = 400;
+    } else {
+        const uint16_t* u16 = reinterpret_cast<const uint16_t*>(data);
+        srcW   = u16[0];
+        srcH   = u16[1];
+        yStart = u16[2];
+        stripH = u16[3];
+    }
 
     if (srcW == 0 || srcH == 0 || yStart >= srcH || (yStart + stripH) > srcH) {
         return;
@@ -132,35 +290,71 @@ void VxrQuestApp::DecodeLiveDesktopStrip(const uint8_t* data, size_t size) {
 
     size_t totalStripPixels = static_cast<size_t>(srcW) * stripH;
     size_t pixelIdx = 0;
-    size_t pos = 4;
 
-    // Decode RLE-RGB565 pairs (runLen, c565) and 2x-upscale (640x400 -> 1280x800) into m_desktopRgbaBuffer
-    while (pos + 1 < countU16 && pixelIdx < totalStripPixels) {
-        uint16_t runLen = u16[pos];
-        uint16_t c565   = u16[pos + 1];
-        pos += 2;
-        if (runLen == 0) break;
+    if (isByteTripletRle) {
+        // Decode 3-byte RLE triplets [uint8_t runLen, uint8_t c565_lo, uint8_t c565_hi]
+        // and 2x-upscale (640x400 -> 1280x800) into m_desktopRgbaBuffer
+        size_t bytePos = 8;
+        while (bytePos + 2 < size && pixelIdx < totalStripPixels) {
+            uint8_t runLen = data[bytePos];
+            uint16_t c565  = static_cast<uint16_t>(data[bytePos + 1]) |
+                             (static_cast<uint16_t>(data[bytePos + 2]) << 8);
+            bytePos += 3;
+            if (runLen == 0) break;
 
-        uint8_t r8 = static_cast<uint8_t>(((c565 >> 11) & 0x1F) * 255 / 31);
-        uint8_t g8 = static_cast<uint8_t>(((c565 >> 5)  & 0x3F) * 255 / 63);
-        uint8_t b8 = static_cast<uint8_t>((c565         & 0x1F) * 255 / 31);
-        // RGBA8888 memory order [R, G, B, A] -> 0xAABBGGRR
-        uint32_t rgba = (0xFFu << 24) | (static_cast<uint32_t>(b8) << 16) |
-                        (static_cast<uint32_t>(g8) << 8) | static_cast<uint32_t>(r8);
+            uint8_t r8 = static_cast<uint8_t>(((c565 >> 11) & 0x1F) * 255 / 31);
+            uint8_t g8 = static_cast<uint8_t>(((c565 >> 5)  & 0x3F) * 255 / 63);
+            uint8_t b8 = static_cast<uint8_t>((c565         & 0x1F) * 255 / 31);
+            // RGBA8888 memory order [R, G, B, A] -> 0xAABBGGRR
+            uint32_t rgba = (0xFFu << 24) | (static_cast<uint32_t>(b8) << 16) |
+                            (static_cast<uint32_t>(g8) << 8) | static_cast<uint32_t>(r8);
 
-        for (uint16_t r = 0; r < runLen && pixelIdx < totalStripPixels; ++r, ++pixelIdx) {
-            uint32_t sx = static_cast<uint32_t>(pixelIdx % srcW);
-            uint32_t sy = yStart + static_cast<uint32_t>(pixelIdx / srcW);
+            for (uint8_t r = 0; r < runLen && pixelIdx < totalStripPixels; ++r, ++pixelIdx) {
+                uint32_t sx = static_cast<uint32_t>(pixelIdx % srcW);
+                uint32_t sy = yStart + static_cast<uint32_t>(pixelIdx / srcW);
 
-            uint32_t dx = sx * 2;
-            uint32_t dy = sy * 2;
-            if (dx + 1 < MENU_OVERLAY_W && dy + 1 < MENU_OVERLAY_H) {
-                uint32_t* row0 = m_desktopRgbaBuffer.data() + dy * MENU_OVERLAY_W + dx;
-                uint32_t* row1 = row0 + MENU_OVERLAY_W;
-                row0[0] = rgba;
-                row0[1] = rgba;
-                row1[0] = rgba;
-                row1[1] = rgba;
+                uint32_t dx = sx * 2;
+                uint32_t dy = sy * 2;
+                if (dx + 1 < MENU_OVERLAY_W && dy + 1 < MENU_OVERLAY_H) {
+                    uint32_t* row0 = m_desktopRgbaBuffer.data() + dy * MENU_OVERLAY_W + dx;
+                    uint32_t* row1 = row0 + MENU_OVERLAY_W;
+                    row0[0] = rgba;
+                    row0[1] = rgba;
+                    row1[0] = rgba;
+                    row1[1] = rgba;
+                }
+            }
+        }
+    } else {
+        const uint16_t* u16 = reinterpret_cast<const uint16_t*>(data);
+        size_t countU16 = size / sizeof(uint16_t);
+        size_t pos = 4;
+        while (pos + 1 < countU16 && pixelIdx < totalStripPixels) {
+            uint16_t runLen = u16[pos];
+            uint16_t c565   = u16[pos + 1];
+            pos += 2;
+            if (runLen == 0) break;
+
+            uint8_t r8 = static_cast<uint8_t>(((c565 >> 11) & 0x1F) * 255 / 31);
+            uint8_t g8 = static_cast<uint8_t>(((c565 >> 5)  & 0x3F) * 255 / 63);
+            uint8_t b8 = static_cast<uint8_t>((c565         & 0x1F) * 255 / 31);
+            uint32_t rgba = (0xFFu << 24) | (static_cast<uint32_t>(b8) << 16) |
+                            (static_cast<uint32_t>(g8) << 8) | static_cast<uint32_t>(r8);
+
+            for (uint16_t r = 0; r < runLen && pixelIdx < totalStripPixels; ++r, ++pixelIdx) {
+                uint32_t sx = static_cast<uint32_t>(pixelIdx % srcW);
+                uint32_t sy = yStart + static_cast<uint32_t>(pixelIdx / srcW);
+
+                uint32_t dx = sx * 2;
+                uint32_t dy = sy * 2;
+                if (dx + 1 < MENU_OVERLAY_W && dy + 1 < MENU_OVERLAY_H) {
+                    uint32_t* row0 = m_desktopRgbaBuffer.data() + dy * MENU_OVERLAY_W + dx;
+                    uint32_t* row1 = row0 + MENU_OVERLAY_W;
+                    row0[0] = rgba;
+                    row0[1] = rgba;
+                    row1[0] = rgba;
+                    row1[1] = rgba;
+                }
             }
         }
     }
@@ -268,12 +462,7 @@ void VxrQuestApp::OnSurfacePointerEvent(float norm_x, float norm_y, bool is_down
     if (m_vrMenu.IsVisible()) {
         if (is_click) {
             m_vrMenu.OnPointerClick(norm_x, norm_y);
-            const auto& comps = m_vrMenu.GetComputers();
-            for (const auto& c : comps) {
-                if (c.connected && !c.ip_address.empty()) {
-                    m_network.SendDiscoverAndConnect(c.ip_address.c_str(), 38810);
-                }
-            }
+            ProcessMenuComputerActions();
         }
     } else {
         // Top-left menu button pill (norm_x < 0.04, norm_y < 0.05) reopens the 7-tab menu
@@ -302,40 +491,22 @@ bool VxrQuestApp::RunFrame() {
         return false;
     }
 
-    // Periodically send LAN discovery broadcast every ~120 frames (~1.3s) until a host is found
-    if (!m_network.IsConnected() && (m_totalFramesRendered % 120) == 0) {
-        m_network.SendDiscoverAndConnect("255.255.255.255", 38810);
-    }
+    // 0. Continuously update real device telemetry (Headset Model, Battery %, Clock, Local Wi-Fi IP)
+    UpdateRealHardwareTelemetry();
 
-    // 1. Poll mDNS Host Discovery & Incoming Fragmented Video Packets over UDP
+#ifdef __ANDROID__
+    // Every 1.0 second on Android, broadcast VxrControlDiscoverPacket with the real headset model name
+    // to both the /24 subnet broadcast (e.g. 192.168.1.255:38810) and 255.255.255.255:38810
+    uint64_t nowMs = GetSteadyTimeMs();
+    if (nowMs - m_lastBroadcastTimeMs >= 1000) {
+        m_lastBroadcastTimeMs = nowMs;
+        m_network.SendBroadcastDiscovery(m_vrMenu.GetSettings().headset_model.c_str(), 38810);
+    }
+#endif
+
+    // 1. Poll mDNS / Broadcast Host Discovery & Incoming Fragmented Video Packets over UDP
     std::vector<DiscoveredHostInfo> discoveredHosts;
-    bool newMdns = m_network.PollMdnsDiscovery(&discoveredHosts);
-    if (discoveredHosts.empty()) {
-        discoveredHosts = m_network.GetDiscoveredHosts();
-    }
-    if (!discoveredHosts.empty()) {
-        // Auto-connect to the first discovered PC if auto_connect is enabled and not yet connected
-        if (!m_network.IsConnected() && m_vrMenu.GetSettings().auto_connect) {
-            m_network.SendDiscoverAndConnect(discoveredHosts[0].ip_address.c_str(), discoveredHosts[0].port);
-        }
-
-        if (newMdns || m_vrMenu.GetComputers().size() != discoveredHosts.size()) {
-            std::vector<VrComputerEntry> comps;
-            for (const auto& h : discoveredHosts) {
-                VrComputerEntry entry;
-                entry.hostname = h.computer_name;
-                entry.ip_address = h.ip_address;
-                entry.connected = (m_network.IsConnected() && m_network.GetConnectedHostIp() == h.ip_address);
-                entry.available = true;
-                entry.link_speed_mbps = 1200;
-                entry.wifi_band_ghz = 5;
-                comps.push_back(entry);
-            }
-            m_vrMenu.SetComputers(comps);
-            m_vrMenu.GetSettings().local_ip = discoveredHosts[0].ip_address;
-            m_vrMenu.GetSettings().connected_hostname = discoveredHosts[0].computer_name;
-        }
-    }
+    m_network.PollMdnsDiscovery(&discoveredHosts);
 
     ReassembledVideoFrame netFrame = {};
     while (m_network.PollNetwork(&netFrame)) {
@@ -343,10 +514,41 @@ bool VxrQuestApp::RunFrame() {
             if (netFrame.codec_id == 0x55) {
                 // Real Live RLE-RGB565 Desktop Strip from ProjectVXR.exe
                 DecodeLiveDesktopStrip(netFrame.data.data(), netFrame.size);
+            } else if (netFrame.codec_id == 0x56) {
+                // Multi-Monitor Sliced Stream (Phase C: 16-byte VxrSliceHeader)
+                m_multiDecoder.FeedSlicedPacket(netFrame.data.data(), netFrame.size, netFrame.is_keyframe);
             } else {
                 m_decoder.QueueInputBuffer(netFrame.data.data(), netFrame.size, netFrame.pts_us, netFrame.is_keyframe);
             }
             m_cursor.UpdatePosition(netFrame.cursor_norm_x, netFrame.cursor_norm_y, netFrame.cursor_visible);
+        }
+    }
+
+    discoveredHosts = m_network.GetDiscoveredHosts();
+    if (!discoveredHosts.empty()) {
+        std::vector<VrComputerEntry> comps;
+        comps.reserve(discoveredHosts.size());
+        for (const auto& h : discoveredHosts) {
+            VrComputerEntry entry;
+            entry.hostname = h.computer_name;
+            entry.ip_address = h.ip_address;
+            // Newly discovered PCs start with connected = false ("Available - Click Connect")
+            // unless m_network.IsConnected() is actively connected to that exact IP!
+            entry.connected = (m_network.IsConnected() && m_network.GetConnectedHostIp() == h.ip_address);
+            entry.available = true;
+            entry.link_speed_mbps = 1200;
+            entry.wifi_band_ghz = 5;
+            comps.push_back(entry);
+        }
+        m_vrMenu.SetComputers(comps);
+        m_vrMenu.GetSettingsMutable().is_pc_connected = m_network.IsConnected();
+        if (m_network.IsConnected()) {
+            for (const auto& h : discoveredHosts) {
+                if (h.ip_address == m_network.GetConnectedHostIp()) {
+                    m_vrMenu.GetSettingsMutable().connected_hostname = h.computer_name;
+                    break;
+                }
+            }
         }
     }
 
@@ -385,12 +587,7 @@ bool VxrQuestApp::RunFrame() {
             if (m_vrMenu.IsVisible()) {
                 if (ctrl.trigger_clicked && !m_prevTriggerClicked) {
                     m_vrMenu.OnPointerClick(pointerU, pointerV);
-                    const auto& comps = m_vrMenu.GetComputers();
-                    for (const auto& c : comps) {
-                        if (c.connected && !c.ip_address.empty()) {
-                            m_network.SendDiscoverAndConnect(c.ip_address.c_str(), 38810);
-                        }
-                    }
+                    ProcessMenuComputerActions();
                 }
             } else {
                 if (ctrl.trigger_clicked && !m_prevTriggerClicked && pointerU < 0.04f && pointerV < 0.05f) {
@@ -412,26 +609,19 @@ bool VxrQuestApp::RunFrame() {
     m_prevTriggerClicked = ctrl.trigger_clicked;
 
     // 6. Sync In-VR Menu Changes & Actions to PC Host & Local Renderer
-    auto& menuCfg = m_vrMenu.GetSettings();
+    auto& menuCfg = m_vrMenu.GetSettingsMutable();
     if (menuCfg.launch_steamvr_requested) {
         m_network.SendLaunchSteamVr();
         menuCfg.launch_steamvr_requested = false;
     }
     if (m_vrMenu.IsSettingsDirty()) {
+        ProcessMenuComputerActions();
         m_renderer.SetEnvironmentPreset(
             menuCfg.selected_environment,
             menuCfg.screen_distance_m,
             menuCfg.screen_curvature
         );
-        m_network.SendClientStreamingSettings(
-            menuCfg.desktop_bitrate_mbps,
-            menuCfg.vr_bitrate_mbps,
-            menuCfg.vr_graphics_quality,
-            menuCfg.vr_frame_rate,
-            menuCfg.sharpening_pct,
-            static_cast<uint8_t>(menuCfg.ssw_mode),
-            menuCfg.snapdragon_sgsr
-        );
+        m_network.SendClientSettings(menuCfg);
         m_vrMenu.ClearSettingsDirty();
     }
 
@@ -445,6 +635,10 @@ bool VxrQuestApp::RunFrame() {
         stats.fps = menuCfg.vr_frame_rate;
         stats.bitrate_mbps = menuCfg.vr_bitrate_mbps;
         stats.ssw_active = (menuCfg.ssw_mode != 0);
+        if (m_network.GetMeasuredRttMs() > 0.01f) {
+            stats.networking_ms = m_network.GetMeasuredRttMs();
+            stats.total_latency_ms = stats.game_ms + stats.encoding_ms + stats.networking_ms + stats.decoding_ms;
+        }
         m_vrMenu.RenderPerformanceOverlayToRgba(m_perfHudRgbaBuffer.data(), PERF_HUD_W, PERF_HUD_H, stats);
         m_renderer.UpdatePerformanceHudTexture(m_perfHudRgbaBuffer.data(), PERF_HUD_W, PERF_HUD_H);
     }
@@ -498,6 +692,7 @@ void VxrQuestApp::Shutdown() {
         m_network.Cleanup();
         m_openXr.Cleanup();
         m_renderer.Cleanup();
+        m_multiDecoder.Cleanup();
         m_decoder.Cleanup();
         m_running = false;
     }

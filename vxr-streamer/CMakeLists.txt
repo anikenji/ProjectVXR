@@ -6,6 +6,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_executable(ProjectVXR WIN32
     src/main.cpp
+    src/VxrWifiOptimizer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../vxr-encoder/src/VxrNvapiOptimizer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../quest-client/src/VxrComputeShaders.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../vxr-capture/src/DxgiDuplicator.cpp
 )
@@ -13,6 +15,7 @@ add_executable(ProjectVXR WIN32
 target_compile_options(ProjectVXR PRIVATE /utf-8)
 
 target_include_directories(ProjectVXR PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../vxr-capture/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../vxr-encoder/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../drivers/iddcx/include
@@ -40,5 +43,6 @@ target_link_libraries(ProjectVXR PRIVATE
     dwmapi
     ws2_32
     iphlpapi
+    wlanapi
     avrt
 )

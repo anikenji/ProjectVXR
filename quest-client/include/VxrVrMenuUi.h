@@ -70,10 +70,12 @@ struct VrPerfStats {
 struct VrMenuSettings {
     // --- COMPUTERS & CONNECTION ---
     std::string connected_hostname = "DESKTOP-VXR-HOST";
-    std::string local_ip = "192.168.1.61";
+    std::string local_ip = "0.0.0.0";
     uint32_t wifi_band_ghz = 5;
     uint32_t wifi_link_mbps = 1200;
-    bool is_pc_connected = true;
+    bool is_pc_connected = false;
+    int32_t connect_computer_index = -1;
+    bool disconnect_computer_requested = false;
 
     // --- ENVIRONMENTS ---
     // 0=Home Theater, 1=Modern Apartment, 2=Cinema Auditorium, 3=Gaming Room, 4=Passthrough Void
@@ -191,9 +193,9 @@ struct VrMenuSettings {
     // --- SIDEBAR & STATUS BAR ---
     bool launch_steamvr_requested = false;
     bool quit_requested = false;
-    std::string headset_model = "Meta Quest 3";
-    std::string clock_text = "1:09 PM";
-    uint32_t battery_pct = 96;
+    std::string headset_model = "Meta Quest";
+    std::string clock_text = "12:00 PM";
+    uint32_t battery_pct = 100;
 
     // Dirty flag for syncing with PC Host
     bool settingsDirty = false;
@@ -232,6 +234,7 @@ public:
     /// Access & modify underlying settings
     VrMenuSettings& GetSettings() { return m_settings; }
     const VrMenuSettings& GetSettings() const { return m_settings; }
+    VrMenuSettings& GetSettingsMutable() { return m_settings; }
 
     bool IsSettingsDirty() const { return m_settingsDirty || m_settings.settingsDirty; }
     void ClearSettingsDirty() { m_settingsDirty = false; m_settings.settingsDirty = false; }
@@ -251,6 +254,7 @@ public:
     /// Updates discovered PCs, VR games, and media files
     void SetComputers(const std::vector<VrComputerEntry>& computers);
     const std::vector<VrComputerEntry>& GetComputers() const { return m_computers; }
+    std::vector<VrComputerEntry>& GetComputersMutable() { return m_computers; }
 
     void SetGames(const std::vector<VrGameEntry>& games);
     const std::vector<VrGameEntry>& GetGames() const { return m_games; }

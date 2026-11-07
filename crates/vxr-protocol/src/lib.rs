@@ -8,6 +8,7 @@ pub mod fec;
 pub mod packet;
 pub mod payloads;
 pub mod socket;
+pub mod telemetry;
 
 pub use error::{ProtocolError, Result};
 pub use fec::{FecDecoder, FecEncoder, FecHeader, FecShard};
@@ -17,6 +18,10 @@ pub use payloads::{
     Pose6DoF, VideoCodec, VideoFragmenter, VideoPayload, VideoReassembler,
 };
 pub use socket::{SocketConfig, SocketStats, VxrSocket, DSCP_EXPEDITED_FORWARDING};
+pub use telemetry::{
+    VxrFrameData, VxrFrameMetadata, VxrHandTracking26, VxrJointPose, VxrTouchControllerTelemetry,
+    VXR_FRAME_DATA_WIRE_SIZE,
+};
 
 #[cfg(test)]
 mod tests {
