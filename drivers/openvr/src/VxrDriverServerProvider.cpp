@@ -77,6 +77,20 @@ vr::EVRInitError VxrDriverServerProvider::Init(vr::IVRDriverContext* pDriverCont
     std::string model  = "Meta Quest 2";
 
 #ifdef _WIN32
+    // When loaded inside real SteamVR (pDriverContext != nullptr), only activate VXR HMD
+    // if ProjectVXR.exe is running AND a Quest headset is actively connected to ProjectVXR!
+    // Otherwise return VRInitError_Init_HmdNotFound (108) so Virtual Desktop / other drivers work normally.
+    if (pDriverContext != nullptr) {
+        if (!m_pSharedState ||
+            m_pSharedState->magic != VXR_STEAMVR_SHM_MAGIC ||
+            m_pSharedState->headset_connected == 0) {
+            if (vr::VRDriverLog()) {
+                vr::VRDriverLog()->Log("[VXR-OpenVR] ProjectVXR Streamer has no connected headset. Returning HmdNotFound(108) so VirtualDesktop/other drivers can take over.\n");
+            }
+            CloseSharedMemory();
+            return vr::VRInitError_Init_HmdNotFound;
+        }
+    }
     if (m_pSharedState && m_pSharedState->magic == VXR_STEAMVR_SHM_MAGIC) {
         if (m_pSharedState->headset_serial[0] != '\0') {
             serial = m_pSharedState->headset_serial;

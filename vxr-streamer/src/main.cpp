@@ -1052,9 +1052,9 @@ static void HostServiceThreadProc() {
             memset(pSteamVrShm, 0, sizeof(VxrSteamVrSharedState));
             pSteamVrShm->magic = VXR_STEAMVR_SHM_MAGIC;
             pSteamVrShm->version = 1;
-            pSteamVrShm->headset_connected = 1;
-            pSteamVrShm->controllers_connected[0] = 1;
-            pSteamVrShm->controllers_connected[1] = 1;
+            pSteamVrShm->headset_connected = 0; // Only set to 1 when Quest is actively connected to Project VXR!
+            pSteamVrShm->controllers_connected[0] = 0;
+            pSteamVrShm->controllers_connected[1] = 0;
             pSteamVrShm->last_update_tick_ms = GetTickCount64();
             strncpy_s(pSteamVrShm->headset_model, "Meta Quest 2", _TRUNCATE);
             strncpy_s(pSteamVrShm->headset_serial, "VXR-HMD-001", _TRUNCATE);
@@ -1292,6 +1292,11 @@ static void HostServiceThreadProc() {
         // Check client heartbeat timeout (> 5000 ms without UDP packets -> mark disconnected & unlock Wi-Fi scan)
         if (hasActiveClient && (now - g_svc.lastClientPacketTick > 5000)) {
             hasActiveClient = false;
+            if (pSteamVrShm) {
+                pSteamVrShm->headset_connected = 0;
+                pSteamVrShm->controllers_connected[0] = 0;
+                pSteamVrShm->controllers_connected[1] = 0;
+            }
             wifiOptimizer.UnlockBackgroundScan();
             {
                 std::lock_guard<std::mutex> lock(g_svc.statusMutex);
