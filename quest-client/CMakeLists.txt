@@ -15,6 +15,8 @@ set(CLIENT_SOURCES
     src/VxrOpenXrClient.cpp
     src/VxrComputeShaders.cpp
     src/spatial_canvas.cpp
+    src/VxrVrMenuUi.cpp
+    src/VxrClientNetwork.cpp
     src/VxrQuestApp.cpp
     src/main.cpp
 )
@@ -37,6 +39,7 @@ if(ANDROID)
         log
         mediandk
         vulkan
+        dl
     )
 
 else()
@@ -49,6 +52,10 @@ else()
         _CRT_SECURE_NO_WARNINGS
     )
 
+    target_link_libraries(vxr_quest_client PRIVATE
+        ws2_32
+    )
+
     # Client Pipeline Test Executable
     add_executable(test_quest_client
         tests/test_quest_client.cpp
@@ -58,6 +65,8 @@ else()
         src/VxrOpenXrClient.cpp
         src/VxrComputeShaders.cpp
         src/spatial_canvas.cpp
+        src/VxrVrMenuUi.cpp
+        src/VxrClientNetwork.cpp
         src/VxrQuestApp.cpp
     )
 
@@ -67,6 +76,10 @@ else()
 
     target_compile_definitions(test_quest_client PRIVATE
         _CRT_SECURE_NO_WARNINGS
+    )
+
+    target_link_libraries(test_quest_client PRIVATE
+        ws2_32
     )
 
     # Shaders & Reprojection Test Executable

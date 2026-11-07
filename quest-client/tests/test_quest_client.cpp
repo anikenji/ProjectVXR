@@ -6,11 +6,15 @@
 #include "VxrVulkanRenderer.h"
 #include "VxrOpenXrClient.h"
 #include "VxrHardwareCursor.h"
+#include "VxrVrMenuUi.h"
+#include "VxrClientNetwork.h"
 #include "VxrQuestApp.h"
 
 #include <iostream>
 #include <cassert>
 #include <cmath>
+#include <cstring>
+#include <vector>
 
 int main() {
     std::cout << "=================================================" << std::endl;
@@ -28,12 +32,10 @@ int main() {
         assert(decoder.GetWidth() == 2064 && decoder.GetHeight() == 2208);
         assert(decoder.GetFps() == 90);
 
-        // Queue simulated HEVC NALU
         uint8_t fakeNalu[256] = { 0x00, 0x00, 0x00, 0x01, 0x40, 0x01 };
         bool queued = decoder.QueueInputBuffer(fakeNalu, sizeof(fakeNalu), 1000000, true);
         assert(queued);
 
-        // Dequeue output buffer containing AHardwareBuffer
         vxr::DecodedOutputFrame frame;
         vxr::DecoderStatus status = decoder.DequeueOutputBuffer(&frame, 0);
         assert(status == vxr::DecoderStatus::Success);
@@ -79,6 +81,7 @@ int main() {
         assert(beginOk);
         renderer.RenderStreamQuad(texture, 0); // left eye
         renderer.RenderStreamQuad(texture, 1); // right eye
+        renderer.RenderMenuOverlayQuad(true, true);
         bool endOk = renderer.EndFrame();
         assert(endOk);
         assert(renderer.GetRenderedFrameCount() == 1);
@@ -94,22 +97,18 @@ int main() {
         vxr::VxrHardwareCursor cursor;
         assert(cursor.IsVisible());
 
-        // Update position to (75%, 25%) on virtual screen
         cursor.UpdatePosition(0.75f, 0.25f, true);
         assert(cursor.GetNormalizedX() == 0.75f);
         assert(cursor.GetNormalizedY() == 0.25f);
         assert(cursor.GetUpdateCount() == 1);
 
-        // Calculate 3D billboard vertices over desktop at (0, 1.5m, -2.0m)
         float desktopPos[3] = { 0.0f, 1.5f, -2.0f };
-        float desktopW = 2.0f;  // 2 meters wide
-        float desktopH = 1.125f; // 16:9 aspect ratio
+        float desktopW = 2.0f;
+        float desktopH = 1.125f;
 
         vxr::CursorQuadVertex quad[4];
         cursor.CalculateQuadVertices(desktopPos, desktopW, desktopH, quad);
 
-        // Normalized x = 0.75 -> offset_x = (0.75 - 0.5) * 2.0 = +0.5m -> X center = 0.5m
-        // Normalized y = 0.25 -> offset_y = (0.5 - 0.25) * 1.125 = +0.28125m -> Y center = 1.78125m
         float expectedCenterX = 0.5f;
         float expectedCenterY = 1.5f + 0.28125f;
         float actualCenterX = (quad[0].pos[0] + quad[2].pos[0]) * 0.5f;
@@ -117,13 +116,10 @@ int main() {
 
         assert(std::abs(actualCenterX - expectedCenterX) < 1e-4);
         assert(std::abs(actualCenterY - expectedCenterY) < 1e-4);
-        // Positioned 2mm in front of desktop screen to prevent Z-fighting
         assert(std::abs(quad[0].pos[2] - (-2.0f + 0.002f)) < 1e-4);
 
         std::cout << "  -> 0ms Cursor Quad projected at VR coordinates: ("
                   << actualCenterX << ", " << actualCenterY << ", " << quad[0].pos[2] << ")" << std::endl;
-        std::cout << "  -> UV mapping verified: (" << quad[0].uv[0] << ", " << quad[0].uv[1]
-                  << ") to (" << quad[2].uv[0] << ", " << quad[2].uv[1] << ")" << std::endl;
     }
 
     // Test 4: OpenXR Session Lifecycle & 6DoF Views
@@ -153,11 +149,12 @@ int main() {
         vxr::XrEyeView views[2];
         bool locateOk = openXr.LocateViews(displayTime, views);
         assert(locateOk);
-        // Verify IPD: Left eye at -0.0315m, Right eye at +0.0315m (0.063m total)
         assert(std::abs(views[0].position[0] - (-0.0315f)) < 1e-4);
         assert(std::abs(views[1].position[0] - 0.0315f) < 1e-4);
-        std::cout << "  -> 6DoF Eye Views located: Left X=" << views[0].position[0]
-                  << ", Right X=" << views[1].position[0] << " (IPD = 63mm)" << std::endl;
+
+        float u = 0.0f, v = 0.0f;
+        assert(openXr.ComputeDesktopPointerUV(2.2f, &u, &v));
+        assert(u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f);
 
         bool endOk = openXr.EndFrame(displayTime);
         assert(endOk);
@@ -165,17 +162,84 @@ int main() {
 
         openXr.HandleSessionStateChanged(vxr::OpenXrSessionState::Stopping);
         assert(!openXr.IsSessionRunning());
-        std::cout << "  -> OpenXR session lifecycle validated." << std::endl;
+        std::cout << "  -> OpenXR session lifecycle & laser ray-plane UV intersection validated." << std::endl;
     }
 
-    // Test 5: End-to-End Quest App Coordinator Loop
-    std::cout << "[Test 5] Testing End-to-End Quest App Coordinator (RunFrame loop)..." << std::endl;
+    // Test 5: Virtual Desktop 7-Tab In-VR Menu UI & RGBA Framebuffer Rasterizer
+    std::cout << "[Test 5] Testing Virtual Desktop 7-Tab In-VR Menu UI & Performance HUD..." << std::endl;
+    {
+        vxr::VxrVrMenuUi menu;
+        assert(menu.Initialize());
+        assert(menu.IsVisible());
+        assert(menu.GetVrRenderWidth() == 2496 && menu.GetVrRenderHeight() == 2592); // High preset default
+        assert(vxr::VxrVrMenuUi::GetVrRenderWidthForQuality(5) == 3072); // Godlike preset
+
+        std::vector<uint32_t> rgba(1280 * 800, 0);
+        for (uint32_t tabIdx = 0; tabIdx < 7; ++tabIdx) {
+            menu.SetActiveTab(static_cast<vxr::VrMenuTab>(tabIdx));
+            assert(menu.RenderMenuToRgba(rgba.data(), 1280, 800));
+        }
+
+        vxr::VrPerfStats stats;
+        std::vector<uint32_t> hudRgba(480 * 220, 0);
+        assert(menu.RenderPerformanceOverlayToRgba(hudRgba.data(), 480, 220, stats));
+        std::cout << "  -> All 7 VR Menu Tabs (COMPUTERS..VIDEOS) & Performance Overlay rasterized cleanly." << std::endl;
+    }
+
+    // Test 6: Multi-Fragment UDP Video Frame Reassembly & Bidirectional Control Protocol
+    std::cout << "[Test 6] Testing Multi-Fragment UDP Video Reassembly & Control Protocol..." << std::endl;
+    {
+        vxr::VxrClientNetwork net;
+        assert(net.Initialize(0, 0));
+
+        // Simulate a 3000-byte HEVC keyframe split across 3 MTU fragments (1200 + 1200 + 600)
+        std::vector<uint8_t> originalFrame(3000);
+        for (size_t i = 0; i < originalFrame.size(); ++i) originalFrame[i] = static_cast<uint8_t>(i & 0xFF);
+
+        const uint16_t fragCount = 3;
+        const size_t sizes[3] = { 1200, 1200, 600 };
+        vxr::ReassembledVideoFrame outFrame = {};
+        bool completed = false;
+
+        for (uint16_t f = 0; f < fragCount; ++f) {
+            std::vector<uint8_t> pkt(sizeof(vxr::VxrUdpVideoFragmentHeader) + sizes[f]);
+            vxr::VxrUdpVideoFragmentHeader hdr = {};
+            hdr.magic = vxr::VXR_UDP_VIDEO_MAGIC;
+            hdr.frame_id = 42;
+            hdr.frag_idx = f;
+            hdr.frag_count = fragCount;
+            hdr.flags = 0x01; // keyframe
+            hdr.codec_id = 1; // HEVC
+            hdr.payload_len = static_cast<uint16_t>(sizes[f]);
+            hdr.pts_us = 777000;
+            hdr.cursor_norm_x = 0.65f;
+            hdr.cursor_norm_y = 0.35f;
+            hdr.cursor_visible = 1;
+
+            std::memcpy(pkt.data(), &hdr, sizeof(hdr));
+            std::memcpy(pkt.data() + sizeof(hdr), originalFrame.data() + f * 1200, sizes[f]);
+
+            completed = net.ReassembleFrame(pkt.data(), pkt.size(), &outFrame);
+            if (f < fragCount - 1) assert(!completed);
+        }
+
+        assert(completed);
+        assert(outFrame.size == 3000);
+        assert(outFrame.frame_id == 42);
+        assert(outFrame.is_keyframe);
+        assert(std::memcmp(outFrame.data.data(), originalFrame.data(), 3000) == 0);
+        std::cout << "  -> 3-fragment 3000-byte HEVC frame reassembled with 100% byte accuracy." << std::endl;
+        net.Cleanup();
+    }
+
+    // Test 7: End-to-End Quest App Coordinator Loop
+    std::cout << "[Test 7] Testing End-to-End Quest App Coordinator (RunFrame loop)..." << std::endl;
     {
         vxr::VxrQuestApp app;
         vxr::QuestAppConfig config;
         config.preferred_codec = vxr::VideoCodecType::Hevc;
-        config.stream_width = 2064;
-        config.stream_height = 2208;
+        config.stream_width = 2496;
+        config.stream_height = 2592;
         config.target_fps = 90;
         config.enable_zero_copy = true;
         config.enable_space_warp = true;
@@ -185,22 +249,19 @@ int main() {
         assert(initOk);
         assert(app.IsRunning());
 
-        // Feed video packets
         uint8_t packet[128] = { 0x00, 0x00, 0x00, 0x01 };
         bool feedOk = app.FeedVideoData(packet, sizeof(packet), 123456, true);
         assert(feedOk);
 
-        // Update hardware cursor
         app.UpdateHardwareCursor(0.8f, 0.4f, true);
 
-        // Run 5 consecutive frames through the zero-copy pipeline
         for (int i = 0; i < 5; ++i) {
             bool frameOk = app.RunFrame();
             assert(frameOk);
         }
 
         assert(app.GetTotalFramesRendered() == 5);
-        std::cout << "  -> 5 consecutive frames rendered through zero-copy pipeline!" << std::endl;
+        std::cout << "  -> 5 consecutive frames rendered with 7-Tab Menu & Performance HUD layers!" << std::endl;
 
         app.Shutdown();
         assert(!app.IsRunning());
@@ -208,7 +269,7 @@ int main() {
     }
 
     std::cout << "=================================================" << std::endl;
-    std::cout << "   ALL QUEST CLIENT TESTS PASSED!                " << std::endl;
+    std::cout << "   ALL 7 QUEST CLIENT TEST SUITES PASSED!        " << std::endl;
     std::cout << "=================================================" << std::endl;
     return 0;
 }

@@ -34,6 +34,99 @@
 
 using namespace Gdiplus;
 
+// ============================================================================
+// SHARED UDP WIRE PACKET STRUCTS (VXRV Video Fragments & VXRC Control Packets)
+// ============================================================================
+#pragma pack(push, 1)
+
+static const uint32_t VXR_UDP_VIDEO_MAGIC = 0x56585256; // "VXRV"
+static const uint32_t VXR_UDP_CTRL_MAGIC  = 0x56585243; // "VXRC"
+static const uint32_t VXR_HOST_INFO_MAGIC = 0x56585248; // "VXRH"
+
+enum VxrControlCommandType : uint8_t {
+    VXR_CMD_DISCOVER        = 1,
+    VXR_CMD_CONNECT         = 1,
+    VXR_CMD_MOUSE_INPUT     = 2,
+    VXR_CMD_CLIENT_SETTINGS = 3,
+    VXR_CMD_LAUNCH_STEAMVR  = 4,
+    VXR_CMD_SWITCH_MONITOR  = 5
+};
+
+enum VxrMouseButtonFlags : uint8_t {
+    VXR_MOUSE_LEFT_DOWN   = (1 << 0),
+    VXR_MOUSE_LEFT_UP     = (1 << 1),
+    VXR_MOUSE_RIGHT_DOWN  = (1 << 2),
+    VXR_MOUSE_RIGHT_UP    = (1 << 3),
+    VXR_MOUSE_MIDDLE_DOWN = (1 << 4),
+    VXR_MOUSE_MIDDLE_UP   = (1 << 5)
+};
+
+struct VxrUdpVideoFragmentHeader {
+    uint32_t magic;          // 0x56585256 ("VXRV")
+    uint32_t frame_id;
+    uint16_t frag_idx;
+    uint16_t frag_count;
+    uint8_t  flags;          // bit 0 = keyframe, bit 1 = intra_refresh
+    uint8_t  codec_id;
+    uint16_t payload_len;
+    uint64_t pts_us;
+    float    cursor_norm_x;
+    float    cursor_norm_y;
+    uint8_t  cursor_visible;
+    uint8_t  reserved[3];
+};
+
+struct VxrControlHeader {
+    uint32_t magic;          // 0x56585243 ("VXRC")
+    uint8_t  cmd_type;       // 1..5
+    uint8_t  reserved[3];
+};
+
+struct VxrControlDiscoverPacket {
+    VxrControlHeader hdr;
+    char headset_name[64];
+};
+
+struct VxrControlMouseInputPacket {
+    VxrControlHeader hdr;
+    float   norm_x;          // 0.0 .. 1.0
+    float   norm_y;          // 0.0 .. 1.0
+    uint8_t button_flags;    // VxrMouseButtonFlags
+    uint8_t reserved[3];
+    int16_t scroll_dx;
+    int16_t scroll_dy;
+};
+
+struct VxrControlClientSettingsPacket {
+    VxrControlHeader hdr;
+    uint16_t desktop_bitrate_mbps;
+    uint16_t vr_bitrate_mbps;
+    uint8_t  vr_graphics_quality; // 0=Potato, 1=Low, 2=Medium, 3=High, 4=Ultra, 5=Godlike
+    uint8_t  vr_fps;              // 60, 72, 80, 90, 96, 100, 120
+    uint8_t  sharpening_pct;      // 0..100
+    uint8_t  ssw_mode;            // 0=Disabled, 1=Automatic, 2=Always Enabled
+    uint8_t  enable_sgsr;         // 0 or 1
+    uint8_t  passthrough_mask;    // bitmask for environment/hand/desk passthrough
+    uint8_t  reserved[2];
+};
+
+struct VxrHostInfoPacket {
+    uint32_t magic;          // 0x56585248 ("VXRH")
+    uint16_t udp_port;
+    uint16_t desktop_width;
+    uint16_t desktop_height;
+    uint16_t refresh_rate_hz;
+    uint16_t bitrate_mbps;
+    uint8_t  codec_id;
+    uint8_t  reserved;
+    char     computer_name[64];
+    char     gpu_name[64];
+    char     codec_name[32];
+    char     json_summary[256];
+};
+
+#pragma pack(pop)
+
 static const int WIN_W = 680;
 static const int WIN_H = 475;
 static const int TOP_BAR_H = 46;
@@ -272,6 +365,13 @@ struct HostServiceState {
     uint32_t          activeEyeWidth = 2064;
     uint32_t          activeEyeHeight = 2208;
     float             activeCasSharpness = 0.0f;
+    uint32_t          activeBitrateMbps = 150;
+    uint32_t          activeVrFps = 90;
+    uint32_t          activeMonitorIdx = 0;
+    std::atomic<bool> switchMonitorRequested{ false };
+    uint8_t           activeSswMode = 1;
+    bool              activeSgsrEnabled = false;
+    uint8_t           activePassthroughMask = 0;
 
     HMODULE           hEncoderDll = nullptr;
     HMODULE           hOpenXrDll  = nullptr;
@@ -907,7 +1007,8 @@ static void HostServiceThreadProc() {
     inet_pton(AF_INET, "224.0.0.251", &mdnsAddr.sin_addr);
 
     vxr::DxgiDuplicator dxgiDupl;
-    bool capInit = (dxgiDupl.Initialize(0, 0) == VXR_CAPTURE_OK);
+    uint32_t currentOutputIdx = 0;
+    bool capInit = (dxgiDupl.Initialize(0, currentOutputIdx) == VXR_CAPTURE_OK);
 
     sockaddr_in lastActiveClient = {};
     bool hasActiveClient = false;
@@ -915,6 +1016,21 @@ static void HostServiceThreadProc() {
     ULONGLONG lastBeaconTick = 0;
     while (!g_svc.stopRequested) {
         ULONGLONG now = GetTickCount64();
+
+        if (g_svc.switchMonitorRequested.exchange(false)) {
+            dxgiDupl.Cleanup();
+            currentOutputIdx = (currentOutputIdx + 1) % 4;
+            if (dxgiDupl.Initialize(0, currentOutputIdx) != VXR_CAPTURE_OK) {
+                currentOutputIdx = 0;
+                capInit = (dxgiDupl.Initialize(0, 0) == VXR_CAPTURE_OK);
+            } else {
+                capInit = true;
+            }
+            g_svc.activeMonitorIdx = currentOutputIdx;
+            wchar_t monMsg[128];
+            swprintf_s(monMsg, L"Switched active DXGI desktop capture monitor to Display #%u", currentOutputIdx + 1);
+            ShowToast(monMsg);
+        }
 
         if (g_svc.mdnsListening && (now - lastBeaconTick >= 2000)) {
             lastBeaconTick = now;
@@ -927,12 +1043,176 @@ static void HostServiceThreadProc() {
             char rxBuf[2048];
             sockaddr_in clientAddr = {};
             int clientLen = sizeof(clientAddr);
-            int r = recvfrom(g_svc.udpSocket, rxBuf, sizeof(rxBuf), 0, (sockaddr*)&clientAddr, &clientLen);
-            if (r > 0) {
+            while (true) {
+                int r = recvfrom(g_svc.udpSocket, rxBuf, sizeof(rxBuf), 0, (sockaddr*)&clientAddr, &clientLen);
+                if (r <= 0) break;
+
                 lastActiveClient = clientAddr;
                 hasActiveClient = true;
-                const char ack[] = "VXR_ACK_OK";
-                sendto(g_svc.udpSocket, ack, sizeof(ack) - 1, 0, (sockaddr*)&clientAddr, clientLen);
+
+                bool handledCtrl = false;
+                if (r >= (int)sizeof(VxrControlHeader)) {
+                    const VxrControlHeader* ctrlHdr = reinterpret_cast<const VxrControlHeader*>(rxBuf);
+                    if (ctrlHdr->magic == VXR_UDP_CTRL_MAGIC) {
+                        handledCtrl = true;
+                        uint8_t cmd = ctrlHdr->cmd_type;
+
+                        if (cmd == VXR_CMD_DISCOVER) {
+                            std::wstring clientHeadset = L"Meta Quest 3 (Connected)";
+                            if (r >= (int)sizeof(VxrControlDiscoverPacket)) {
+                                const VxrControlDiscoverPacket* disc = reinterpret_cast<const VxrControlDiscoverPacket*>(rxBuf);
+                                char hsBuf[65] = {};
+                                memcpy(hsBuf, disc->headset_name, 64);
+                                if (hsBuf[0] != '\0') {
+                                    clientHeadset = Utf8ToWide(hsBuf) + L" (Connected)";
+                                }
+                            }
+
+                            wchar_t compNameW[MAX_COMPUTERNAME_LENGTH + 1] = L"VXR-PC";
+                            DWORD compNameLen = MAX_COMPUTERNAME_LENGTH + 1;
+                            GetComputerNameW(compNameW, &compNameLen);
+
+                            DEVMODEW dm = {};
+                            dm.dmSize = sizeof(dm);
+                            uint16_t deskW = (uint16_t)GetSystemMetrics(SM_CXSCREEN);
+                            uint16_t deskH = (uint16_t)GetSystemMetrics(SM_CYSCREEN);
+                            uint16_t deskHz = 60;
+                            if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm)) {
+                                if (dm.dmPelsWidth > 0) deskW = (uint16_t)dm.dmPelsWidth;
+                                if (dm.dmPelsHeight > 0) deskH = (uint16_t)dm.dmPelsHeight;
+                                if (dm.dmDisplayFrequency > 1) deskHz = (uint16_t)dm.dmDisplayFrequency;
+                            }
+
+                            std::string compUtf8 = WideToUtf8(compNameW);
+                            std::string gpuUtf8;
+                            {
+                                std::lock_guard<std::mutex> lock(g_svc.statusMutex);
+                                g_svc.connectedHeadset = clientHeadset;
+                                gpuUtf8 = WideToUtf8(g_svc.gpuShortName);
+                            }
+                            std::string codecUtf8 = WideToUtf8(g_cfg.GetCodecName());
+
+                            VxrHostInfoPacket hostInfo = {};
+                            hostInfo.magic = VXR_HOST_INFO_MAGIC;
+                            hostInfo.udp_port = g_svc.udpPort;
+                            hostInfo.desktop_width = deskW;
+                            hostInfo.desktop_height = deskH;
+                            hostInfo.refresh_rate_hz = deskHz;
+                            hostInfo.bitrate_mbps = (uint16_t)g_svc.activeBitrateMbps;
+                            hostInfo.codec_id = (uint8_t)g_cfg.preferredCodec;
+                            strncpy_s(hostInfo.computer_name, compUtf8.c_str(), _TRUNCATE);
+                            strncpy_s(hostInfo.gpu_name, gpuUtf8.c_str(), _TRUNCATE);
+                            strncpy_s(hostInfo.codec_name, codecUtf8.c_str(), _TRUNCATE);
+                            sprintf_s(hostInfo.json_summary,
+                                "VXR_HOST_INFO:{\"pc\":\"%s\",\"gpu\":\"%s\",\"codec\":\"%s\",\"width\":%u,\"height\":%u,\"hz\":%u,\"bitrate_mbps\":%u}",
+                                hostInfo.computer_name, hostInfo.gpu_name, hostInfo.codec_name,
+                                (unsigned)deskW, (unsigned)deskH, (unsigned)deskHz, (unsigned)hostInfo.bitrate_mbps);
+
+                            sendto(g_svc.udpSocket, reinterpret_cast<const char*>(&hostInfo), sizeof(hostInfo), 0,
+                                   (sockaddr*)&clientAddr, clientLen);
+                            ShowToast(L"Headset connected: " + clientHeadset);
+                        }
+                        else if (cmd == VXR_CMD_MOUSE_INPUT && r >= (int)sizeof(VxrControlMouseInputPacket)) {
+                            const VxrControlMouseInputPacket* mp = reinterpret_cast<const VxrControlMouseInputPacket*>(rxBuf);
+                            float nx = (std::max)(0.0f, (std::min)(1.0f, mp->norm_x));
+                            float ny = (std::max)(0.0f, (std::min)(1.0f, mp->norm_y));
+
+                            INPUT inputs[4] = {};
+                            int inputCount = 0;
+
+                            // 1. Absolute normalized cursor move (0..65535)
+                            inputs[inputCount].type = INPUT_MOUSE;
+                            inputs[inputCount].mi.dx = (LONG)(nx * 65535.0f);
+                            inputs[inputCount].mi.dy = (LONG)(ny * 65535.0f);
+                            inputs[inputCount].mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+                            if (mp->button_flags & VXR_MOUSE_LEFT_DOWN)   inputs[inputCount].mi.dwFlags |= MOUSEEVENTF_LEFTDOWN;
+                            if (mp->button_flags & VXR_MOUSE_LEFT_UP)     inputs[inputCount].mi.dwFlags |= MOUSEEVENTF_LEFTUP;
+                            if (mp->button_flags & VXR_MOUSE_RIGHT_DOWN)  inputs[inputCount].mi.dwFlags |= MOUSEEVENTF_RIGHTDOWN;
+                            if (mp->button_flags & VXR_MOUSE_RIGHT_UP)    inputs[inputCount].mi.dwFlags |= MOUSEEVENTF_RIGHTUP;
+                            if (mp->button_flags & VXR_MOUSE_MIDDLE_DOWN) inputs[inputCount].mi.dwFlags |= MOUSEEVENTF_MIDDLEDOWN;
+                            if (mp->button_flags & VXR_MOUSE_MIDDLE_UP)   inputs[inputCount].mi.dwFlags |= MOUSEEVENTF_MIDDLEUP;
+                            inputCount++;
+
+                            // 2. Vertical scroll wheel
+                            if (mp->scroll_dy != 0) {
+                                inputs[inputCount].type = INPUT_MOUSE;
+                                inputs[inputCount].mi.mouseData = (DWORD)(int32_t)mp->scroll_dy;
+                                inputs[inputCount].mi.dwFlags = MOUSEEVENTF_WHEEL;
+                                inputCount++;
+                            }
+
+                            // 3. Horizontal scroll wheel
+                            if (mp->scroll_dx != 0) {
+                                inputs[inputCount].type = INPUT_MOUSE;
+                                inputs[inputCount].mi.mouseData = (DWORD)(int32_t)mp->scroll_dx;
+                                inputs[inputCount].mi.dwFlags = MOUSEEVENTF_HWHEEL;
+                                inputCount++;
+                            }
+
+                            SendInput((UINT)inputCount, inputs, sizeof(INPUT));
+                        }
+                        else if (cmd == VXR_CMD_CLIENT_SETTINGS && r >= (int)sizeof(VxrControlClientSettingsPacket)) {
+                            const VxrControlClientSettingsPacket* sp = reinterpret_cast<const VxrControlClientSettingsPacket*>(rxBuf);
+
+                            // Map VR Graphics Quality (0=Potato..5=Godlike) to renderResolution %
+                            static const int kQualityToResPct[6] = { 65, 75, 88, 100, 120, 145 };
+                            static const wchar_t* kQualityNames[6] = {
+                                L"Potato", L"Low", L"Medium", L"High", L"Ultra", L"Godlike"
+                            };
+                            uint8_t qIdx = (sp->vr_graphics_quality <= 5) ? sp->vr_graphics_quality : 3;
+                            g_cfg.renderResolution = kQualityToResPct[qIdx];
+
+                            uint8_t sharp = (sp->sharpening_pct <= 100) ? sp->sharpening_pct : 75;
+                            g_cfg.sharpeningPercent = sharp;
+                            g_cfg.additionalSharpening = (sharp > 0);
+
+                            uint32_t vrMbps = (sp->vr_bitrate_mbps >= 10 && sp->vr_bitrate_mbps <= 500)
+                                ? sp->vr_bitrate_mbps : 150;
+                            uint32_t deskMbps = (sp->desktop_bitrate_mbps >= 5 && sp->desktop_bitrate_mbps <= 200)
+                                ? sp->desktop_bitrate_mbps : 60;
+                            uint32_t fps = (sp->vr_fps >= 60 && sp->vr_fps <= 120) ? sp->vr_fps : 90;
+
+                            g_svc.activeBitrateMbps = vrMbps;
+                            g_svc.activeVrFps = fps;
+                            g_svc.activeSswMode = sp->ssw_mode;
+                            g_svc.activeSgsrEnabled = (sp->enable_sgsr != 0);
+                            g_svc.activePassthroughMask = sp->passthrough_mask;
+
+                            // Dynamically update openxr_vxr.dll and CAS/SGSR shaders
+                            ApplyAdvancedOpticalAndSharpeningParameters();
+                            if (g_svc.activeSgsrEnabled) {
+                                std::vector<float> sgsrIn(16 * 16 * 4, 0.3f);
+                                std::vector<float> sgsrOut(16 * 16 * 4, 0.0f);
+                                g_sgsrShader.ProcessFrame(sgsrIn.data(), 16, 16, 0.1f, g_svc.activeCasSharpness, sgsrOut.data());
+                            }
+
+                            // Dynamically reconfigure hardware encoder bitrate & FPS in-flight
+                            if (g_svc.encoderHandle && pfn_encoder_reconfig) {
+                                pfn_encoder_reconfig(g_svc.encoderHandle, vrMbps * 1000 * 1000, fps);
+                            }
+
+                            SaveConfig();
+                            wchar_t toastBuf[256];
+                            swprintf_s(toastBuf,
+                                L"In-VR Settings Applied: %s (%d%%), %uHz, VR %uMbps / Desk %uMbps, Sharp %u%%, SGSR %s",
+                                kQualityNames[qIdx], g_cfg.renderResolution, fps, vrMbps, deskMbps, sharp,
+                                g_svc.activeSgsrEnabled ? L"ON" : L"OFF");
+                            ShowToast(toastBuf);
+                        }
+                        else if (cmd == VXR_CMD_LAUNCH_STEAMVR) {
+                            ShellExecuteW(nullptr, L"open", L"steam://rungameid/250820", nullptr, nullptr, SW_SHOWNORMAL);
+                            ShowToast(L"Launching SteamVR (steam://rungameid/250820) from headset...");
+                        }
+                        else if (cmd == VXR_CMD_SWITCH_MONITOR) {
+                            g_svc.switchMonitorRequested = true;
+                        }
+                    }
+                }
+
+                if (!handledCtrl) {
+                    const char ack[] = "VXR_ACK_OK";
+                    sendto(g_svc.udpSocket, ack, sizeof(ack) - 1, 0, (sockaddr*)&clientAddr, clientLen);
+                }
             }
         }
 
@@ -949,11 +1229,53 @@ static void HostServiceThreadProc() {
             VxrBitstreamFrame frame = {};
             if (pfn_encoder_encode(g_svc.encoderHandle, texToEncode, now * 1000ULL, 0, &frame)) {
                 g_svc.framesEncoded++;
-                // Stream packet over UDP socket to connected Quest headset
+                // Stream packet over UDP socket to connected Quest headset using MTU Packet Fragmentation
                 if (hasActiveClient && frame.data && frame.size > 0) {
-                    int sendBytes = (frame.size > 1400) ? 1400 : (int)frame.size;
-                    sendto(g_svc.udpSocket, (const char*)frame.data, sendBytes, 0,
-                           (sockaddr*)&lastActiveClient, sizeof(lastActiveClient));
+                    POINT curPt = { 0, 0 };
+                    BOOL curOk = GetCursorPos(&curPt);
+                    int scrW = (std::max)(1, GetSystemMetrics(SM_CXSCREEN));
+                    int scrH = (std::max)(1, GetSystemMetrics(SM_CYSCREEN));
+                    float normX = (std::max)(0.0f, (std::min)(1.0f, (float)curPt.x / (float)scrW));
+                    float normY = (std::max)(0.0f, (std::min)(1.0f, (float)curPt.y / (float)scrH));
+
+                    const size_t kMaxPayloadBytes = 1200;
+                    uint16_t fragCount = (uint16_t)((frame.size + kMaxPayloadBytes - 1) / kMaxPayloadBytes);
+                    if (fragCount == 0) fragCount = 1;
+
+                    uint8_t pktFlags = 0;
+                    if (frame.is_keyframe)      pktFlags |= (1 << 0);
+                    if (frame.is_intra_refresh) pktFlags |= (1 << 1);
+
+                    uint8_t pktBuf[sizeof(VxrUdpVideoFragmentHeader) + 1200];
+                    for (uint16_t fragIdx = 0; fragIdx < fragCount; ++fragIdx) {
+                        size_t offset = (size_t)fragIdx * kMaxPayloadBytes;
+                        size_t rem = frame.size - offset;
+                        uint16_t chunkLen = (uint16_t)((rem > kMaxPayloadBytes) ? kMaxPayloadBytes : rem);
+
+                        VxrUdpVideoFragmentHeader hdr = {};
+                        hdr.magic          = VXR_UDP_VIDEO_MAGIC;
+                        hdr.frame_id       = frame.frame_index;
+                        hdr.frag_idx       = fragIdx;
+                        hdr.frag_count     = fragCount;
+                        hdr.flags          = pktFlags;
+                        hdr.codec_id       = (uint8_t)frame.codec_id;
+                        hdr.payload_len    = chunkLen;
+                        hdr.pts_us         = frame.pts_us;
+                        hdr.cursor_norm_x  = normX;
+                        hdr.cursor_norm_y  = normY;
+                        hdr.cursor_visible = curOk ? 1 : 0;
+
+                        memcpy(pktBuf, &hdr, sizeof(hdr));
+                        memcpy(pktBuf + sizeof(hdr), frame.data + offset, chunkLen);
+
+                        sendto(g_svc.udpSocket, reinterpret_cast<const char*>(pktBuf),
+                               (int)(sizeof(hdr) + chunkLen), 0,
+                               (sockaddr*)&lastActiveClient, sizeof(lastActiveClient));
+
+                        if ((fragIdx % 8) == 7) {
+                            SwitchToThread();
+                        }
+                    }
                 }
             }
 
@@ -1572,6 +1894,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_HOTKEY: {
             int idx = (int)wParam - HOTKEY_BASE_ID;
             if (idx >= 0 && idx < 9) {
+                if (idx == 0) {
+                    g_svc.switchMonitorRequested = true;
+                }
                 ShowToast(L"Hotkey Triggered: " + g_cfg.bindings[idx].actionName);
             }
             return 0;
