@@ -1,10 +1,24 @@
 #include "VxrDriverServerProvider.h"
 #include <iostream>
+#include <cstring>
 
 namespace vxr {
 
 static const char* const s_InterfaceVersions[] = {
+    vr::IVRSettings_Version,
+    vr::ITrackedDeviceServerDriver_Version,
+    vr::IVRDisplayComponent_Version,
+    vr::IVRDriverDirectModeComponent_Version,
+    vr::IVRCameraComponent_Version,
     vr::IServerTrackedDeviceProvider_Version,
+    vr::IVRWatchdogProvider_Version,
+    vr::IVRVirtualDisplay_Version,
+    vr::IVRDriverManager_Version,
+    vr::IVRResources_Version,
+    vr::IVRCompositorPluginProvider_Version,
+    "IVRIPCResourceManagerClient_004",
+    vr::IVRIPCResourceManagerClient_Version,
+    "IVRIPCResourceManagerClient_002",
     nullptr
 };
 
@@ -22,12 +36,60 @@ VxrDriverServerProvider::~VxrDriverServerProvider() {
     Cleanup();
 }
 
+void VxrDriverServerProvider::OpenSharedMemory() {
+#ifdef _WIN32
+    if (m_pSharedState) return;
+    m_hMapFile = CreateFileMappingW(
+        INVALID_HANDLE_VALUE,
+        nullptr,
+        PAGE_READWRITE,
+        0,
+        sizeof(VxrSteamVrSharedState),
+        VXR_STEAMVR_SHM_NAME
+    );
+    if (m_hMapFile) {
+        m_pSharedState = reinterpret_cast<VxrSteamVrSharedState*>(
+            MapViewOfFile(m_hMapFile, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(VxrSteamVrSharedState))
+        );
+    }
+#endif
+}
+
+void VxrDriverServerProvider::CloseSharedMemory() {
+#ifdef _WIN32
+    if (m_pSharedState) {
+        UnmapViewOfFile(m_pSharedState);
+        m_pSharedState = nullptr;
+    }
+    if (m_hMapFile) {
+        CloseHandle(m_hMapFile);
+        m_hMapFile = nullptr;
+    }
+#endif
+}
+
 vr::EVRInitError VxrDriverServerProvider::Init(vr::IVRDriverContext* pDriverContext) {
     VR_INIT_SERVER_DRIVER_CONTEXT(pDriverContext);
 
+    OpenSharedMemory();
+
+    std::string serial = "VXR-HMD-001";
+    std::string model  = "Meta Quest 2";
+
+#ifdef _WIN32
+    if (m_pSharedState && m_pSharedState->magic == VXR_STEAMVR_SHM_MAGIC) {
+        if (m_pSharedState->headset_serial[0] != '\0') {
+            serial = m_pSharedState->headset_serial;
+        }
+        if (m_pSharedState->headset_model[0] != '\0') {
+            model = m_pSharedState->headset_model;
+        }
+    }
+#endif
+
     // Create virtual HMD and dual 6DoF controllers
-    m_pHmd = std::make_unique<VxrHmdDevice>("VXR-HMD-001");
-    m_pLeftController = std::make_unique<VxrControllerDevice>(0); // Left Hand
+    m_pHmd = std::make_unique<VxrHmdDevice>(serial, model);
+    m_pLeftController = std::make_unique<VxrControllerDevice>(0);  // Left Hand
     m_pRightController = std::make_unique<VxrControllerDevice>(1); // Right Hand
 
     // Register devices with SteamVR vrserver host
@@ -37,8 +99,10 @@ vr::EVRInitError VxrDriverServerProvider::Init(vr::IVRDriverContext* pDriverCont
             vr::TrackedDeviceClass_HMD,
             m_pHmd.get()
         );
-        if (!hmdAdded) {
-            std::cerr << "[VXR-OpenVR] Failed to add HMD to vrserver host!" << std::endl;
+        if (!hmdAdded && vr::VRDriverLog()) {
+            vr::VRDriverLog()->Log("[VXR-OpenVR] Failed to add HMD to vrserver host!\n");
+        } else if (vr::VRDriverLog()) {
+            vr::VRDriverLog()->Log(("[VXR-OpenVR] Activated HMD: " + model + " (" + serial + ")\n").c_str());
         }
 
         bool leftAdded = vr::VRServerDriverHost()->TrackedDeviceAdded(
@@ -46,8 +110,8 @@ vr::EVRInitError VxrDriverServerProvider::Init(vr::IVRDriverContext* pDriverCont
             vr::TrackedDeviceClass_Controller,
             m_pLeftController.get()
         );
-        if (!leftAdded) {
-            std::cerr << "[VXR-OpenVR] Failed to add Left Controller to vrserver host!" << std::endl;
+        if (!leftAdded && vr::VRDriverLog()) {
+            vr::VRDriverLog()->Log("[VXR-OpenVR] Failed to add Left Controller to vrserver host!\n");
         }
 
         bool rightAdded = vr::VRServerDriverHost()->TrackedDeviceAdded(
@@ -55,8 +119,8 @@ vr::EVRInitError VxrDriverServerProvider::Init(vr::IVRDriverContext* pDriverCont
             vr::TrackedDeviceClass_Controller,
             m_pRightController.get()
         );
-        if (!rightAdded) {
-            std::cerr << "[VXR-OpenVR] Failed to add Right Controller to vrserver host!" << std::endl;
+        if (!rightAdded && vr::VRDriverLog()) {
+            vr::VRDriverLog()->Log("[VXR-OpenVR] Failed to add Right Controller to vrserver host!\n");
         }
     }
 
@@ -69,6 +133,7 @@ void VxrDriverServerProvider::Cleanup() {
         m_pHmd.reset();
         m_pLeftController.reset();
         m_pRightController.reset();
+        CloseSharedMemory();
         VR_CLEANUP_SERVER_DRIVER_CONTEXT();
         m_initialized.store(false);
     }
@@ -79,11 +144,66 @@ const char* const* VxrDriverServerProvider::GetInterfaceVersions() {
 }
 
 void VxrDriverServerProvider::RunFrame() {
-    // Process driver frame updates
+    if (!m_initialized.load()) return;
+
+#ifdef _WIN32
+    if (!m_pSharedState) {
+        OpenSharedMemory();
+    }
+    if (m_pSharedState && m_pSharedState->magic == VXR_STEAMVR_SHM_MAGIC) {
+        if (m_pHmd) {
+            if (m_pSharedState->headset_model[0] != '\0') {
+                m_pHmd->UpdateModelName(m_pSharedState->headset_model);
+            }
+            if (m_pSharedState->h_fov_scale > 0.1f && m_pSharedState->v_fov_scale > 0.1f) {
+                float resScale = (m_pSharedState->render_width_per_eye > 0)
+                    ? (static_cast<float>(m_pSharedState->render_width_per_eye) / 2064.0f)
+                    : 1.0f;
+                m_pHmd->SetOpticalConfig(m_pSharedState->h_fov_scale, m_pSharedState->v_fov_scale, resScale);
+            }
+            m_pHmd->UpdatePose(m_pSharedState->hmd_pose);
+        }
+        if (m_pLeftController) {
+            m_pLeftController->UpdatePose(m_pSharedState->controller_pose[0]);
+            m_pLeftController->UpdateInput(m_pSharedState->controller_input[0]);
+        }
+        if (m_pRightController) {
+            m_pRightController->UpdatePose(m_pSharedState->controller_pose[1]);
+            m_pRightController->UpdateInput(m_pSharedState->controller_input[1]);
+        }
+        return;
+    }
+#endif
+
+    // Keep default valid poses alive if ProjectVXR.exe hasn't written a frame yet
+    if (m_pHmd) {
+        VxrPose6DoF defaultHmd = {};
+        defaultHmd.position[0] = 0.0f;
+        defaultHmd.position[1] = 1.65f;
+        defaultHmd.position[2] = 0.0f;
+        defaultHmd.orientation[3] = 1.0f;
+        m_pHmd->UpdatePose(defaultHmd);
+    }
+    if (m_pLeftController) {
+        VxrPose6DoF defaultLeft = {};
+        defaultLeft.position[0] = -0.25f;
+        defaultLeft.position[1] = 1.15f;
+        defaultLeft.position[2] = -0.35f;
+        defaultLeft.orientation[3] = 1.0f;
+        m_pLeftController->UpdatePose(defaultLeft);
+    }
+    if (m_pRightController) {
+        VxrPose6DoF defaultRight = {};
+        defaultRight.position[0] = 0.25f;
+        defaultRight.position[1] = 1.15f;
+        defaultRight.position[2] = -0.35f;
+        defaultRight.orientation[3] = 1.0f;
+        m_pRightController->UpdatePose(defaultRight);
+    }
 }
 
 bool VxrDriverServerProvider::ShouldBlockStandbyMode() {
-    return false;
+    return true;
 }
 
 void VxrDriverServerProvider::EnterStandby() {

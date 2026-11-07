@@ -1,0 +1,11 @@
+﻿[
+  {
+    "language_tag": "en_US",
+    "vd_hand_controller": "Virtual Desktop Hand Tracking Controller",
+    "/input/index_pinch": "Index Pinch",
+    "/input/middle_pinch": "Middle Pinch",
+    "/input/ring_pinch": "Ring Pinch",
+    "/input/pinky_pinch": "Pinky Pinch",
+    "/input/index_point": "Index Point"
+  }
+]

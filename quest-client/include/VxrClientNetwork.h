@@ -43,6 +43,24 @@ struct VxrControlDiscoverPacket {
     char headset_name[64];
 };
 
+struct VxrControlTrackingPacket {
+    VxrControlHeader hdr;          // magic=0x56585243 ("VXRC"), cmd_type=6 (TrackingState)
+    float    hmd_pos[3];
+    float    hmd_quat[4];          // x, y, z, w
+    float    left_pos[3];
+    float    left_quat[4];
+    float    right_pos[3];
+    float    right_quat[4];
+    float    left_trigger;
+    float    left_grip;
+    float    left_joy[2];
+    uint32_t left_buttons;
+    float    right_trigger;
+    float    right_grip;
+    float    right_joy[2];
+    uint32_t right_buttons;
+};
+
 struct VxrClientControlPacket {
     uint32_t magic;                // 0x56585243 ("VXRC")
     uint8_t  cmd_type;             // 1=Connect, 2=MouseInput, 3=StreamingSettings, 4=LaunchSteamVR, 5=SwitchMonitor
@@ -150,6 +168,7 @@ public:
     bool SendClientSettings(const VrMenuSettings& settings);
     bool SendLaunchSteamVr();
     bool SendSwitchMonitor();
+    bool SendVrTrackingState(const VxrControlTrackingPacket& trackingPkt);
 
     bool IsInitialized() const { return m_initialized; }
     bool IsConnected() const { return m_connected; }

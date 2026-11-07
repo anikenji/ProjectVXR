@@ -1,8 +1,10 @@
 {
-  "alwaysActivate": false,
+  "alwaysActivate": true,
   "name": "vxr",
+  "directory": "",
   "resourceOnly": false,
+  "redirectsDisplay": true,
   "hmd_presence": [
-    "VXR-HMD-001"
+    "*.*"
   ]
 }

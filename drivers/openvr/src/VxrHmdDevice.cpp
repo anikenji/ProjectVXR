@@ -4,8 +4,9 @@
 
 namespace vxr {
 
-VxrHmdDevice::VxrHmdDevice(const std::string& serialNumber)
+VxrHmdDevice::VxrHmdDevice(const std::string& serialNumber, const std::string& modelName)
     : m_serialNumber(serialNumber)
+    , m_modelName(modelName.empty() ? "Meta Quest 2" : modelName)
     , m_objectId(vr::k_unTrackedDeviceIndexInvalid)
     , m_propertyContainer(vr::k_ulInvalidPropertyContainer)
     , m_submittedFrames(0)
@@ -23,32 +24,53 @@ VxrHmdDevice::VxrHmdDevice(const std::string& serialNumber)
     m_currentPose.qWorldFromDriverRotation.w = 1.0;
     m_currentPose.qDriverFromHeadRotation.w = 1.0;
     m_currentPose.qRotation.w = 1.0;
+    m_currentPose.vecPosition[1] = 1.65; // Standing head height default (1.65m)
 }
 
 VxrHmdDevice::~VxrHmdDevice() {
     Deactivate();
 }
 
+void VxrHmdDevice::UpdateModelName(const std::string& modelName) {
+    if (modelName.empty() || modelName == m_modelName) return;
+    m_modelName = modelName;
+    if (m_propertyContainer != vr::k_ulInvalidPropertyContainer && vr::VRProperties() != nullptr) {
+        vr::VRProperties()->SetStringProperty(m_propertyContainer, vr::Prop_ModelNumber_String, m_modelName.c_str());
+    }
+}
+
 vr::EVRInitError VxrHmdDevice::Activate(uint32_t unObjectId) {
     m_objectId = unObjectId;
     m_propertyContainer = vr::VRProperties()->TrackedDeviceToPropertyContainer(m_objectId);
 
-    // Set standard OpenVR HMD properties
-    vr::VRProperties()->SetStringProperty(m_propertyContainer, vr::Prop_ModelNumber_String, "Project VXR Virtual HMD");
+    // Set standard OpenVR HMD properties (matching SteamVR 2.18.4 Virtual/Null HMD requirements)
+    vr::VRProperties()->SetStringProperty(m_propertyContainer, vr::Prop_ModelNumber_String, m_modelName.c_str());
+    vr::VRProperties()->SetStringProperty(m_propertyContainer, vr::Prop_RenderModelName_String, m_modelName.c_str());
     vr::VRProperties()->SetStringProperty(m_propertyContainer, vr::Prop_SerialNumber_String, m_serialNumber.c_str());
-    vr::VRProperties()->SetStringProperty(m_propertyContainer, vr::Prop_ManufacturerName_String, "Project VXR");
-    vr::VRProperties()->SetStringProperty(m_propertyContainer, vr::Prop_TrackingSystemName_String, "VXR Tracking System");
-    vr::VRProperties()->SetStringProperty(m_propertyContainer, vr::Prop_RegisteredDeviceType_String, "vxr/hmd");
+    vr::VRProperties()->SetStringProperty(m_propertyContainer, vr::Prop_ManufacturerName_String, "Oculus");
+    vr::VRProperties()->SetStringProperty(m_propertyContainer, vr::Prop_TrackingSystemName_String, "oculus");
+    vr::VRProperties()->SetStringProperty(m_propertyContainer, vr::Prop_RegisteredDeviceType_String, "oculus/VXR-HMD-001");
 
     vr::VRProperties()->SetFloatProperty(m_propertyContainer, vr::Prop_UserIpdMeters_Float, m_ipdMeters);
     vr::VRProperties()->SetFloatProperty(m_propertyContainer, vr::Prop_UserHeadToEyeDepthMeters_Float, 0.0f);
     vr::VRProperties()->SetFloatProperty(m_propertyContainer, vr::Prop_DisplayFrequency_Float, m_displayFrequency);
-    vr::VRProperties()->SetFloatProperty(m_propertyContainer, vr::Prop_SecondsFromVsyncToPhotons_Float, 0.011f);
+    vr::VRProperties()->SetFloatProperty(m_propertyContainer, vr::Prop_SecondsFromVsyncToPhotons_Float, 0.0111111f);
 
     vr::VRProperties()->SetUint64Property(m_propertyContainer, vr::Prop_CurrentUniverseId_Uint64, 2);
     vr::VRProperties()->SetBoolProperty(m_propertyContainer, vr::Prop_ContainsProximitySensor_Bool, true);
+
+    // Critical for SteamVR 2.18.4 Virtual HMD Compositor:
+    // Prop_DisplayDebugMode_Bool = true + Prop_IsOnDesktop_Bool = false tells vrcompositor.exe
+    // to run an offscreen/virtual compositor swapchain without requiring physical HDMI/DP EDID!
+    vr::VRProperties()->SetBoolProperty(m_propertyContainer, vr::Prop_DisplayDebugMode_Bool, true);
+    vr::VRProperties()->SetBoolProperty(m_propertyContainer, vr::Prop_IsOnDesktop_Bool, false);
     vr::VRProperties()->SetBoolProperty(m_propertyContainer, vr::Prop_HasDisplayComponent_Bool, true);
     vr::VRProperties()->SetBoolProperty(m_propertyContainer, vr::Prop_ReportsTimeSinceVSync_Bool, false);
+
+    // Publish initial valid pose immediately upon activation
+    if (vr::VRServerDriverHost() != nullptr) {
+        vr::VRServerDriverHost()->TrackedDevicePoseUpdated(m_objectId, m_currentPose, sizeof(m_currentPose));
+    }
 
     return vr::VRInitError_None;
 }
@@ -59,7 +81,6 @@ void VxrHmdDevice::Deactivate() {
 }
 
 void VxrHmdDevice::EnterStandby() {
-    // Switch to low power state
 }
 
 void* VxrHmdDevice::GetComponent(const char* pchComponentNameAndVersion) {
@@ -71,8 +92,14 @@ void* VxrHmdDevice::GetComponent(const char* pchComponentNameAndVersion) {
         return static_cast<vr::IVRDisplayComponent*>(this);
     }
 
+    // Only expose IVRDriverDirectModeComponent when explicitly running offline unit tests
+    // (when vr::VRDriverContext() == nullptr). When running inside real SteamVR vrserver.exe,
+    // returning nullptr here lets vrcompositor.exe use IVRDisplayComponent in virtual display mode!
     if (strcmp(pchComponentNameAndVersion, vr::IVRDriverDirectModeComponent_Version) == 0) {
-        return static_cast<vr::IVRDriverDirectModeComponent*>(this);
+        if (vr::VRDriverContext() == nullptr) {
+            return static_cast<vr::IVRDriverDirectModeComponent*>(this);
+        }
+        return nullptr;
     }
 
     return nullptr;
@@ -100,6 +127,10 @@ bool VxrHmdDevice::UpdatePose(const VxrPose6DoF& pose) {
     m_currentPose.qRotation.y = pose.orientation[1];
     m_currentPose.qRotation.z = pose.orientation[2];
     m_currentPose.qRotation.w = pose.orientation[3];
+    if (m_currentPose.qRotation.x == 0.0 && m_currentPose.qRotation.y == 0.0 &&
+        m_currentPose.qRotation.z == 0.0 && m_currentPose.qRotation.w == 0.0) {
+        m_currentPose.qRotation.w = 1.0;
+    }
 
     m_currentPose.vecVelocity[0] = pose.linear_velocity[0];
     m_currentPose.vecVelocity[1] = pose.linear_velocity[1];
@@ -128,8 +159,8 @@ bool VxrHmdDevice::UpdatePose(const VxrPose6DoF& pose) {
 void VxrHmdDevice::GetWindowBounds(int32_t* pnX, int32_t* pnY, uint32_t* pnWidth, uint32_t* pnHeight) {
     if (pnX) *pnX = 0;
     if (pnY) *pnY = 0;
-    if (pnWidth) *pnWidth = m_renderWidthPerEye * 2;
-    if (pnHeight) *pnHeight = m_renderHeightPerEye;
+    if (pnWidth) *pnWidth = 1920;
+    if (pnHeight) *pnHeight = 1080;
 }
 
 bool VxrHmdDevice::IsDisplayOnDesktop() {
@@ -147,18 +178,17 @@ void VxrHmdDevice::GetRecommendedRenderTargetSize(uint32_t* pnWidth, uint32_t* p
 
 void VxrHmdDevice::GetEyeOutputViewport(vr::EVREye eEye, uint32_t* pnX, uint32_t* pnY, uint32_t* pnWidth, uint32_t* pnHeight) {
     if (pnY) *pnY = 0;
-    if (pnWidth) *pnWidth = m_renderWidthPerEye;
-    if (pnHeight) *pnHeight = m_renderHeightPerEye;
+    if (pnWidth) *pnWidth = 1920 / 2;
+    if (pnHeight) *pnHeight = 1080;
 
     if (eEye == vr::Eye_Left) {
         if (pnX) *pnX = 0;
     } else {
-        if (pnX) *pnX = m_renderWidthPerEye;
+        if (pnX) *pnX = 1920 / 2;
     }
 }
 
 void VxrHmdDevice::GetProjectionRaw(vr::EVREye eEye, float* pfLeft, float* pfRight, float* pfTop, float* pfBottom) {
-    // Symmetrical tangent FOV ~96-100 degrees per eye scaled by Horizontal & Vertical FOV Tangent sliders
     if (pfLeft) *pfLeft = -1.05f * m_hFovScale;
     if (pfRight) *pfRight = 1.05f * m_hFovScale;
     if (pfTop) *pfTop = -1.05f * m_vFovScale;

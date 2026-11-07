@@ -1,6 +1,9 @@
 #include "DxgiDuplicator.h"
+#include <dxgi1_5.h>
 #include <iostream>
 #include <sstream>
+#include <algorithm>
+#include <cstring>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -12,6 +15,7 @@ DxgiDuplicator::DxgiDuplicator()
     , m_outputIndex(0)
     , m_initialized(false)
     , m_frameAcquired(false)
+    , m_hasValidStagingFrame(false)
     , m_sharedHandle(nullptr)
 {
     memset(&m_desc, 0, sizeof(m_desc));
@@ -27,11 +31,13 @@ void DxgiDuplicator::Cleanup() {
         m_frameAcquired = false;
     }
     m_duplication.Reset();
+    m_stagingTexture.Reset();
     m_sharedTexture.Reset();
     m_sharedHandle = nullptr;
     m_context.Reset();
     m_device.Reset();
     m_initialized = false;
+    m_hasValidStagingFrame = false;
 }
 
 VxrCaptureStatus DxgiDuplicator::CreateD3DDevice(IDXGIAdapter* adapter) {
@@ -87,14 +93,34 @@ VxrCaptureStatus DxgiDuplicator::CreateD3DDevice(IDXGIAdapter* adapter) {
 }
 
 VxrCaptureStatus DxgiDuplicator::CreateDuplication(IDXGIOutput* output) {
-    ComPtr<IDXGIOutput1> output1;
-    HRESULT hr = output->QueryInterface(__uuidof(IDXGIOutput1), &output1);
-    if (FAILED(hr)) {
-        std::cerr << "[VXR-Capture] QueryInterface IDXGIOutput1 failed: 0x" << std::hex << hr << std::endl;
-        return VXR_CAPTURE_D3D_ERROR;
+    HRESULT hr = E_FAIL;
+
+    ComPtr<IDXGIOutput5> output5;
+    if (SUCCEEDED(output->QueryInterface(__uuidof(IDXGIOutput5), &output5)) && output5) {
+        const DXGI_FORMAT supportedFormats[] = {
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_R16G16B16A16_FLOAT
+        };
+        hr = output5->DuplicateOutput1(
+            m_device.Get(),
+            0,
+            ARRAYSIZE(supportedFormats),
+            supportedFormats,
+            &m_duplication
+        );
     }
 
-    hr = output1->DuplicateOutput(m_device.Get(), &m_duplication);
+    if (FAILED(hr) || !m_duplication) {
+        ComPtr<IDXGIOutput1> output1;
+        hr = output->QueryInterface(__uuidof(IDXGIOutput1), &output1);
+        if (FAILED(hr)) {
+            std::cerr << "[VXR-Capture] QueryInterface IDXGIOutput1 failed: 0x" << std::hex << hr << std::endl;
+            return VXR_CAPTURE_D3D_ERROR;
+        }
+        hr = output1->DuplicateOutput(m_device.Get(), &m_duplication);
+    }
+
     if (FAILED(hr)) {
         std::cerr << "[VXR-Capture] DuplicateOutput failed: 0x" << std::hex << hr << std::endl;
         if (hr == E_ACCESSDENIED) return VXR_CAPTURE_ACCESS_LOST;
@@ -153,6 +179,29 @@ VxrCaptureStatus DxgiDuplicator::CreateSharedTexture(uint32_t width, uint32_t he
     return VXR_CAPTURE_OK;
 }
 
+VxrCaptureStatus DxgiDuplicator::CreateStagingTexture(uint32_t width, uint32_t height) {
+    D3D11_TEXTURE2D_DESC desc;
+    ZeroMemory(&desc, sizeof(desc));
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.MiscFlags = 0;
+
+    HRESULT hr = m_device->CreateTexture2D(&desc, nullptr, &m_stagingTexture);
+    if (FAILED(hr)) {
+        std::cerr << "[VXR-Capture] Failed to create staging texture: 0x" << std::hex << hr << std::endl;
+        return VXR_CAPTURE_D3D_ERROR;
+    }
+    return VXR_CAPTURE_OK;
+}
+
 VxrCaptureStatus DxgiDuplicator::Initialize(uint32_t adapterIndex, uint32_t outputIndex) {
     Cleanup();
 
@@ -196,8 +245,12 @@ VxrCaptureStatus DxgiDuplicator::Initialize(uint32_t adapterIndex, uint32_t outp
     status = CreateSharedTexture(m_desc.width, m_desc.height);
     if (status != VXR_CAPTURE_OK) return status;
 
+    status = CreateStagingTexture(m_desc.width, m_desc.height);
+    if (status != VXR_CAPTURE_OK) return status;
+
     m_initialized = true;
     m_frameAcquired = false;
+    m_hasValidStagingFrame = false;
     return VXR_CAPTURE_OK;
 }
 
@@ -252,13 +305,16 @@ VxrCaptureStatus DxgiDuplicator::AcquireFrame(uint32_t timeoutMs, VxrCapturedFra
     }
 
     m_context->CopyResource(m_sharedTexture.Get(), acquiredTexture.Get());
+    if (m_stagingTexture) {
+        m_context->CopyResource(m_stagingTexture.Get(), acquiredTexture.Get());
+    }
 
     if (outFrame) {
         outFrame->d3d11_texture = m_sharedTexture.Get();
         outFrame->shared_handle = m_sharedHandle;
         outFrame->present_time_qpc = frameInfo.LastPresentTime.QuadPart;
         outFrame->accumulated_frames = frameInfo.AccumulatedFrames;
-        outFrame->has_new_frame = (frameInfo.AccumulatedFrames > 0) ? 1 : 0;
+        outFrame->has_new_frame = (frameInfo.AccumulatedFrames > 0 || frameInfo.LastPresentTime.QuadPart > 0) ? 1 : 0;
 
         outFrame->cursor.visible = frameInfo.PointerPosition.Visible ? 1 : 0;
         outFrame->cursor.x = frameInfo.PointerPosition.Position.x;
@@ -291,6 +347,155 @@ VxrCaptureStatus DxgiDuplicator::AcquireFrame(uint32_t timeoutMs, VxrCapturedFra
     }
 
     return VXR_CAPTURE_OK;
+}
+
+bool DxgiDuplicator::CaptureScaledBgra(uint32_t dstWidth, uint32_t dstHeight, uint32_t* outBgra, bool* outHasNewFrame) {
+    if (!outBgra || dstWidth == 0 || dstHeight == 0) return false;
+    if (outHasNewFrame) *outHasNewFrame = false;
+
+    if (!m_initialized) {
+        if (Reinitialize() != VXR_CAPTURE_OK) {
+            return false;
+        }
+    }
+
+    VxrCapturedFrame capFrame = {};
+    uint32_t timeoutMs = m_hasValidStagingFrame ? 2 : 16;
+    VxrCaptureStatus status = AcquireFrame(timeoutMs, &capFrame);
+    if (status == VXR_CAPTURE_ACCESS_LOST || status == VXR_CAPTURE_DEVICE_RESET) {
+        if (Reinitialize() == VXR_CAPTURE_OK) {
+            status = AcquireFrame(16, &capFrame);
+        }
+    }
+
+    if (status == VXR_CAPTURE_OK) {
+        ReleaseFrame();
+
+        if (m_stagingTexture && m_desc.width > 0 && m_desc.height > 0) {
+            D3D11_MAPPED_SUBRESOURCE mapped = {};
+            HRESULT mapHr = m_context->Map(m_stagingTexture.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+            if (SUCCEEDED(mapHr) && mapped.pData != nullptr) {
+                const uint32_t srcW = m_desc.width;
+                const uint32_t srcH = m_desc.height;
+                const uint32_t srcPitchPixels = mapped.RowPitch / 4;
+                const uint32_t* srcBase = static_cast<const uint32_t*>(mapped.pData);
+
+                if (m_cachedScaledBgra.size() != (size_t)dstWidth * dstHeight) {
+                    m_cachedScaledBgra.resize((size_t)dstWidth * dstHeight);
+                }
+                m_cachedDstW = dstWidth;
+                m_cachedDstH = dstHeight;
+
+                // High-precision 4-tap Bilinear Area Downsampling + Subtle Unsharp Contrast Enhancement
+                // Preserves 1-pixel UI font strokes cleanly when scaling 1920x1080 / 2560x1440 -> 1280x800
+                const uint32_t scaleX_fp16 = (srcW << 16) / dstWidth;
+                const uint32_t scaleY_fp16 = (srcH << 16) / dstHeight;
+
+                for (uint32_t dy = 0; dy < dstHeight; ++dy) {
+                    uint32_t sy_fp = dy * scaleY_fp16;
+                    uint32_t sy0 = sy_fp >> 16;
+                    uint32_t sy1 = (sy0 + 1 < srcH) ? (sy0 + 1) : sy0;
+                    uint32_t wy = (sy_fp >> 8) & 0xFFu;
+                    uint32_t iwy = 256u - wy;
+
+                    const uint32_t* row0 = srcBase + (size_t)sy0 * srcPitchPixels;
+                    const uint32_t* row1 = srcBase + (size_t)sy1 * srcPitchPixels;
+                    uint32_t* dstRow = m_cachedScaledBgra.data() + (size_t)dy * dstWidth;
+
+                    for (uint32_t dx = 0; dx < dstWidth; ++dx) {
+                        uint32_t sx_fp = dx * scaleX_fp16;
+                        uint32_t sx0 = sx_fp >> 16;
+                        uint32_t sx1 = (sx0 + 1 < srcW) ? (sx0 + 1) : sx0;
+                        uint32_t wx = (sx_fp >> 8) & 0xFFu;
+                        uint32_t iwx = 256u - wx;
+
+                        uint32_t w00 = iwx * iwy;
+                        uint32_t w10 = wx  * iwy;
+                        uint32_t w01 = iwx * wy;
+                        uint32_t w11 = wx  * wy;
+
+                        uint32_t p00 = row0[sx0];
+                        uint32_t p10 = row0[sx1];
+                        uint32_t p01 = row1[sx0];
+                        uint32_t p11 = row1[sx1];
+
+                        uint32_t b = (((p00 & 0xFFu) * w00 + (p10 & 0xFFu) * w10 +
+                                       (p01 & 0xFFu) * w01 + (p11 & 0xFFu) * w11) >> 16);
+                        uint32_t g = ((((p00 >> 8) & 0xFFu) * w00 + ((p10 >> 8) & 0xFFu) * w10 +
+                                       ((p01 >> 8) & 0xFFu) * w01 + ((p11 >> 8) & 0xFFu) * w11) >> 16);
+                        uint32_t r = ((((p00 >> 16) & 0xFFu) * w00 + ((p10 >> 16) & 0xFFu) * w10 +
+                                       ((p01 >> 16) & 0xFFu) * w01 + ((p11 >> 16) & 0xFFu) * w11) >> 16);
+
+                        dstRow[dx] = 0xFF000000u | (r << 16) | (g << 8) | b;
+                    }
+                }
+
+                m_context->Unmap(m_stagingTexture.Get(), 0);
+
+                // Apply fast integer Contrast-Adaptive Sharpening (CAS) on the 1280x800 downsampled buffer
+                // so 1-pixel IDE/desktop font stems stay razor-sharp after 1920x1080 -> 1280x800 downsampling!
+                if (dstWidth >= 4 && dstHeight >= 4) {
+                    std::vector<uint32_t> sharpBuf((size_t)dstWidth * dstHeight);
+                    std::memcpy(sharpBuf.data(), m_cachedScaledBgra.data(), dstWidth * sizeof(uint32_t));
+                    std::memcpy(sharpBuf.data() + (size_t)(dstHeight - 1) * dstWidth,
+                                m_cachedScaledBgra.data() + (size_t)(dstHeight - 1) * dstWidth,
+                                dstWidth * sizeof(uint32_t));
+
+                    for (uint32_t y = 1; y + 1 < dstHeight; ++y) {
+                        const uint32_t* rPrev = m_cachedScaledBgra.data() + (size_t)(y - 1) * dstWidth;
+                        const uint32_t* rCurr = m_cachedScaledBgra.data() + (size_t)y * dstWidth;
+                        const uint32_t* rNext = m_cachedScaledBgra.data() + (size_t)(y + 1) * dstWidth;
+                        uint32_t* rOut = sharpBuf.data() + (size_t)y * dstWidth;
+                        rOut[0] = rCurr[0];
+                        rOut[dstWidth - 1] = rCurr[dstWidth - 1];
+
+                        for (uint32_t x = 1; x + 1 < dstWidth; ++x) {
+                            uint32_t c = rCurr[x];
+                            uint32_t n = rPrev[x];
+                            uint32_t s = rNext[x];
+                            uint32_t w = rCurr[x - 1];
+                            uint32_t e = rCurr[x + 1];
+
+                            int cb = (int)(c & 0xFFu);
+                            int cg = (int)((c >> 8) & 0xFFu);
+                            int cr = (int)((c >> 16) & 0xFFu);
+
+                            int sumB = (int)(n & 0xFFu) + (int)(s & 0xFFu) + (int)(w & 0xFFu) + (int)(e & 0xFFu);
+                            int sumG = (int)((n >> 8) & 0xFFu) + (int)((s >> 8) & 0xFFu) + (int)((w >> 8) & 0xFFu) + (int)((e >> 8) & 0xFFu);
+                            int sumR = (int)((n >> 16) & 0xFFu) + (int)((s >> 16) & 0xFFu) + (int)((w >> 16) & 0xFFu) + (int)((e >> 16) & 0xFFu);
+
+                            // Unsharp weight = 0.375 (3/8 of Laplacian)
+                            int ob = cb + (((4 * cb - sumB) * 3) >> 5);
+                            int og = cg + (((4 * cg - sumG) * 3) >> 5);
+                            int or_ = cr + (((4 * cr - sumR) * 3) >> 5);
+
+                            if (ob < 0) ob = 0; else if (ob > 255) ob = 255;
+                            if (og < 0) og = 0; else if (og > 255) og = 255;
+                            if (or_ < 0) or_ = 0; else if (or_ > 255) or_ = 255;
+
+                            rOut[x] = 0xFF000000u | ((uint32_t)or_ << 16) | ((uint32_t)og << 8) | (uint32_t)ob;
+                        }
+                    }
+                    m_cachedScaledBgra.swap(sharpBuf);
+                }
+
+                m_hasValidStagingFrame = true;
+                if (outHasNewFrame) *outHasNewFrame = true;
+            }
+        }
+    } else if (m_frameAcquired) {
+        ReleaseFrame();
+    }
+
+    if (m_hasValidStagingFrame &&
+        m_cachedDstW == dstWidth &&
+        m_cachedDstH == dstHeight &&
+        m_cachedScaledBgra.size() == (size_t)dstWidth * dstHeight) {
+        std::memcpy(outBgra, m_cachedScaledBgra.data(), (size_t)dstWidth * dstHeight * sizeof(uint32_t));
+        return true;
+    }
+
+    return false;
 }
 
 VxrCaptureStatus DxgiDuplicator::ReleaseFrame() {

@@ -18,6 +18,9 @@ extern "C" {
   #define VXR_DRIVER_API
 #endif
 
+#define VXR_STEAMVR_SHM_NAME  L"Local\\VxrSteamVrSharedState"
+#define VXR_STEAMVR_SHM_MAGIC 0x56585253u // 'VXRS'
+
 /// 6DoF Pose in 3D Space
 typedef struct VxrPose6DoF {
     float position[3];          // x, y, z (meters)
@@ -49,6 +52,29 @@ enum VxrControllerButtonFlags {
     VXR_BTN_STICK_CLICK   = (1 << 4),
     VXR_BTN_MENU          = (1 << 5)
 };
+
+#pragma pack(push, 1)
+typedef struct VxrSteamVrSharedState {
+    uint32_t magic;                     // VXR_STEAMVR_SHM_MAGIC (0x56585253)
+    uint32_t version;                   // 1
+    uint64_t update_seq;                // Incremented on each pose/config update
+    uint64_t last_update_tick_ms;       // GetTickCount64()
+    uint8_t  headset_connected;         // 1 when Quest is connected to ProjectVXR.exe
+    uint8_t  controllers_connected[2];  // Left=0, Right=1
+    uint8_t  reserved0;
+    char     headset_model[64];         // e.g. "Meta Quest 2"
+    char     headset_serial[64];        // e.g. "VXR-HMD-001"
+    uint32_t render_width_per_eye;      // e.g. 2064
+    uint32_t render_height_per_eye;     // e.g. 2208
+    float    refresh_rate_hz;           // e.g. 90.0f
+    float    h_fov_scale;               // e.g. 1.0f
+    float    v_fov_scale;               // e.g. 1.0f
+    float    ipd_meters;                // e.g. 0.063f
+    VxrPose6DoF        hmd_pose;
+    VxrPose6DoF        controller_pose[2];
+    VxrControllerInput controller_input[2];
+} VxrSteamVrSharedState;
+#pragma pack(pop)
 
 /// External API to update HMD 6DoF pose from streamer network thread
 VXR_DRIVER_API bool VxrDriver_UpdateHmdPose(const VxrPose6DoF* pose);

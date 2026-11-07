@@ -13,7 +13,8 @@ class VxrHmdDevice : public vr::ITrackedDeviceServerDriver,
                      public vr::IVRDriverDirectModeComponent
 {
 public:
-    VxrHmdDevice(const std::string& serialNumber = "VXR-HMD-001");
+    VxrHmdDevice(const std::string& serialNumber = "VXR-HMD-001",
+                 const std::string& modelName = "Meta Quest 2");
     virtual ~VxrHmdDevice();
 
     // =========================================================================
@@ -39,7 +40,7 @@ public:
     virtual bool ComputeInverseDistortion(vr::HmdVector2_t* pResult, vr::EVREye eEye, uint32_t unChannel, float fU, float fV) override;
 
     // =========================================================================
-    // IVRDriverDirectModeComponent interface
+    // IVRDriverDirectModeComponent interface (for unit test compatibility)
     // =========================================================================
     virtual void CreateSwapTextureSet(uint32_t unPid, const SwapTextureSetDesc_t* pSwapTextureSetDesc, SwapTextureSet_t* pOutSwapTextureSet) override;
     virtual void DestroySwapTextureSet(vr::SharedTextureHandle_t sharedTextureHandle) override;
@@ -54,6 +55,7 @@ public:
     // VXR Custom Methods
     // =========================================================================
     bool UpdatePose(const VxrPose6DoF& pose);
+    void UpdateModelName(const std::string& modelName);
     uint32_t GetObjectId() const { return m_objectId; }
     const std::string& GetSerialNumber() const { return m_serialNumber; }
     bool IsActive() const { return m_objectId != vr::k_unTrackedDeviceIndexInvalid; }
@@ -67,6 +69,7 @@ public:
 
 private:
     std::string m_serialNumber;
+    std::string m_modelName;
     uint32_t m_objectId;
     vr::PropertyContainerHandle_t m_propertyContainer;
 
@@ -79,7 +82,7 @@ private:
     vr::SharedTextureHandle_t m_lastSubmittedLeftEye;
     vr::SharedTextureHandle_t m_lastSubmittedRightEye;
 
-    // Display configuration: Quest 3 dual panels
+    // Display configuration
     uint32_t m_renderWidthPerEye;
     uint32_t m_renderHeightPerEye;
     float m_displayFrequency;

@@ -28,6 +28,9 @@ VxrControllerDevice::VxrControllerDevice(int handRole)
     m_currentPose.qWorldFromDriverRotation.w = 1.0;
     m_currentPose.qDriverFromHeadRotation.w = 1.0;
     m_currentPose.qRotation.w = 1.0;
+    m_currentPose.vecPosition[0] = (handRole == 0) ? -0.25 : 0.25;
+    m_currentPose.vecPosition[1] = 1.15;
+    m_currentPose.vecPosition[2] = -0.35;
 
     memset(&m_lastInput, 0, sizeof(m_lastInput));
 }
@@ -40,19 +43,24 @@ vr::EVRInitError VxrControllerDevice::Activate(uint32_t unObjectId) {
     m_objectId = unObjectId;
     m_propertyContainer = vr::VRProperties()->TrackedDeviceToPropertyContainer(m_objectId);
 
-    vr::VRProperties()->SetStringProperty(m_propertyContainer, vr::Prop_ModelNumber_String, "Project VXR Controller");
+    vr::VRProperties()->SetStringProperty(m_propertyContainer, vr::Prop_ModelNumber_String, m_handRole == 0 ? "Oculus Quest2 (Left Controller)" : "Oculus Quest2 (Right Controller)");
+    vr::VRProperties()->SetStringProperty(m_propertyContainer, vr::Prop_RenderModelName_String, m_handRole == 0 ? "oculus_quest2_controller_left" : "oculus_quest2_controller_right");
     vr::VRProperties()->SetStringProperty(m_propertyContainer, vr::Prop_SerialNumber_String, m_serialNumber.c_str());
-    vr::VRProperties()->SetStringProperty(m_propertyContainer, vr::Prop_ManufacturerName_String, "Project VXR");
-    vr::VRProperties()->SetStringProperty(m_propertyContainer, vr::Prop_TrackingSystemName_String, "VXR Tracking System");
+    vr::VRProperties()->SetStringProperty(m_propertyContainer, vr::Prop_ManufacturerName_String, "Oculus");
+    vr::VRProperties()->SetStringProperty(m_propertyContainer, vr::Prop_TrackingSystemName_String, "oculus");
+    vr::VRProperties()->SetStringProperty(m_propertyContainer, vr::Prop_ControllerType_String, "oculus_touch");
 
     vr::ETrackedControllerRole role = (m_handRole == 0) ? vr::TrackedControllerRole_LeftHand : vr::TrackedControllerRole_RightHand;
     vr::VRProperties()->SetInt32Property(m_propertyContainer, vr::Prop_ControllerRoleHint_Int32, role);
     vr::VRProperties()->SetInt32Property(m_propertyContainer, vr::Prop_DeviceClass_Int32, vr::TrackedDeviceClass_Controller);
-    vr::VRProperties()->SetStringProperty(m_propertyContainer, vr::Prop_InputProfilePath_String, "{vxr}/input/vxr_controller_profile.json");
+    vr::VRProperties()->SetStringProperty(m_propertyContainer, vr::Prop_InputProfilePath_String, "{oculus}/input/touch_profile.json");
+
+    if (vr::VRServerDriverHost() != nullptr) {
+        vr::VRServerDriverHost()->TrackedDevicePoseUpdated(m_objectId, m_currentPose, sizeof(m_currentPose));
+    }
 
     // Register OpenVR Input Components
     if (vr::VRDriverInput() != nullptr) {
-        // Trigger pull & click
         vr::VRDriverInput()->CreateScalarComponent(
             m_propertyContainer,
             "/input/trigger/value",
@@ -62,7 +70,6 @@ vr::EVRInitError VxrControllerDevice::Activate(uint32_t unObjectId) {
         );
         vr::VRDriverInput()->CreateBooleanComponent(m_propertyContainer, "/input/trigger/click", &m_hTriggerClick);
 
-        // Grip pull & click
         vr::VRDriverInput()->CreateScalarComponent(
             m_propertyContainer,
             "/input/grip/value",
@@ -72,7 +79,6 @@ vr::EVRInitError VxrControllerDevice::Activate(uint32_t unObjectId) {
         );
         vr::VRDriverInput()->CreateBooleanComponent(m_propertyContainer, "/input/grip/click", &m_hGripClick);
 
-        // Joystick X & Y and click
         vr::VRDriverInput()->CreateScalarComponent(
             m_propertyContainer,
             "/input/thumbstick/x",
@@ -89,7 +95,6 @@ vr::EVRInitError VxrControllerDevice::Activate(uint32_t unObjectId) {
         );
         vr::VRDriverInput()->CreateBooleanComponent(m_propertyContainer, "/input/thumbstick/click", &m_hJoystickClick);
 
-        // Face buttons (X/Y for left, A/B for right)
         if (m_handRole == 0) {
             vr::VRDriverInput()->CreateBooleanComponent(m_propertyContainer, "/input/x/click", &m_hButtonA_or_X);
             vr::VRDriverInput()->CreateBooleanComponent(m_propertyContainer, "/input/y/click", &m_hButtonB_or_Y);
@@ -98,10 +103,7 @@ vr::EVRInitError VxrControllerDevice::Activate(uint32_t unObjectId) {
             vr::VRDriverInput()->CreateBooleanComponent(m_propertyContainer, "/input/b/click", &m_hButtonB_or_Y);
         }
 
-        // Menu / System button
         vr::VRDriverInput()->CreateBooleanComponent(m_propertyContainer, "/input/menu/click", &m_hMenuButton);
-
-        // Haptic feedback output
         vr::VRDriverInput()->CreateHapticComponent(m_propertyContainer, "/output/haptic", &m_hHaptic);
     }
 
@@ -142,6 +144,10 @@ bool VxrControllerDevice::UpdatePose(const VxrPose6DoF& pose) {
     m_currentPose.qRotation.y = pose.orientation[1];
     m_currentPose.qRotation.z = pose.orientation[2];
     m_currentPose.qRotation.w = pose.orientation[3];
+    if (m_currentPose.qRotation.x == 0.0 && m_currentPose.qRotation.y == 0.0 &&
+        m_currentPose.qRotation.z == 0.0 && m_currentPose.qRotation.w == 0.0) {
+        m_currentPose.qRotation.w = 1.0;
+    }
 
     m_currentPose.vecVelocity[0] = pose.linear_velocity[0];
     m_currentPose.vecVelocity[1] = pose.linear_velocity[1];
@@ -170,15 +176,12 @@ bool VxrControllerDevice::UpdateInput(const VxrControllerInput& input) {
         return false;
     }
 
-    // Trigger & Grip analog
     if (m_hTriggerPull != vr::k_ulInvalidInputComponentHandle) {
         vr::VRDriverInput()->UpdateScalarComponent(m_hTriggerPull, input.trigger_value, 0.0);
     }
     if (m_hGripPull != vr::k_ulInvalidInputComponentHandle) {
         vr::VRDriverInput()->UpdateScalarComponent(m_hGripPull, input.grip_value, 0.0);
     }
-
-    // Joystick 2D analog
     if (m_hJoystickX != vr::k_ulInvalidInputComponentHandle) {
         vr::VRDriverInput()->UpdateScalarComponent(m_hJoystickX, input.joystick[0], 0.0);
     }
@@ -186,7 +189,6 @@ bool VxrControllerDevice::UpdateInput(const VxrControllerInput& input) {
         vr::VRDriverInput()->UpdateScalarComponent(m_hJoystickY, input.joystick[1], 0.0);
     }
 
-    // Buttons
     bool triggerClick = (input.buttons & VXR_BTN_TRIGGER_CLICK) != 0;
     bool gripClick = (input.buttons & VXR_BTN_GRIP_CLICK) != 0;
     bool btnA_X = (input.buttons & VXR_BTN_A_X) != 0;

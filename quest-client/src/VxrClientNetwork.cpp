@@ -306,7 +306,7 @@ bool VxrClientNetwork::ReassembleFrame(const uint8_t* packetData, size_t packetL
             // Multi-fragment frame reassembly
             auto it = m_pendingFrames.find(frameId);
             if (it == m_pendingFrames.end()) {
-                while (m_pendingFrameOrder.size() >= 8) {
+                while (m_pendingFrameOrder.size() >= 64) {
                     uint32_t oldestId = m_pendingFrameOrder.front();
                     m_pendingFrameOrder.erase(m_pendingFrameOrder.begin());
                     m_pendingFrames.erase(oldestId);
@@ -502,16 +502,13 @@ bool VxrClientNetwork::PollNetwork(ReassembledVideoFrame* outFrame) {
         return false;
     }
 
-    // Also poll m_beaconSock (:38811) and m_mdnsSock (:5353) for host discovery packets
-    PollMdnsDiscovery(nullptr);
-
     VxrRawSocket s = static_cast<VxrRawSocket>(m_udpSock);
     if (s == VXR_INVALID_SOCK) {
         return false;
     }
 
     uint8_t rxBuf[2048];
-    for (int iter = 0; iter < 64; ++iter) {
+    for (int iter = 0; iter < 256; ++iter) {
         sockaddr_in fromAddr = {};
 #ifdef _WIN32
         int fromLen = sizeof(fromAddr);
@@ -815,6 +812,24 @@ bool VxrClientNetwork::SendSwitchMonitor() {
     pkt.magic = VXR_UDP_CTRL_MAGIC; // 0x56585243 ("VXRC")
     pkt.cmd_type = 5;
     return SendControlPacketInternal(pkt);
+}
+
+bool VxrClientNetwork::SendVrTrackingState(const VxrControlTrackingPacket& trackingPkt) {
+    VxrRawSocket s = static_cast<VxrRawSocket>(m_udpSock);
+    if (!m_initialized || s == VXR_INVALID_SOCK || m_connectedHostIp.empty()) {
+        return false;
+    }
+
+    sockaddr_in destAddr = {};
+    destAddr.sin_family = AF_INET;
+    destAddr.sin_port = htons(m_connectedHostPort);
+    if (inet_pton(AF_INET, m_connectedHostIp.c_str(), &destAddr.sin_addr) != 1) {
+        return false;
+    }
+
+    int sent = sendto(s, reinterpret_cast<const char*>(&trackingPkt), sizeof(trackingPkt), 0,
+                      reinterpret_cast<const sockaddr*>(&destAddr), sizeof(destAddr));
+    return (sent == static_cast<int>(sizeof(trackingPkt)));
 }
 
 } // namespace vxr

@@ -16,7 +16,29 @@ set(DRIVER_SOURCES
     src/VxrDriverApi.cpp
 )
 
-# Build driver_vrserver.dll
+# Build driver_vxr.dll (Required by SteamVR for driver "name": "vxr")
+add_library(driver_vxr SHARED
+    ${DRIVER_SOURCES}
+)
+
+target_compile_definitions(driver_vxr PRIVATE
+    VXR_OPENVR_DRIVER_EXPORTS
+    _CRT_SECURE_NO_WARNINGS
+)
+
+target_include_directories(driver_vxr PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+
+set_target_properties(driver_vxr PROPERTIES
+    OUTPUT_NAME "driver_vxr"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin/win64"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin/win64"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/bin/win64"
+)
+
+# Also build driver_vrserver.dll for ProjectVXR.exe compatibility
 add_library(driver_vrserver SHARED
     ${DRIVER_SOURCES}
 )
@@ -31,7 +53,6 @@ target_include_directories(driver_vrserver PUBLIC
     $<INSTALL_INTERFACE:include>
 )
 
-# Standard SteamVR directory layout: bin/win64/driver_vrserver.dll
 set_target_properties(driver_vrserver PROPERTIES
     OUTPUT_NAME "driver_vrserver"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin/win64"

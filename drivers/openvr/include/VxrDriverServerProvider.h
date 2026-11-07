@@ -7,6 +7,13 @@
 #include <memory>
 #include <atomic>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 namespace vxr {
 
 class VxrDriverServerProvider : public vr::IServerTrackedDeviceProvider {
@@ -36,10 +43,18 @@ public:
     bool IsInitialized() const { return m_initialized.load(); }
 
 private:
+    void OpenSharedMemory();
+    void CloseSharedMemory();
+
     std::atomic<bool> m_initialized;
     std::unique_ptr<VxrHmdDevice> m_pHmd;
     std::unique_ptr<VxrControllerDevice> m_pLeftController;
     std::unique_ptr<VxrControllerDevice> m_pRightController;
+
+#ifdef _WIN32
+    HANDLE m_hMapFile = nullptr;
+    VxrSteamVrSharedState* m_pSharedState = nullptr;
+#endif
 };
 
 } // namespace vxr

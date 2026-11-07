@@ -299,20 +299,21 @@ void VxrQuestApp::UpdateHardwareCursor(float norm_x, float norm_y, bool visible)
 
 void VxrQuestApp::DecodeLiveDesktopStrip(const uint8_t* data, size_t size) {
     // 8-byte header from ProjectVXR.exe:
-    // ['V','X', uint16_t srcW (640), uint16_t yStart, uint16_t stripH]
+    // ['V','X' (Full RLE) or 'V','D' (Delta RLE), uint16_t srcW (1280 or 640), uint16_t yStart, uint16_t stripH]
     if (!data || size < 8) return;
 
     uint16_t srcW   = 0;
-    uint16_t srcH   = 400;
+    uint16_t srcH   = 800;
     uint16_t yStart = 0;
     uint16_t stripH = 0;
     bool isByteTripletRle = (data[0] == 'V' && data[1] == 'X');
+    bool isDeltaRle       = (data[0] == 'V' && data[1] == 'D');
 
-    if (isByteTripletRle) {
+    if (isByteTripletRle || isDeltaRle) {
         srcW   = static_cast<uint16_t>(data[2]) | (static_cast<uint16_t>(data[3]) << 8);
         yStart = static_cast<uint16_t>(data[4]) | (static_cast<uint16_t>(data[5]) << 8);
         stripH = static_cast<uint16_t>(data[6]) | (static_cast<uint16_t>(data[7]) << 8);
-        srcH   = 400;
+        srcH   = (srcW >= 1280) ? 800 : 400;
     } else {
         const uint16_t* u16 = reinterpret_cast<const uint16_t*>(data);
         srcW   = u16[0];
@@ -331,10 +332,67 @@ void VxrQuestApp::DecodeLiveDesktopStrip(const uint8_t* data, size_t size) {
 
     size_t totalStripPixels = static_cast<size_t>(srcW) * stripH;
     size_t pixelIdx = 0;
+    bool isNative1280 = (srcW == MENU_OVERLAY_W && srcH == MENU_OVERLAY_H);
 
-    if (isByteTripletRle) {
+    if (isDeltaRle) {
+        // High-speed 90Hz Delta-RLE strip:
+        // - 0x80 followed by uint16_t skipLen: skip unchanged pixels (1..65535)
+        // - 0x81..0xFF: skip (b0 & 0x7F) unchanged pixels (1..127)
+        // - 0x01..0x7F: Color-Run of b0 pixels followed by uint16_t c565
+        size_t bytePos = 8;
+        while (bytePos < size && pixelIdx < totalStripPixels) {
+            uint8_t cmd = data[bytePos];
+            if (cmd == 0) break;
+
+            if (cmd == 0x80) {
+                if (bytePos + 2 >= size) break;
+                uint16_t skipLen = static_cast<uint16_t>(data[bytePos + 1]) |
+                                   (static_cast<uint16_t>(data[bytePos + 2]) << 8);
+                bytePos += 3;
+                pixelIdx += skipLen;
+            } else if ((cmd & 0x80) != 0) {
+                uint8_t skipLen = (cmd & 0x7F);
+                bytePos += 1;
+                pixelIdx += skipLen;
+            } else {
+                if (bytePos + 2 >= size) break;
+                uint8_t runLen = cmd;
+                uint16_t c565  = static_cast<uint16_t>(data[bytePos + 1]) |
+                                 (static_cast<uint16_t>(data[bytePos + 2]) << 8);
+                bytePos += 3;
+
+                uint8_t r8 = static_cast<uint8_t>(((c565 >> 11) & 0x1F) * 255 / 31);
+                uint8_t g8 = static_cast<uint8_t>(((c565 >> 5)  & 0x3F) * 255 / 63);
+                uint8_t b8 = static_cast<uint8_t>((c565         & 0x1F) * 255 / 31);
+                uint32_t rgba = (0xFFu << 24) | (static_cast<uint32_t>(b8) << 16) |
+                                (static_cast<uint32_t>(g8) << 8) | static_cast<uint32_t>(r8);
+
+                if (isNative1280) {
+                    size_t dstOffset = static_cast<size_t>(yStart) * MENU_OVERLAY_W + pixelIdx;
+                    size_t maxIdx = MENU_OVERLAY_W * MENU_OVERLAY_H;
+                    for (uint8_t r = 0; r < runLen && pixelIdx < totalStripPixels; ++r, ++pixelIdx, ++dstOffset) {
+                        if (dstOffset < maxIdx) {
+                            m_desktopRgbaBuffer[dstOffset] = rgba;
+                        }
+                    }
+                } else {
+                    for (uint8_t r = 0; r < runLen && pixelIdx < totalStripPixels; ++r, ++pixelIdx) {
+                        uint32_t sx = static_cast<uint32_t>(pixelIdx % srcW);
+                        uint32_t sy = yStart + static_cast<uint32_t>(pixelIdx / srcW);
+                        uint32_t dx = sx * 2;
+                        uint32_t dy = sy * 2;
+                        if (dx + 1 < MENU_OVERLAY_W && dy + 1 < MENU_OVERLAY_H) {
+                            uint32_t* row0 = m_desktopRgbaBuffer.data() + dy * MENU_OVERLAY_W + dx;
+                            uint32_t* row1 = row0 + MENU_OVERLAY_W;
+                            row0[0] = rgba; row0[1] = rgba;
+                            row1[0] = rgba; row1[1] = rgba;
+                        }
+                    }
+                }
+            }
+        }
+    } else if (isByteTripletRle) {
         // Decode 3-byte RLE triplets [uint8_t runLen, uint8_t c565_lo, uint8_t c565_hi]
-        // and 2x-upscale (640x400 -> 1280x800) into m_desktopRgbaBuffer
         size_t bytePos = 8;
         while (bytePos + 2 < size && pixelIdx < totalStripPixels) {
             uint8_t runLen = data[bytePos];
@@ -350,19 +408,30 @@ void VxrQuestApp::DecodeLiveDesktopStrip(const uint8_t* data, size_t size) {
             uint32_t rgba = (0xFFu << 24) | (static_cast<uint32_t>(b8) << 16) |
                             (static_cast<uint32_t>(g8) << 8) | static_cast<uint32_t>(r8);
 
-            for (uint8_t r = 0; r < runLen && pixelIdx < totalStripPixels; ++r, ++pixelIdx) {
-                uint32_t sx = static_cast<uint32_t>(pixelIdx % srcW);
-                uint32_t sy = yStart + static_cast<uint32_t>(pixelIdx / srcW);
+            if (isNative1280) {
+                // Direct 1:1 native 1280x800 pixel copy (zero upscaling blur!)
+                size_t dstOffset = static_cast<size_t>(yStart) * MENU_OVERLAY_W + pixelIdx;
+                size_t maxIdx = MENU_OVERLAY_W * MENU_OVERLAY_H;
+                for (uint8_t r = 0; r < runLen && pixelIdx < totalStripPixels; ++r, ++pixelIdx, ++dstOffset) {
+                    if (dstOffset < maxIdx) {
+                        m_desktopRgbaBuffer[dstOffset] = rgba;
+                    }
+                }
+            } else {
+                for (uint8_t r = 0; r < runLen && pixelIdx < totalStripPixels; ++r, ++pixelIdx) {
+                    uint32_t sx = static_cast<uint32_t>(pixelIdx % srcW);
+                    uint32_t sy = yStart + static_cast<uint32_t>(pixelIdx / srcW);
 
-                uint32_t dx = sx * 2;
-                uint32_t dy = sy * 2;
-                if (dx + 1 < MENU_OVERLAY_W && dy + 1 < MENU_OVERLAY_H) {
-                    uint32_t* row0 = m_desktopRgbaBuffer.data() + dy * MENU_OVERLAY_W + dx;
-                    uint32_t* row1 = row0 + MENU_OVERLAY_W;
-                    row0[0] = rgba;
-                    row0[1] = rgba;
-                    row1[0] = rgba;
-                    row1[1] = rgba;
+                    uint32_t dx = sx * 2;
+                    uint32_t dy = sy * 2;
+                    if (dx + 1 < MENU_OVERLAY_W && dy + 1 < MENU_OVERLAY_H) {
+                        uint32_t* row0 = m_desktopRgbaBuffer.data() + dy * MENU_OVERLAY_W + dx;
+                        uint32_t* row1 = row0 + MENU_OVERLAY_W;
+                        row0[0] = rgba;
+                        row0[1] = rgba;
+                        row1[0] = rgba;
+                        row1[1] = rgba;
+                    }
                 }
             }
         }
@@ -622,6 +691,62 @@ bool VxrQuestApp::RunFrame() {
     // 5. Poll 6DoF Touch Controller & Laser Pointer Input
     XrControllerInputState ctrl = {};
     m_openXr.PollControllerInput(&ctrl);
+
+    // 5b. Forward live 6DoF HMD + Left/Right Touch Controller Poses & Inputs to PC Host & SteamVR at 90Hz
+    if (m_network.IsConnected()) {
+        VxrControlTrackingPacket trackPkt = {};
+        trackPkt.hdr.magic    = VXR_UDP_CTRL_MAGIC;
+        trackPkt.hdr.cmd_type = 6; // VXR_CMD_TRACKING_STATE
+
+        // HMD 6DoF Pose (in standing/local coordinates; offset Y by +1.65m so SteamVR standing floor is at Y=0)
+        trackPkt.hmd_pos[0]  = (eyeViews[0].position[0] + eyeViews[1].position[0]) * 0.5f;
+        trackPkt.hmd_pos[1]  = (eyeViews[0].position[1] + eyeViews[1].position[1]) * 0.5f + 1.65f;
+        trackPkt.hmd_pos[2]  = (eyeViews[0].position[2] + eyeViews[1].position[2]) * 0.5f;
+        trackPkt.hmd_quat[0] = eyeViews[0].orientation[0];
+        trackPkt.hmd_quat[1] = eyeViews[0].orientation[1];
+        trackPkt.hmd_quat[2] = eyeViews[0].orientation[2];
+        trackPkt.hmd_quat[3] = eyeViews[0].orientation[3];
+
+        const XrControllerPose& leftPose  = m_openXr.GetLeftControllerPose();
+        const XrControllerPose& rightPose = m_openXr.GetRightControllerPose();
+
+        trackPkt.left_pos[0]  = leftPose.position[0];
+        trackPkt.left_pos[1]  = leftPose.position[1] + 1.65f;
+        trackPkt.left_pos[2]  = leftPose.position[2];
+        trackPkt.left_quat[0] = leftPose.orientation[0];
+        trackPkt.left_quat[1] = leftPose.orientation[1];
+        trackPkt.left_quat[2] = leftPose.orientation[2];
+        trackPkt.left_quat[3] = leftPose.orientation[3];
+
+        trackPkt.right_pos[0]  = rightPose.position[0];
+        trackPkt.right_pos[1]  = rightPose.position[1] + 1.65f;
+        trackPkt.right_pos[2]  = rightPose.position[2];
+        trackPkt.right_quat[0] = rightPose.orientation[0];
+        trackPkt.right_quat[1] = rightPose.orientation[1];
+        trackPkt.right_quat[2] = rightPose.orientation[2];
+        trackPkt.right_quat[3] = rightPose.orientation[3];
+
+        uint32_t btnFlags = 0;
+        if (ctrl.trigger_clicked) btnFlags |= (1u << 0);
+        if (ctrl.grip_clicked)    btnFlags |= (1u << 1);
+        if (ctrl.button_a || ctrl.button_x) btnFlags |= (1u << 2);
+        if (ctrl.button_b || ctrl.button_y) btnFlags |= (1u << 3);
+        if (ctrl.button_menu)     btnFlags |= (1u << 5);
+
+        trackPkt.left_trigger  = (m_openXr.GetActiveHand() == 0) ? ctrl.trigger_value : 0.0f;
+        trackPkt.left_grip     = (m_openXr.GetActiveHand() == 0) ? ctrl.grip_value : 0.0f;
+        trackPkt.left_joy[0]   = (m_openXr.GetActiveHand() == 0) ? ctrl.thumbstick_x : 0.0f;
+        trackPkt.left_joy[1]   = (m_openXr.GetActiveHand() == 0) ? ctrl.thumbstick_y : 0.0f;
+        trackPkt.left_buttons  = (m_openXr.GetActiveHand() == 0) ? btnFlags : 0u;
+
+        trackPkt.right_trigger = (m_openXr.GetActiveHand() == 1) ? ctrl.trigger_value : 0.0f;
+        trackPkt.right_grip    = (m_openXr.GetActiveHand() == 1) ? ctrl.grip_value : 0.0f;
+        trackPkt.right_joy[0]  = (m_openXr.GetActiveHand() == 1) ? ctrl.thumbstick_x : 0.0f;
+        trackPkt.right_joy[1]  = (m_openXr.GetActiveHand() == 1) ? ctrl.thumbstick_y : 0.0f;
+        trackPkt.right_buttons = (m_openXr.GetActiveHand() == 1) ? btnFlags : 0u;
+
+        m_network.SendVrTrackingState(trackPkt);
+    }
 
     if (ctrl.button_menu && !m_prevMenuBtnPressed) {
         m_vrMenu.ToggleVisible();

@@ -1,0 +1,17 @@
+{
+  "driver_vxr": {
+    "enable": true,
+    "blocked_by_safe_mode": false,
+    "loadPriority": 2000,
+    "serialNumber": "VXR-HMD-001",
+    "modelNumber": "Meta Quest 2",
+    "windowX": 0,
+    "windowY": 0,
+    "windowWidth": 1920,
+    "windowHeight": 1080,
+    "renderWidth": 2064,
+    "renderHeight": 2208,
+    "secondsFromVsyncToPhotons": 0.01111111,
+    "displayFrequency": 90.0
+  }
+}
