@@ -517,13 +517,13 @@ bool VxrOpenXrClient::Initialize(const OpenXrClientConfig& config) {
                         }
                     }
 
-                    // 1. Create 1280x800 Quad Swapchain for Virtual Desktop Menu & Live Desktop Screen
+                    // 1. Create 1920x1080 (Full HD 16:9) Quad Swapchain for Live Desktop Screen & 1280x800 VR Menu
                     XrSwapchainCreateInfo scInfo = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
                     scInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
                     scInfo.format = chosenFormat;
                     scInfo.sampleCount = 1;
-                    scInfo.width = 1280;
-                    scInfo.height = 800;
+                    scInfo.width = 1920;
+                    scInfo.height = 1080;
                     scInfo.faceCount = 1;
                     scInfo.arraySize = 1;
                     scInfo.mipCount = 1;
@@ -540,7 +540,7 @@ bool VxrOpenXrClient::Initialize(const OpenXrClientConfig& config) {
                         for (const auto& img : glImgs) {
                             m_quadSwapchainTexIds.push_back(img.image);
                         }
-                        ALOGI("Created 1280x800 OpenXR Quad Swapchain with %u GLES textures", imgCount);
+                        ALOGI("Created 1920x1080 OpenXR Quad Swapchain with %u GLES textures", imgCount);
                     }
 
                     // 2. Create 1024x1024 Stereo Projection Swapchain for 3D Environment, 3D Touch Controllers & 3D Laser Beam
@@ -1221,11 +1221,20 @@ bool VxrOpenXrClient::LocateViews(uint64_t display_time_ns, XrEyeView out_views[
     return true;
 }
 
+static uint32_t g_activeQuadW = 1280;
+static uint32_t g_activeQuadH = 800;
+
 void VxrOpenXrClient::SubmitQuadSwapchainRgba(const uint32_t* rgbaPixels,
                                               uint32_t width,
                                               uint32_t height,
                                               float screenDistM,
                                               float screenScale) {
+    if (width > 1920) width = 1920;
+    if (height > 1080) height = 1080;
+    if (width > 0 && height > 0) {
+        g_activeQuadW = width;
+        g_activeQuadH = height;
+    }
     m_quadDistM = (screenDistM > 0.5f) ? screenDistM : 2.0f;
     m_quadWidthM = 2.0f * ((screenScale > 0.2f) ? screenScale : 1.0f);
     m_quadHeightM = m_quadWidthM * (static_cast<float>(height) / static_cast<float>(width));
@@ -1233,7 +1242,7 @@ void VxrOpenXrClient::SubmitQuadSwapchainRgba(const uint32_t* rgbaPixels,
 #if defined(__ANDROID__)
     if (!m_realXrActive || !rgbaPixels || width == 0 || height == 0) return;
 
-    // 1. Upload 1280x800 RGBA buffer into m_quadSwapchain (vertically flipped for OpenGL UV Bottom-Left origin)
+    // 1. Upload RGBA buffer (1920x1080 Native Desktop or 1280x800 VR Menu) into m_quadSwapchain
     if (m_quadSwapchain && !m_quadSwapchainTexIds.empty()) {
         XrSwapchain quadSc = reinterpret_cast<XrSwapchain>(m_quadSwapchain);
         XrSwapchainImageAcquireInfo acqInfo = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
@@ -1327,7 +1336,7 @@ bool VxrOpenXrClient::EndFrame(uint64_t display_time_ns) {
             layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projLayer);
         }
 
-        // Layer 1: High-Resolution 1280x800 Virtual Desktop Cinema Quad in 3D VR Space at Y = m_screenCenterY
+        // Layer 1: High-Resolution 1920x1080 Native Desktop / 1280x800 VR Menu Cinema Quad in 3D VR Space at Y = m_screenCenterY
         XrCompositionLayerQuad quadLayer = { XR_TYPE_COMPOSITION_LAYER_QUAD };
         if (m_quadSwapchain && m_shouldRenderFrame) {
             XrSwapchain quadSc = reinterpret_cast<XrSwapchain>(m_quadSwapchain);
@@ -1336,7 +1345,7 @@ bool VxrOpenXrClient::EndFrame(uint64_t display_time_ns) {
             quadLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
             quadLayer.subImage.swapchain = quadSc;
             quadLayer.subImage.imageRect.offset = { 0, 0 };
-            quadLayer.subImage.imageRect.extent = { 1280, 800 };
+            quadLayer.subImage.imageRect.extent = { static_cast<int32_t>(g_activeQuadW), static_cast<int32_t>(g_activeQuadH) };
             quadLayer.subImage.imageArrayIndex = 0;
             quadLayer.pose.orientation = { 0.0f, 0.0f, 0.0f, 1.0f };
             quadLayer.pose.position = { 0.0f, m_screenCenterY, -m_quadDistM };

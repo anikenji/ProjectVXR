@@ -653,6 +653,7 @@ bool VxrClientNetwork::SendBroadcastDiscovery(const char* headsetModelName, uint
     VxrControlDiscoverPacket discPkt = {};
     discPkt.hdr.magic = VXR_UDP_CTRL_MAGIC; // 0x56585243 ("VXRC")
     discPkt.hdr.cmd_type = 1;               // VXR_CMD_DISCOVER
+    discPkt.hdr.reserved[0] = 0x10;         // Native 1920x1080 Full HD capability flag
     const char* model = (headsetModelName && headsetModelName[0] != '\0') ? headsetModelName : "Meta Quest";
     std::strncpy(discPkt.headset_name, model, sizeof(discPkt.headset_name) - 1);
 
@@ -733,6 +734,7 @@ bool VxrClientNetwork::SendDiscoverAndConnect(const char* hostIp, uint16_t port,
     VxrControlDiscoverPacket discPkt = {};
     discPkt.hdr.magic = VXR_UDP_CTRL_MAGIC; // 0x56585243 ("VXRC")
     discPkt.hdr.cmd_type = 1;               // VXR_CMD_CONNECT
+    discPkt.hdr.reserved[0] = 0x10;         // Native 1920x1080 Full HD capability flag
     const char* model = (headsetModelName && headsetModelName[0] != '\0') ? headsetModelName : "Meta Quest";
     std::strncpy(discPkt.headset_name, model, sizeof(discPkt.headset_name) - 1);
 

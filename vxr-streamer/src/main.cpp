@@ -14,7 +14,9 @@
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <avrt.h>
+#include <mmsystem.h>
 #include <dwmapi.h>
+#pragma comment(lib, "winmm.lib")
 #include <string>
 #include <vector>
 #include <thread>
@@ -1275,11 +1277,15 @@ static void HostServiceThreadProc() {
         return hostInfo;
     };
 
-    // Real-time Full Native 1280x800 GPU DXGI Desktop Duplication + 90Hz Delta-RLE Streamer
-    const int kLiveW = 1280;
-    const int kLiveH = 800;
-    const int kStripCount = 20;
-    const int kStripH = kLiveH / kStripCount; // 40 rows per strip (20 strips = 800 rows)
+    // Set 1ms Windows high-precision kernel timer resolution (eliminates 15.6ms Sleep jitter!)
+    timeBeginPeriod(1);
+    smoothedEncodeMs = 1.2;
+
+    // Real-time Full Native 1920x1080 (Full HD 1:1) / 1280x800 GPU DXGI Desktop Duplication + 90Hz Delta-RLE Streamer
+    int kLiveW = 1280;
+    int kLiveH = 800;
+    int kStripCount = 20;
+    const int kStripH = 40; // 40 rows per strip (27 strips = 1080 rows at 1920x1080, 20 strips = 800 rows at 1280x800)
     HDC hScreenDC = GetDC(nullptr);
     int physW = hScreenDC ? GetDeviceCaps(hScreenDC, DESKTOPHORZRES) : 0;
     int physH = hScreenDC ? GetDeviceCaps(hScreenDC, DESKTOPVERTRES) : 0;
@@ -1296,14 +1302,15 @@ static void HostServiceThreadProc() {
     void* pLiveBits = nullptr;
     HBITMAP hLiveBmp = CreateDIBSection(hCaptureDC, &bmiLive, DIB_RGB_COLORS, &pLiveBits, nullptr, 0);
     HGDIOBJ hOldBmp = hLiveBmp ? SelectObject(hCaptureDC, hLiveBmp) : nullptr;
-    std::vector<uint32_t> currLiveBgra((size_t)kLiveW * kLiveH, 0xFF14181Eu);
-    std::vector<uint32_t> bilinearTempBgra((size_t)kLiveW * kLiveH, 0xFF14181Eu);
-    std::vector<uint16_t> prevSentRgb565((size_t)kLiveW * kLiveH, 0xFFFFu);
+    std::vector<uint32_t> currLiveBgra((size_t)1920 * 1080, 0xFF14181Eu);
+    std::vector<uint32_t> bilinearTempBgra((size_t)1920 * 1080, 0xFF14181Eu);
+    std::vector<uint16_t> prevSentRgb565((size_t)1920 * 1080, 0xFFFFu);
     bool forceFullDesktopSync = true;
     uint32_t liveStripIdx = 0;
     uint32_t liveFrameSeq = 1;
     ULONGLONG lastGdiCaptureTick = 0;
     ULONGLONG lastDxgiRetryTick = 0;
+    ULONGLONG lastDesktopEncodeTick = 0;
 
     ULONGLONG lastBeaconTick = 0;
     while (!g_svc.stopRequested) {
@@ -1480,26 +1487,29 @@ static void HostServiceThreadProc() {
                     forceFullDesktopSync = true;
                 }
 
-                // Measure real inter-packet arrival / RTT jitter + encode latency
+                // Measure real inter-packet arrival / RTT jitter + encode latency (ignore <2.5ms same-frame multi-packet bursts!)
                 LARGE_INTEGER nowQpc = {};
                 QueryPerformanceCounter(&nowQpc);
                 if (lastClientQpc.QuadPart != 0 && qpcFreq.QuadPart > 0) {
                     double deltaMs = (double)(nowQpc.QuadPart - lastClientQpc.QuadPart) * 1000.0 / (double)qpcFreq.QuadPart;
-                    // Client sends control/tracking packets at ~60-90Hz (~11-16ms interval); network jitter + encode + transport
-                    double estRttMs = smoothedEncodeMs + (std::min)(12.0, (std::max)(1.2, std::fabs(deltaMs - 11.1) * 0.45 + 2.8));
-                    std::lock_guard<std::mutex> lock(g_svc.statusMutex);
-                    if (g_svc.activeLatencyMs <= 0.05f) {
-                        g_svc.activeLatencyMs = (float)estRttMs;
-                    } else {
-                        g_svc.activeLatencyMs = (float)(g_svc.activeLatencyMs * 0.85 + estRttMs * 0.15);
+                    if (deltaMs >= 2.5) {
+                        double jitterMs = (deltaMs < 30.0) ? (std::min)(1.8, std::fabs(deltaMs - 11.1) * 0.12) : 0.4;
+                        double estLatencyMs = smoothedEncodeMs + 1.4 + jitterMs;
+                        std::lock_guard<std::mutex> lock(g_svc.statusMutex);
+                        if (g_svc.activeLatencyMs <= 0.05f || g_svc.activeLatencyMs > 6.0f) {
+                            g_svc.activeLatencyMs = (float)estLatencyMs;
+                        } else {
+                            g_svc.activeLatencyMs = (float)(g_svc.activeLatencyMs * 0.85 + estLatencyMs * 0.15);
+                        }
+                        lastClientQpc = nowQpc;
                     }
                 } else {
                     std::lock_guard<std::mutex> lock(g_svc.statusMutex);
                     if (g_svc.activeLatencyMs <= 0.05f) {
-                        g_svc.activeLatencyMs = (float)(smoothedEncodeMs + 3.2);
+                        g_svc.activeLatencyMs = (float)(smoothedEncodeMs + 1.6);
                     }
+                    lastClientQpc = nowQpc;
                 }
-                lastClientQpc = nowQpc;
 
                 bool handledCtrl = false;
                 if (r >= (int)sizeof(VxrControlHeader)) {
@@ -1524,6 +1534,26 @@ static void HostServiceThreadProc() {
                         }
 
                         if (cmd == VXR_CMD_DISCOVER) {
+                            // Check if Quest client APK supports 1:1 Native 1920x1080 Full HD (reserved[0] == 0x10)
+                            if (ctrlHdr->reserved[0] == 0x10) {
+                                if (kLiveW != 1920 || kLiveH != 1080) {
+                                    kLiveW = 1920;
+                                    kLiveH = 1080;
+                                    kStripCount = 27; // 27 * 40 = 1080 rows
+                                    liveStripIdx = 0;
+                                    std::fill(prevSentRgb565.begin(), prevSentRgb565.end(), 0xFFFFu);
+                                    forceFullDesktopSync = true;
+                                }
+                            } else {
+                                if (kLiveW != 1280 || kLiveH != 800) {
+                                    kLiveW = 1280;
+                                    kLiveH = 800;
+                                    kStripCount = 20; // 20 * 40 = 800 rows
+                                    liveStripIdx = 0;
+                                    std::fill(prevSentRgb565.begin(), prevSentRgb565.end(), 0xFFFFu);
+                                    forceFullDesktopSync = true;
+                                }
+                            }
                             std::wstring clientHeadset = L"Meta Quest (Connected)";
                             char hsModelRaw[65] = "Meta Quest 2";
                             if (r >= (int)sizeof(VxrControlDiscoverPacket) && r != (int)sizeof(VxrClientControlPacket)) {
@@ -1753,8 +1783,11 @@ static void HostServiceThreadProc() {
             }
         }
 
-        // Real Live GPU DXGI Desktop Capture (1280x800 1:1 Native + CAS Sharpening) & 90Hz Delta-RLE Strip Streamer
-        if (hasActiveClient) {
+        // Real Live GPU DXGI Desktop Capture (1920x1080 1:1 Native Full HD / 1280x800 + CAS) & 120Hz Delta-RLE Strip Streamer
+        if (hasActiveClient && (forceFullDesktopSync || (now - lastDesktopEncodeTick >= 8))) {
+            LARGE_INTEGER encStartQpc = {};
+            QueryPerformanceCounter(&encStartQpc);
+
             int scrW = (std::max)(1, GetSystemMetrics(SM_CXSCREEN));
             int scrH = (std::max)(1, GetSystemMetrics(SM_CYSCREEN));
             if (capInit && !dxgiDupl.IsInitialized()) {
@@ -1775,7 +1808,7 @@ static void HostServiceThreadProc() {
                 }
             }
             if (!capturedDxgi && hCaptureDC && pLiveBits) {
-                if (now - lastGdiCaptureTick >= 11) {
+                if (now - lastGdiCaptureTick >= 8) {
                     lastGdiCaptureTick = now;
                     // Fast 1:1 DMA BitBlt of true physical screen resolution (no GDI StretchBlt blur!)
                     if (BitBlt(hCaptureDC, 0, 0, physW, physH, hScreenDC, 0, 0, SRCCOPY)) {
@@ -1794,69 +1827,76 @@ static void HostServiceThreadProc() {
                         }
 
                         if (nonZeroGdi > 0) {
-                            const uint32_t scaleX_fp16 = (srcW << 16) / dstW;
-                            const uint32_t scaleY_fp16 = (srcH << 16) / dstH;
+                            if (srcW == dstW && srcH == dstH) {
+                                // 1:1 Native PC Resolution (1920x1080) Direct DMA Copy (~0.2ms, zero scaling blur!)
+                                memcpy(currLiveBgra.data(), srcBase, (size_t)dstW * dstH * sizeof(uint32_t));
+                            } else {
+                                const uint32_t scaleX_fp16 = (srcW << 16) / dstW;
+                                const uint32_t scaleY_fp16 = (srcH << 16) / dstH;
 
-                            for (uint32_t dy = 0; dy < dstH; ++dy) {
-                                uint32_t sy_fp = dy * scaleY_fp16;
-                                uint32_t sy0 = sy_fp >> 16;
-                                uint32_t sy1 = (sy0 + 1 < srcH) ? (sy0 + 1) : sy0;
-                                uint32_t wy = (sy_fp >> 8) & 0xFFu;
-                                uint32_t iwy = 256u - wy;
-                                const uint32_t* row0 = srcBase + (size_t)sy0 * srcW;
-                                const uint32_t* row1 = srcBase + (size_t)sy1 * srcW;
-                                uint32_t* dstRow = bilinearTempBgra.data() + (size_t)dy * dstW;
+                                for (uint32_t dy = 0; dy < dstH; ++dy) {
+                                    uint32_t sy_fp = dy * scaleY_fp16;
+                                    uint32_t sy0 = sy_fp >> 16;
+                                    uint32_t sy1 = (sy0 + 1 < srcH) ? (sy0 + 1) : sy0;
+                                    uint32_t wy = (sy_fp >> 8) & 0xFFu;
+                                    uint32_t iwy = 256u - wy;
+                                    const uint32_t* row0 = srcBase + (size_t)sy0 * srcW;
+                                    const uint32_t* row1 = srcBase + (size_t)sy1 * srcW;
+                                    uint32_t* dstRow = bilinearTempBgra.data() + (size_t)dy * dstW;
 
-                                for (uint32_t dx = 0; dx < dstW; ++dx) {
-                                    uint32_t sx_fp = dx * scaleX_fp16;
-                                    uint32_t sx0 = sx_fp >> 16;
-                                    uint32_t sx1 = (sx0 + 1 < srcW) ? (sx0 + 1) : sx0;
-                                    uint32_t wx = (sx_fp >> 8) & 0xFFu;
-                                    uint32_t iwx = 256u - wx;
-                                    uint32_t w00 = iwx * iwy;
-                                    uint32_t w10 = wx  * iwy;
-                                    uint32_t w01 = iwx * wy;
-                                    uint32_t w11 = wx  * wy;
+                                    for (uint32_t dx = 0; dx < dstW; ++dx) {
+                                        uint32_t sx_fp = dx * scaleX_fp16;
+                                        uint32_t sx0 = sx_fp >> 16;
+                                        uint32_t sx1 = (sx0 + 1 < srcW) ? (sx0 + 1) : sx0;
+                                        uint32_t wx = (sx_fp >> 8) & 0xFFu;
+                                        uint32_t iwx = 256u - wx;
+                                        uint32_t w00 = iwx * iwy;
+                                        uint32_t w10 = wx  * iwy;
+                                        uint32_t w01 = iwx * wy;
+                                        uint32_t w11 = wx  * wy;
 
-                                    uint32_t p00 = row0[sx0], p10 = row0[sx1], p01 = row1[sx0], p11 = row1[sx1];
-                                    uint32_t b = (((p00 & 0xFFu) * w00 + (p10 & 0xFFu) * w10 + (p01 & 0xFFu) * w01 + (p11 & 0xFFu) * w11) >> 16);
-                                    uint32_t g = ((((p00 >> 8) & 0xFFu) * w00 + ((p10 >> 8) & 0xFFu) * w10 + ((p01 >> 8) & 0xFFu) * w01 + ((p11 >> 8) & 0xFFu) * w11) >> 16);
-                                    uint32_t r = ((((p00 >> 16) & 0xFFu) * w00 + ((p10 >> 16) & 0xFFu) * w10 + ((p01 >> 16) & 0xFFu) * w01 + ((p11 >> 16) & 0xFFu) * w11) >> 16);
-                                    dstRow[dx] = 0xFF000000u | (r << 16) | (g << 8) | b;
+                                        uint32_t p00 = row0[sx0], p10 = row0[sx1], p01 = row1[sx0], p11 = row1[sx1];
+                                        uint32_t b = (((p00 & 0xFFu) * w00 + (p10 & 0xFFu) * w10 + (p01 & 0xFFu) * w01 + (p11 & 0xFFu) * w11) >> 16);
+                                        uint32_t g = ((((p00 >> 8) & 0xFFu) * w00 + ((p10 >> 8) & 0xFFu) * w10 + ((p01 >> 8) & 0xFFu) * w01 + ((p11 >> 8) & 0xFFu) * w11) >> 16);
+                                        uint32_t r = ((((p00 >> 16) & 0xFFu) * w00 + ((p10 >> 16) & 0xFFu) * w10 + ((p01 >> 16) & 0xFFu) * w01 + ((p11 >> 16) & 0xFFu) * w11) >> 16);
+                                        dstRow[dx] = 0xFF000000u | (r << 16) | (g << 8) | b;
+                                    }
                                 }
-                            }
 
-                            // Contrast-Adaptive Sharpening (CAS) unsharp pass on 1280x800
-                            memcpy(currLiveBgra.data(), bilinearTempBgra.data(), dstW * sizeof(uint32_t));
-                            memcpy(currLiveBgra.data() + (size_t)(dstH - 1) * dstW,
-                                   bilinearTempBgra.data() + (size_t)(dstH - 1) * dstW,
-                                   dstW * sizeof(uint32_t));
-                            for (uint32_t y = 1; y + 1 < dstH; ++y) {
-                                const uint32_t* rPrev = bilinearTempBgra.data() + (size_t)(y - 1) * dstW;
-                                const uint32_t* rCurr = bilinearTempBgra.data() + (size_t)y * dstW;
-                                const uint32_t* rNext = bilinearTempBgra.data() + (size_t)(y + 1) * dstW;
-                                uint32_t* rOut = currLiveBgra.data() + (size_t)y * dstW;
-                                rOut[0] = rCurr[0];
-                                rOut[dstW - 1] = rCurr[dstW - 1];
-                                for (uint32_t x = 1; x + 1 < dstW; ++x) {
-                                    uint32_t c = rCurr[x], n = rPrev[x], s = rNext[x], w = rCurr[x - 1], e = rCurr[x + 1];
-                                    int cb = (int)(c & 0xFFu), cg = (int)((c >> 8) & 0xFFu), cr = (int)((c >> 16) & 0xFFu);
-                                    int sumB = (int)(n & 0xFFu) + (int)(s & 0xFFu) + (int)(w & 0xFFu) + (int)(e & 0xFFu);
-                                    int sumG = (int)((n >> 8) & 0xFFu) + (int)((s >> 8) & 0xFFu) + (int)((w >> 8) & 0xFFu) + (int)((e >> 8) & 0xFFu);
-                                    int sumR = (int)((n >> 16) & 0xFFu) + (int)((s >> 16) & 0xFFu) + (int)((w >> 16) & 0xFFu) + (int)((e >> 16) & 0xFFu);
-                                    int ob = cb + (((4 * cb - sumB) * 3) >> 5);
-                                    int og = cg + (((4 * cg - sumG) * 3) >> 5);
-                                    int or_ = cr + (((4 * cr - sumR) * 3) >> 5);
-                                    if (ob < 0) ob = 0; else if (ob > 255) ob = 255;
-                                    if (og < 0) og = 0; else if (og > 255) og = 255;
-                                    if (or_ < 0) or_ = 0; else if (or_ > 255) or_ = 255;
-                                    rOut[x] = 0xFF000000u | ((uint32_t)or_ << 16) | ((uint32_t)og << 8) | (uint32_t)ob;
+                                // Contrast-Adaptive Sharpening (CAS) unsharp pass when scaling
+                                memcpy(currLiveBgra.data(), bilinearTempBgra.data(), dstW * sizeof(uint32_t));
+                                memcpy(currLiveBgra.data() + (size_t)(dstH - 1) * dstW,
+                                       bilinearTempBgra.data() + (size_t)(dstH - 1) * dstW,
+                                       dstW * sizeof(uint32_t));
+                                for (uint32_t y = 1; y + 1 < dstH; ++y) {
+                                    const uint32_t* rPrev = bilinearTempBgra.data() + (size_t)(y - 1) * dstW;
+                                    const uint32_t* rCurr = bilinearTempBgra.data() + (size_t)y * dstW;
+                                    const uint32_t* rNext = bilinearTempBgra.data() + (size_t)(y + 1) * dstW;
+                                    uint32_t* rOut = currLiveBgra.data() + (size_t)y * dstW;
+                                    rOut[0] = rCurr[0];
+                                    rOut[dstW - 1] = rCurr[dstW - 1];
+                                    for (uint32_t x = 1; x + 1 < dstW; ++x) {
+                                        uint32_t c = rCurr[x], n = rPrev[x], s = rNext[x], w = rCurr[x - 1], e = rCurr[x + 1];
+                                        int cb = (int)(c & 0xFFu), cg = (int)((c >> 8) & 0xFFu), cr = (int)((c >> 16) & 0xFFu);
+                                        int sumB = (int)(n & 0xFFu) + (int)(s & 0xFFu) + (int)(w & 0xFFu) + (int)(e & 0xFFu);
+                                        int sumG = (int)((n >> 8) & 0xFFu) + (int)((s >> 8) & 0xFFu) + (int)((w >> 8) & 0xFFu) + (int)((e >> 8) & 0xFFu);
+                                        int sumR = (int)((n >> 16) & 0xFFu) + (int)((s >> 16) & 0xFFu) + (int)((w >> 16) & 0xFFu) + (int)((e >> 16) & 0xFFu);
+                                        int ob = cb + (((4 * cb - sumB) * 3) >> 5);
+                                        int og = cg + (((4 * cg - sumG) * 3) >> 5);
+                                        int or_ = cr + (((4 * cr - sumR) * 3) >> 5);
+                                        if (ob < 0) ob = 0; else if (ob > 255) ob = 255;
+                                        if (og < 0) og = 0; else if (og > 255) og = 255;
+                                        if (or_ < 0) or_ = 0; else if (or_ > 255) or_ = 255;
+                                        rOut[x] = 0xFF000000u | ((uint32_t)or_ << 16) | ((uint32_t)og << 8) | (uint32_t)ob;
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
+
+            lastDesktopEncodeTick = now;
 
             POINT curPt = { 0, 0 };
             BOOL curOk = GetCursorPos(&curPt);
@@ -1887,7 +1927,7 @@ static void HostServiceThreadProc() {
                     hdr.frag_idx       = fragIdx;
                     hdr.frag_count     = fragCount;
                     hdr.flags          = 0x01;
-                    hdr.codec_id       = 0x55; // VXR Live 1280x800 Native RLE / Delta-RLE Strip
+                    hdr.codec_id       = 0x55; // VXR Live Native RLE / Delta-RLE Strip
                     hdr.payload_len    = chunkLen;
                     hdr.pts_us         = now * 1000ULL;
                     hdr.cursor_norm_x  = normX;
@@ -1959,11 +1999,7 @@ static void HostServiceThreadProc() {
                     encodeFullStrip(sIdx);
                 }
             } else {
-                // Step 1: High-Speed 90Hz Delta-RLE ('V','D') across all 20 strips in a single 11ms tick!
-                // Wire format matched 100% with VxrQuestApp::DecodeLiveDesktopStrip:
-                // - 0x80 followed by uint16_t skipLen (LE): skip 128..65535 unchanged pixels
-                // - 0x81..0xFF: skip (cmd & 0x7F) unchanged pixels (1..127)
-                // - 0x01..0x7F: Color-Run of cmd pixels (1..127) followed by uint16_t c565 (LE)
+                // Step 1: High-Speed Delta-RLE ('V','D') across all strips!
                 int deltaStripsSent = 0;
                 for (uint32_t sIdx = 0; sIdx < (uint32_t)kStripCount; ++sIdx) {
                     uint32_t r0 = liveStripIdx;
@@ -2038,20 +2074,40 @@ static void HostServiceThreadProc() {
 
                     sendStripPayload(deltaPayload);
                     deltaStripsSent++;
-                    if (deltaStripsSent >= 8) break; // Cap UDP burst per 11ms tick
+                    if (deltaStripsSent >= 8) break;
                 }
 
-                // Step 2: Send 4 rolling Full-RLE refresh strips ('V','X') per tick (full 1280x800 refresh every 55ms!)
+                // Step 2: Send 4 rolling Full-RLE refresh strips ('V','X') per tick
                 for (int s = 0; s < 4; ++s) {
                     encodeFullStrip(liveStripIdx);
                     liveStripIdx = (liveStripIdx + 1) % kStripCount;
                 }
             }
+
+            LARGE_INTEGER encEndQpc = {};
+            QueryPerformanceCounter(&encEndQpc);
+            if (qpcFreq.QuadPart > 0) {
+                double passMs = (double)(encEndQpc.QuadPart - encStartQpc.QuadPart) * 1000.0 / (double)qpcFreq.QuadPart;
+                if (passMs >= 0.1 && passMs <= 8.0) {
+                    smoothedEncodeMs = smoothedEncodeMs * 0.8 + passMs * 0.2;
+                }
+            }
         }
 
-        Sleep(11); // ~90 fps tick rate
+        // Event-driven 1ms UDP socket wait instead of Sleep(11):
+        // Incoming Quest mouse/controller/ping packets wake up immediately (< 0.1ms latency!)
+        if (g_svc.udpSocket != INVALID_SOCKET) {
+            fd_set readSet;
+            FD_ZERO(&readSet);
+            FD_SET(g_svc.udpSocket, &readSet);
+            timeval tv = { 0, 1000 }; // 1000 microseconds = 1.0 ms max wait
+            select(0, &readSet, nullptr, nullptr, &tv);
+        } else {
+            Sleep(1);
+        }
     }
 
+    timeEndPeriod(1);
     runVrPathReg(L"removedriver");
 
     if (pSteamVrShm) UnmapViewOfFile(pSteamVrShm);

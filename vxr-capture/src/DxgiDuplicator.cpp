@@ -361,7 +361,7 @@ bool DxgiDuplicator::CaptureScaledBgra(uint32_t dstWidth, uint32_t dstHeight, ui
     }
 
     VxrCapturedFrame capFrame = {};
-    uint32_t timeoutMs = m_hasValidStagingFrame ? 2 : 16;
+    uint32_t timeoutMs = m_hasValidStagingFrame ? 0 : 8;
     VxrCaptureStatus status = AcquireFrame(timeoutMs, &capFrame);
     if (status == VXR_CAPTURE_ACCESS_LOST || status == VXR_CAPTURE_DEVICE_RESET) {
         Cleanup();
@@ -402,97 +402,104 @@ bool DxgiDuplicator::CaptureScaledBgra(uint32_t dstWidth, uint32_t dstHeight, ui
                 m_cachedDstW = dstWidth;
                 m_cachedDstH = dstHeight;
 
-                // High-precision 4-tap Bilinear Area Downsampling + Subtle Unsharp Contrast Enhancement
-                // Preserves 1-pixel UI font strokes cleanly when scaling 1920x1080 / 2560x1440 -> 1280x800
-                const uint32_t scaleX_fp16 = (srcW << 16) / dstWidth;
-                const uint32_t scaleY_fp16 = (srcH << 16) / dstHeight;
-
-                for (uint32_t dy = 0; dy < dstHeight; ++dy) {
-                    uint32_t sy_fp = dy * scaleY_fp16;
-                    uint32_t sy0 = sy_fp >> 16;
-                    uint32_t sy1 = (sy0 + 1 < srcH) ? (sy0 + 1) : sy0;
-                    uint32_t wy = (sy_fp >> 8) & 0xFFu;
-                    uint32_t iwy = 256u - wy;
-
-                    const uint32_t* row0 = srcBase + (size_t)sy0 * srcPitchPixels;
-                    const uint32_t* row1 = srcBase + (size_t)sy1 * srcPitchPixels;
-                    uint32_t* dstRow = m_cachedScaledBgra.data() + (size_t)dy * dstWidth;
-
-                    for (uint32_t dx = 0; dx < dstWidth; ++dx) {
-                        uint32_t sx_fp = dx * scaleX_fp16;
-                        uint32_t sx0 = sx_fp >> 16;
-                        uint32_t sx1 = (sx0 + 1 < srcW) ? (sx0 + 1) : sx0;
-                        uint32_t wx = (sx_fp >> 8) & 0xFFu;
-                        uint32_t iwx = 256u - wx;
-
-                        uint32_t w00 = iwx * iwy;
-                        uint32_t w10 = wx  * iwy;
-                        uint32_t w01 = iwx * wy;
-                        uint32_t w11 = wx  * wy;
-
-                        uint32_t p00 = row0[sx0];
-                        uint32_t p10 = row0[sx1];
-                        uint32_t p01 = row1[sx0];
-                        uint32_t p11 = row1[sx1];
-
-                        uint32_t b = (((p00 & 0xFFu) * w00 + (p10 & 0xFFu) * w10 +
-                                       (p01 & 0xFFu) * w01 + (p11 & 0xFFu) * w11) >> 16);
-                        uint32_t g = ((((p00 >> 8) & 0xFFu) * w00 + ((p10 >> 8) & 0xFFu) * w10 +
-                                       ((p01 >> 8) & 0xFFu) * w01 + ((p11 >> 8) & 0xFFu) * w11) >> 16);
-                        uint32_t r = ((((p00 >> 16) & 0xFFu) * w00 + ((p10 >> 16) & 0xFFu) * w10 +
-                                       ((p01 >> 16) & 0xFFu) * w01 + ((p11 >> 16) & 0xFFu) * w11) >> 16);
-
-                        dstRow[dx] = 0xFF000000u | (r << 16) | (g << 8) | b;
+                if (srcW == dstWidth && srcH == dstHeight) {
+                    // 1:1 Native PC Resolution Fast-Path (~0.2ms direct DMA row copy, zero scaling blur!)
+                    for (uint32_t y = 0; y < dstHeight; ++y) {
+                        std::memcpy(m_cachedScaledBgra.data() + (size_t)y * dstWidth,
+                                    srcBase + (size_t)y * srcPitchPixels,
+                                    (size_t)dstWidth * sizeof(uint32_t));
                     }
-                }
+                    m_context->Unmap(m_stagingTexture.Get(), 0);
+                } else {
+                    // High-precision 4-tap Bilinear Area Downsampling + Subtle Unsharp Contrast Enhancement
+                    // Preserves 1-pixel UI font strokes cleanly when scaling 2560x1440 / 3840x2160 -> 1920x1080
+                    const uint32_t scaleX_fp16 = (srcW << 16) / dstWidth;
+                    const uint32_t scaleY_fp16 = (srcH << 16) / dstHeight;
 
-                m_context->Unmap(m_stagingTexture.Get(), 0);
+                    for (uint32_t dy = 0; dy < dstHeight; ++dy) {
+                        uint32_t sy_fp = dy * scaleY_fp16;
+                        uint32_t sy0 = sy_fp >> 16;
+                        uint32_t sy1 = (sy0 + 1 < srcH) ? (sy0 + 1) : sy0;
+                        uint32_t wy = (sy_fp >> 8) & 0xFFu;
+                        uint32_t iwy = 256u - wy;
 
-                // Apply fast integer Contrast-Adaptive Sharpening (CAS) on the 1280x800 downsampled buffer
-                // so 1-pixel IDE/desktop font stems stay razor-sharp after 1920x1080 -> 1280x800 downsampling!
-                if (dstWidth >= 4 && dstHeight >= 4) {
-                    std::vector<uint32_t> sharpBuf((size_t)dstWidth * dstHeight);
-                    std::memcpy(sharpBuf.data(), m_cachedScaledBgra.data(), dstWidth * sizeof(uint32_t));
-                    std::memcpy(sharpBuf.data() + (size_t)(dstHeight - 1) * dstWidth,
-                                m_cachedScaledBgra.data() + (size_t)(dstHeight - 1) * dstWidth,
-                                dstWidth * sizeof(uint32_t));
+                        const uint32_t* row0 = srcBase + (size_t)sy0 * srcPitchPixels;
+                        const uint32_t* row1 = srcBase + (size_t)sy1 * srcPitchPixels;
+                        uint32_t* dstRow = m_cachedScaledBgra.data() + (size_t)dy * dstWidth;
 
-                    for (uint32_t y = 1; y + 1 < dstHeight; ++y) {
-                        const uint32_t* rPrev = m_cachedScaledBgra.data() + (size_t)(y - 1) * dstWidth;
-                        const uint32_t* rCurr = m_cachedScaledBgra.data() + (size_t)y * dstWidth;
-                        const uint32_t* rNext = m_cachedScaledBgra.data() + (size_t)(y + 1) * dstWidth;
-                        uint32_t* rOut = sharpBuf.data() + (size_t)y * dstWidth;
-                        rOut[0] = rCurr[0];
-                        rOut[dstWidth - 1] = rCurr[dstWidth - 1];
+                        for (uint32_t dx = 0; dx < dstWidth; ++dx) {
+                            uint32_t sx_fp = dx * scaleX_fp16;
+                            uint32_t sx0 = sx_fp >> 16;
+                            uint32_t sx1 = (sx0 + 1 < srcW) ? (sx0 + 1) : sx0;
+                            uint32_t wx = (sx_fp >> 8) & 0xFFu;
+                            uint32_t iwx = 256u - wx;
 
-                        for (uint32_t x = 1; x + 1 < dstWidth; ++x) {
-                            uint32_t c = rCurr[x];
-                            uint32_t n = rPrev[x];
-                            uint32_t s = rNext[x];
-                            uint32_t w = rCurr[x - 1];
-                            uint32_t e = rCurr[x + 1];
+                            uint32_t w00 = iwx * iwy;
+                            uint32_t w10 = wx  * iwy;
+                            uint32_t w01 = iwx * wy;
+                            uint32_t w11 = wx  * wy;
 
-                            int cb = (int)(c & 0xFFu);
-                            int cg = (int)((c >> 8) & 0xFFu);
-                            int cr = (int)((c >> 16) & 0xFFu);
+                            uint32_t p00 = row0[sx0];
+                            uint32_t p10 = row0[sx1];
+                            uint32_t p01 = row1[sx0];
+                            uint32_t p11 = row1[sx1];
 
-                            int sumB = (int)(n & 0xFFu) + (int)(s & 0xFFu) + (int)(w & 0xFFu) + (int)(e & 0xFFu);
-                            int sumG = (int)((n >> 8) & 0xFFu) + (int)((s >> 8) & 0xFFu) + (int)((w >> 8) & 0xFFu) + (int)((e >> 8) & 0xFFu);
-                            int sumR = (int)((n >> 16) & 0xFFu) + (int)((s >> 16) & 0xFFu) + (int)((w >> 16) & 0xFFu) + (int)((e >> 16) & 0xFFu);
+                            uint32_t b = (((p00 & 0xFFu) * w00 + (p10 & 0xFFu) * w10 +
+                                           (p01 & 0xFFu) * w01 + (p11 & 0xFFu) * w11) >> 16);
+                            uint32_t g = ((((p00 >> 8) & 0xFFu) * w00 + ((p10 >> 8) & 0xFFu) * w10 +
+                                           ((p01 >> 8) & 0xFFu) * w01 + ((p11 >> 8) & 0xFFu) * w11) >> 16);
+                            uint32_t r = ((((p00 >> 16) & 0xFFu) * w00 + ((p10 >> 16) & 0xFFu) * w10 +
+                                           ((p01 >> 16) & 0xFFu) * w01 + ((p11 >> 16) & 0xFFu) * w11) >> 16);
 
-                            // Unsharp weight = 0.375 (3/8 of Laplacian)
-                            int ob = cb + (((4 * cb - sumB) * 3) >> 5);
-                            int og = cg + (((4 * cg - sumG) * 3) >> 5);
-                            int or_ = cr + (((4 * cr - sumR) * 3) >> 5);
-
-                            if (ob < 0) ob = 0; else if (ob > 255) ob = 255;
-                            if (og < 0) og = 0; else if (og > 255) og = 255;
-                            if (or_ < 0) or_ = 0; else if (or_ > 255) or_ = 255;
-
-                            rOut[x] = 0xFF000000u | ((uint32_t)or_ << 16) | ((uint32_t)og << 8) | (uint32_t)ob;
+                            dstRow[dx] = 0xFF000000u | (r << 16) | (g << 8) | b;
                         }
                     }
-                    m_cachedScaledBgra.swap(sharpBuf);
+
+                    m_context->Unmap(m_stagingTexture.Get(), 0);
+
+                    if (dstWidth >= 4 && dstHeight >= 4) {
+                        std::vector<uint32_t> sharpBuf((size_t)dstWidth * dstHeight);
+                        std::memcpy(sharpBuf.data(), m_cachedScaledBgra.data(), dstWidth * sizeof(uint32_t));
+                        std::memcpy(sharpBuf.data() + (size_t)(dstHeight - 1) * dstWidth,
+                                    m_cachedScaledBgra.data() + (size_t)(dstHeight - 1) * dstWidth,
+                                    dstWidth * sizeof(uint32_t));
+
+                        for (uint32_t y = 1; y + 1 < dstHeight; ++y) {
+                            const uint32_t* rPrev = m_cachedScaledBgra.data() + (size_t)(y - 1) * dstWidth;
+                            const uint32_t* rCurr = m_cachedScaledBgra.data() + (size_t)y * dstWidth;
+                            const uint32_t* rNext = m_cachedScaledBgra.data() + (size_t)(y + 1) * dstWidth;
+                            uint32_t* rOut = sharpBuf.data() + (size_t)y * dstWidth;
+                            rOut[0] = rCurr[0];
+                            rOut[dstWidth - 1] = rCurr[dstWidth - 1];
+
+                            for (uint32_t x = 1; x + 1 < dstWidth; ++x) {
+                                uint32_t c = rCurr[x];
+                                uint32_t n = rPrev[x];
+                                uint32_t s = rNext[x];
+                                uint32_t w = rCurr[x - 1];
+                                uint32_t e = rCurr[x + 1];
+
+                                int cb = (int)(c & 0xFFu);
+                                int cg = (int)((c >> 8) & 0xFFu);
+                                int cr = (int)((c >> 16) & 0xFFu);
+
+                                int sumB = (int)(n & 0xFFu) + (int)(s & 0xFFu) + (int)(w & 0xFFu) + (int)(e & 0xFFu);
+                                int sumG = (int)((n >> 8) & 0xFFu) + (int)((s >> 8) & 0xFFu) + (int)((w >> 8) & 0xFFu) + (int)((e >> 8) & 0xFFu);
+                                int sumR = (int)((n >> 16) & 0xFFu) + (int)((s >> 16) & 0xFFu) + (int)((w >> 16) & 0xFFu) + (int)((e >> 8) & 0xFFu);
+
+                                int ob = cb + (((4 * cb - sumB) * 3) >> 5);
+                                int og = cg + (((4 * cg - sumG) * 3) >> 5);
+                                int or_ = cr + (((4 * cr - sumR) * 3) >> 5);
+
+                                if (ob < 0) ob = 0; else if (ob > 255) ob = 255;
+                                if (og < 0) og = 0; else if (og > 255) og = 255;
+                                if (or_ < 0) or_ = 0; else if (or_ > 255) or_ = 255;
+
+                                rOut[x] = 0xFF000000u | ((uint32_t)or_ << 16) | ((uint32_t)og << 8) | (uint32_t)ob;
+                            }
+                        }
+                        m_cachedScaledBgra.swap(sharpBuf);
+                    }
                 }
 
                 m_hasValidStagingFrame = true;
