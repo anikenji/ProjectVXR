@@ -1,0 +1,52 @@
+{
+  "jsonid": "input_profile",
+  "controller_type": "vxr_controller",
+  "tracker_type": "vxr_controller",
+  "device_class": "TrackedDeviceClass_Controller",
+  "resource_root": "vxr",
+  "input_bindingui_mode": "controller",
+  "input_bindingui_left": {
+    "image": "{vxr}/resources/icons/controller_left.png"
+  },
+  "input_bindingui_right": {
+    "image": "{vxr}/resources/icons/controller_right.png"
+  },
+  "input_source": {
+    "/input/trigger": {
+      "type": "trigger",
+      "binding_image_point": [38, 42]
+    },
+    "/input/grip": {
+      "type": "trigger",
+      "binding_image_point": [52, 60]
+    },
+    "/input/thumbstick": {
+      "type": "joystick",
+      "binding_image_point": [42, 30]
+    },
+    "/input/a": {
+      "type": "button",
+      "binding_image_point": [45, 34]
+    },
+    "/input/b": {
+      "type": "button",
+      "binding_image_point": [48, 28]
+    },
+    "/input/x": {
+      "type": "button",
+      "binding_image_point": [45, 34]
+    },
+    "/input/y": {
+      "type": "button",
+      "binding_image_point": [48, 28]
+    },
+    "/input/menu": {
+      "type": "button",
+      "binding_image_point": [35, 45]
+    },
+    "/output/haptic": {
+      "type": "vibration",
+      "binding_image_point": [50, 50]
+    }
+  }
+}

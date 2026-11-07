@@ -1,0 +1,8 @@
+{
+  "alwaysActivate": false,
+  "name": "vxr",
+  "resourceOnly": false,
+  "hmd_presence": [
+    "VXR-HMD-001"
+  ]
+}

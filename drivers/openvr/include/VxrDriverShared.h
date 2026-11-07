@@ -1,0 +1,69 @@
+#ifndef VXR_DRIVER_SHARED_H
+#define VXR_DRIVER_SHARED_H
+
+#include <stdint.h>
+#include <stdbool.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#ifdef _WIN32
+  #ifdef VXR_OPENVR_DRIVER_EXPORTS
+    #define VXR_DRIVER_API __declspec(dllexport)
+  #else
+    #define VXR_DRIVER_API
+  #endif
+#else
+  #define VXR_DRIVER_API
+#endif
+
+/// 6DoF Pose in 3D Space
+typedef struct VxrPose6DoF {
+    float position[3];          // x, y, z (meters)
+    float orientation[4];       // x, y, z, w (quaternion)
+    float linear_velocity[3];   // m/s
+    float angular_velocity[3];  // rad/s
+} VxrPose6DoF;
+
+/// Controller input state
+typedef struct VxrControllerInput {
+    float trigger_value;        // 0.0f .. 1.0f
+    float grip_value;           // 0.0f .. 1.0f
+    float joystick[2];          // x, y [-1.0f .. 1.0f]
+    uint32_t buttons;           // Bitflags:
+                                // Bit 0: Trigger click
+                                // Bit 1: Grip click
+                                // Bit 2: Button A / X click
+                                // Bit 3: Button B / Y click
+                                // Bit 4: Thumbstick click
+                                // Bit 5: Menu / System click
+    uint8_t battery_percent;    // 0 .. 100
+} VxrControllerInput;
+
+enum VxrControllerButtonFlags {
+    VXR_BTN_TRIGGER_CLICK = (1 << 0),
+    VXR_BTN_GRIP_CLICK    = (1 << 1),
+    VXR_BTN_A_X           = (1 << 2),
+    VXR_BTN_B_Y           = (1 << 3),
+    VXR_BTN_STICK_CLICK   = (1 << 4),
+    VXR_BTN_MENU          = (1 << 5)
+};
+
+/// External API to update HMD 6DoF pose from streamer network thread
+VXR_DRIVER_API bool VxrDriver_UpdateHmdPose(const VxrPose6DoF* pose);
+
+/// External API to update Controller 6DoF pose (hand: 0 = Left, 1 = Right)
+VXR_DRIVER_API bool VxrDriver_UpdateControllerPose(int hand, const VxrPose6DoF* pose);
+
+/// External API to update Controller button/axis input
+VXR_DRIVER_API bool VxrDriver_UpdateControllerInput(int hand, const VxrControllerInput* input);
+
+/// Check if OpenVR driver is currently initialized and active
+VXR_DRIVER_API bool VxrDriver_IsActive(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // VXR_DRIVER_SHARED_H

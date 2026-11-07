@@ -4,3 +4,7 @@ build/
 .idea/
 .vscode/
 .agent-teams/
+bin/
+*.lib
+*.exp
+*.pdb
