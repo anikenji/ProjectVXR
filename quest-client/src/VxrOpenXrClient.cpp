@@ -503,25 +503,35 @@ bool VxrOpenXrClient::Initialize(const OpenXrClientConfig& config) {
                     xrCreateReferenceSpace(xrSess, &spaceInfo, &viewSp);
                     m_viewSpace = reinterpret_cast<void*>(viewSp);
 
-                    // Choose RGBA8 / SRGB8_ALPHA8 swapchain format
+                    // Choose SRGB8_ALPHA8 for Quad Swapchain (exact sRGB desktop & UI colors without double-gamma)
+                    // and RGBA8 for 3D Sky Swapchain
                     uint32_t fmtCount = 0;
                     xrEnumerateSwapchainFormats(xrSess, 0, &fmtCount, nullptr);
                     std::vector<int64_t> formats(fmtCount, 0);
                     if (fmtCount > 0) {
                         xrEnumerateSwapchainFormats(xrSess, fmtCount, &fmtCount, formats.data());
                     }
-                    int64_t chosenFormat = 0x8058; // GL_RGBA8
+                    int64_t chosenQuadFormat = 0x8C43; // GL_SRGB8_ALPHA8
+                    bool foundSrgb = false;
+                    int64_t chosenSkyFormat = 0x8058;  // GL_RGBA8
+                    bool foundRgba8 = false;
                     for (int64_t f : formats) {
-                        if (f == 0x8058 || f == 0x8C43) { // GL_RGBA8 or GL_SRGB8_ALPHA8
-                            chosenFormat = f;
-                            if (f == 0x8058) break;
+                        if (f == 0x8C43) {
+                            chosenQuadFormat = f;
+                            foundSrgb = true;
+                        }
+                        if (f == 0x8058) {
+                            chosenSkyFormat = f;
+                            foundRgba8 = true;
                         }
                     }
+                    if (!foundSrgb) chosenQuadFormat = foundRgba8 ? 0x8058 : (formats.empty() ? 0x8058 : formats[0]);
+                    if (!foundRgba8) chosenSkyFormat = chosenQuadFormat;
 
                     // 1. Create 1920x1080 (Full HD 16:9) Quad Swapchain for Live Desktop Screen & 1280x800 VR Menu
                     XrSwapchainCreateInfo scInfo = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
                     scInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-                    scInfo.format = chosenFormat;
+                    scInfo.format = chosenQuadFormat;
                     scInfo.sampleCount = 1;
                     scInfo.width = 1920;
                     scInfo.height = 1080;
@@ -541,12 +551,14 @@ bool VxrOpenXrClient::Initialize(const OpenXrClientConfig& config) {
                         for (const auto& img : glImgs) {
                             m_quadSwapchainTexIds.push_back(img.image);
                         }
-                        ALOGI("Created 1920x1080 OpenXR Quad Swapchain with %u GLES textures", imgCount);
+                        ALOGI("Created 1920x1080 OpenXR Quad Swapchain (fmt=0x%llx) with %u GLES textures",
+                              (unsigned long long)chosenQuadFormat, imgCount);
                     }
 
                     // 2. Create 1024x1024 Stereo Projection Swapchain for 3D Environment, 3D Touch Controllers & 3D Laser Beam
                     m_skyWidth = 1024;
                     m_skyHeight = 1024;
+                    scInfo.format = chosenSkyFormat;
                     scInfo.width = m_skyWidth;
                     scInfo.height = m_skyHeight;
                     XrSwapchain skySc = XR_NULL_HANDLE;
@@ -1224,15 +1236,21 @@ bool VxrOpenXrClient::LocateViews(uint64_t display_time_ns, XrEyeView out_views[
 
 static uint32_t g_activeQuadW = 1280;
 static uint32_t g_activeQuadH = 800;
+static uint32_t g_quadUploadCount = 0;
 
 void VxrOpenXrClient::SubmitQuadSwapchainRgba(const uint32_t* rgbaPixels,
                                               uint32_t width,
                                               uint32_t height,
                                               float screenDistM,
-                                              float screenScale) {
+                                              float screenScale,
+                                              bool uploadQuad) {
     if (width > 1920) width = 1920;
     if (height > 1080) height = 1080;
     if (width > 0 && height > 0) {
+        if (g_activeQuadW != width || g_activeQuadH != height) {
+            uploadQuad = true;
+            g_quadUploadCount = 0;
+        }
         g_activeQuadW = width;
         g_activeQuadH = height;
     }
@@ -1243,8 +1261,8 @@ void VxrOpenXrClient::SubmitQuadSwapchainRgba(const uint32_t* rgbaPixels,
 #if defined(__ANDROID__)
     if (!m_realXrActive || !rgbaPixels || width == 0 || height == 0) return;
 
-    // 1. Upload RGBA buffer (1920x1080 Native Desktop or 1280x800 VR Menu) into m_quadSwapchain
-    if (m_quadSwapchain && !m_quadSwapchainTexIds.empty()) {
+    // 1. Upload RGBA buffer (1920x1080 Native Desktop or 1280x800 VR Menu) into m_quadSwapchain only when dirty
+    if ((uploadQuad || g_quadUploadCount < 4) && m_quadSwapchain && !m_quadSwapchainTexIds.empty()) {
         XrSwapchain quadSc = reinterpret_cast<XrSwapchain>(m_quadSwapchain);
         XrSwapchainImageAcquireInfo acqInfo = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
         uint32_t imgIdx = 0;
@@ -1272,6 +1290,7 @@ void VxrOpenXrClient::SubmitQuadSwapchainRgba(const uint32_t* rgbaPixels,
                                     m_flippedUploadBuffer.data());
                     glBindTexture(GL_TEXTURE_2D, 0);
                     glFlush();
+                    g_quadUploadCount++;
                 }
             }
             XrSwapchainImageReleaseInfo relInfo = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };

@@ -89,13 +89,14 @@ public:
     /// Locates head views for both eyes at predicted display time
     bool LocateViews(uint64_t display_time_ns, XrEyeView out_views[2]);
 
-    /// Uploads the 1280x800 RGBA8888 composited UI/Desktop frame into the OpenXR Quad Swapchain
+    /// Uploads the 1280x800 / 1920x1080 RGBA8888 composited UI/Desktop frame into the OpenXR Quad Swapchain
     /// and renders the 3D Stereo Environment + 3D Quest Touch Controllers + 3D Laser Beam
     void SubmitQuadSwapchainRgba(const uint32_t* rgbaPixels,
                                  uint32_t width,
                                  uint32_t height,
                                  float screenDistM = 2.0f,
-                                 float screenScale = 1.25f);
+                                 float screenScale = 1.25f,
+                                 bool uploadQuad = true);
 
     /// Submits rendered layers to OpenXR compositor (xrEndFrame)
     bool EndFrame(uint64_t display_time_ns);

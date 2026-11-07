@@ -58,6 +58,10 @@ vr::EVRInitError VxrHmdDevice::Activate(uint32_t unObjectId) {
 
     vr::VRProperties()->SetUint64Property(m_propertyContainer, vr::Prop_CurrentUniverseId_Uint64, 2);
     vr::VRProperties()->SetBoolProperty(m_propertyContainer, vr::Prop_ContainsProximitySensor_Bool, true);
+    vr::VRProperties()->SetBoolProperty(m_propertyContainer, vr::Prop_NeverTracked_Bool, false);
+    vr::VRProperties()->SetBoolProperty(m_propertyContainer, vr::Prop_DeviceCanPowerOff_Bool, false);
+    vr::VRProperties()->SetBoolProperty(m_propertyContainer, vr::Prop_CanUnifyCoordinateSystemWithHmd_Bool, true);
+    vr::VRProperties()->SetBoolProperty(m_propertyContainer, vr::Prop_Firmware_ForceUpdateRequired_Bool, false);
 
     // Critical for SteamVR 2.18.4 Virtual HMD Compositor:
     // Prop_DisplayDebugMode_Bool = true + Prop_IsOnDesktop_Bool = false tells vrcompositor.exe
@@ -66,6 +70,18 @@ vr::EVRInitError VxrHmdDevice::Activate(uint32_t unObjectId) {
     vr::VRProperties()->SetBoolProperty(m_propertyContainer, vr::Prop_IsOnDesktop_Bool, false);
     vr::VRProperties()->SetBoolProperty(m_propertyContainer, vr::Prop_HasDisplayComponent_Bool, true);
     vr::VRProperties()->SetBoolProperty(m_propertyContainer, vr::Prop_ReportsTimeSinceVSync_Bool, false);
+
+    // Register & assert /proximity and /user/head/proximity sensors active so SteamVR & OVR Toolkit immediately exit Standby!
+    if (vr::VRDriverInput() != nullptr) {
+        vr::VRDriverInput()->CreateBooleanComponent(m_propertyContainer, "/proximity", &m_hProximity);
+        if (m_hProximity != vr::k_ulInvalidInputComponentHandle) {
+            vr::VRDriverInput()->UpdateBooleanComponent(m_hProximity, true, 0.0);
+        }
+        vr::VRDriverInput()->CreateBooleanComponent(m_propertyContainer, "/user/head/proximity", &m_hUserHeadProximity);
+        if (m_hUserHeadProximity != vr::k_ulInvalidInputComponentHandle) {
+            vr::VRDriverInput()->UpdateBooleanComponent(m_hUserHeadProximity, true, 0.0);
+        }
+    }
 
     // Publish initial valid pose immediately upon activation
     if (vr::VRServerDriverHost() != nullptr) {
@@ -145,6 +161,14 @@ bool VxrHmdDevice::UpdatePose(const VxrPose6DoF& pose) {
     m_currentPose.result = vr::TrackingResult_Running_OK;
 
     if (m_objectId != vr::k_unTrackedDeviceIndexInvalid && vr::VRServerDriverHost() != nullptr) {
+        if (vr::VRDriverInput() != nullptr) {
+            if (m_hProximity != vr::k_ulInvalidInputComponentHandle) {
+                vr::VRDriverInput()->UpdateBooleanComponent(m_hProximity, true, 0.0);
+            }
+            if (m_hUserHeadProximity != vr::k_ulInvalidInputComponentHandle) {
+                vr::VRDriverInput()->UpdateBooleanComponent(m_hUserHeadProximity, true, 0.0);
+            }
+        }
         vr::VRServerDriverHost()->TrackedDevicePoseUpdated(m_objectId, m_currentPose, sizeof(m_currentPose));
         return true;
     }

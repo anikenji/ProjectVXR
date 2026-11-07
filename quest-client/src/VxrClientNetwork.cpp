@@ -200,6 +200,8 @@ bool VxrClientNetwork::Initialize(uint16_t streamPort, uint16_t mdnsPort) {
         setsockopt(udpSock, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&bcast), sizeof(bcast));
         int rcvBuf = 8 * 1024 * 1024;
         setsockopt(udpSock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvBuf), sizeof(rcvBuf));
+        int sndBuf = 1 * 1024 * 1024;
+        setsockopt(udpSock, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&sndBuf), sizeof(sndBuf));
         SetSocketNonBlocking(udpSock);
 
         sockaddr_in bindAddr = {};
@@ -223,6 +225,8 @@ bool VxrClientNetwork::Initialize(uint16_t streamPort, uint16_t mdnsPort) {
 #endif
         int bcast = 1;
         setsockopt(beaconSock, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&bcast), sizeof(bcast));
+        int beaconRcvBuf = 4 * 1024 * 1024;
+        setsockopt(beaconSock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&beaconRcvBuf), sizeof(beaconRcvBuf));
         SetSocketNonBlocking(beaconSock);
 
         sockaddr_in beaconBind = {};

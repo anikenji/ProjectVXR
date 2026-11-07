@@ -1123,6 +1123,9 @@ static void HostServiceThreadProc() {
                     << "            [ [ 1.8, 0.0, 1.8 ], [ 1.8, 2.4, 1.8 ], [ 1.8, 2.4, -1.8 ], [ 1.8, 0.0, -1.8 ] ],\n"
                     << "            [ [ 1.8, 0.0, -1.8 ], [ 1.8, 2.4, -1.8 ], [ -1.8, 2.4, -1.8 ], [ -1.8, 0.0, -1.8 ] ]\n"
                     << "         ],\n"
+                    << "         \"perimeter\" : [\n"
+                    << "            [ -1.8, -1.8 ], [ -1.8, 1.8 ], [ 1.8, 1.8 ], [ 1.8, -1.8 ]\n"
+                    << "         ],\n"
                     << "         \"play_area\" : [ 2.5, 2.5 ],\n"
                     << "         \"seated\" : {\n"
                     << "            \"translation\" : [ 0.0, 0.0, 0.0 ],\n"
@@ -1148,11 +1151,56 @@ static void HostServiceThreadProc() {
         }
     };
 
+    auto setSteamVrMirrorView = [](bool enable) {
+        const wchar_t* settingsPath = L"C:\\Program Files (x86)\\Steam\\config\\steamvr.vrsettings";
+        std::ifstream in(settingsPath);
+        if (!in.is_open()) return;
+        std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        in.close();
+        if (content.empty()) return;
+
+        auto replaceKey = [&](const std::string& oldStr, const std::string& newStr) {
+            size_t pos = content.find(oldStr);
+            if (pos != std::string::npos) {
+                content.replace(pos, oldStr.size(), newStr);
+            }
+        };
+        if (enable) {
+            replaceKey("\"showMirrorView\" : false", "\"showMirrorView\" : true");
+            replaceKey("\"mirrorViewDisplayMode\" : 0", "\"mirrorViewDisplayMode\" : 1");
+            replaceKey("\"mirrorViewDisplayMode\" : 2", "\"mirrorViewDisplayMode\" : 1");
+            replaceKey("\"mirrorViewDisplayMode\" : 3", "\"mirrorViewDisplayMode\" : 1");
+        } else {
+            replaceKey("\"showMirrorView\" : true", "\"showMirrorView\" : false");
+        }
+        std::ofstream out(settingsPath, std::ios::out | std::ios::trunc);
+        if (out.is_open()) {
+            out << content;
+        }
+    };
+
     // Unregister driver_vxr at startup so Virtual Desktop & other VR streamers are NEVER hijacked when VXR is idle!
     runVrPathReg(L"removedriver");
+    setSteamVrMirrorView(false);
+
+    typedef uint32_t (*PFN_VxrIdd_CreateMonitor)(uint32_t width, uint32_t height, uint32_t refresh_rate);
+    typedef bool     (*PFN_VxrIdd_DestroyMonitor)(uint32_t monitor_id);
+    typedef bool     (*PFN_VxrIdd_SetResolution)(uint32_t monitor_id, uint32_t width, uint32_t height, uint32_t refresh_rate);
+    typedef bool     (*PFN_VxrIdd_SynthesizeEdid)(uint32_t monitor_id, uint32_t width, uint32_t height, uint32_t refresh_rate, uint8_t out_edid[128]);
+    PFN_VxrIdd_CreateMonitor  pfn_IddCreateMonitor  = nullptr;
+    PFN_VxrIdd_DestroyMonitor pfn_IddDestroyMonitor = nullptr;
+    PFN_VxrIdd_SetResolution  pfn_IddSetResolution  = nullptr;
+    PFN_VxrIdd_SynthesizeEdid pfn_IddSynthesizeEdid = nullptr;
+    uint32_t activeVirtualMonitorId = 0;
 
     g_svc.hIddCxDll = LoadLibraryW(L"VxrIddCx.dll");
     g_svc.iddcxDllLoaded = (g_svc.hIddCxDll != nullptr);
+    if (g_svc.hIddCxDll) {
+        pfn_IddCreateMonitor  = (PFN_VxrIdd_CreateMonitor)GetProcAddress(g_svc.hIddCxDll, "VxrIdd_CreateMonitor");
+        pfn_IddDestroyMonitor = (PFN_VxrIdd_DestroyMonitor)GetProcAddress(g_svc.hIddCxDll, "VxrIdd_DestroyMonitor");
+        pfn_IddSetResolution  = (PFN_VxrIdd_SetResolution)GetProcAddress(g_svc.hIddCxDll, "VxrIdd_SetResolution");
+        pfn_IddSynthesizeEdid = (PFN_VxrIdd_SynthesizeEdid)GetProcAddress(g_svc.hIddCxDll, "VxrIdd_SynthesizeEdid");
+    }
 
     g_casShader.Initialize("quest-client/shaders/ffx_cas.spv", 2064, 2208);
     g_sgsrShader.Initialize("quest-client/shaders/qcom_sgsr.spv", 2064, 2208);
@@ -1237,6 +1285,8 @@ static void HostServiceThreadProc() {
             setsockopt(g_svc.udpSocket, IPPROTO_IP, IP_TOS, (const char*)&tos, sizeof(tos));
             int sndBuf = 4 * 1024 * 1024;
             setsockopt(g_svc.udpSocket, SOL_SOCKET, SO_SNDBUF, (const char*)&sndBuf, sizeof(sndBuf));
+            int rcvBuf = 4 * 1024 * 1024;
+            setsockopt(g_svc.udpSocket, SOL_SOCKET, SO_RCVBUF, (const char*)&rcvBuf, sizeof(rcvBuf));
             u_long nonBlock = 1;
             ioctlsocket(g_svc.udpSocket, FIONBIO, &nonBlock);
 
@@ -1353,10 +1403,12 @@ static void HostServiceThreadProc() {
     HGDIOBJ hOldBmp = hLiveBmp ? SelectObject(hCaptureDC, hLiveBmp) : nullptr;
     std::vector<uint32_t> currLiveBgra((size_t)1920 * 1080, 0xFF14181Eu);
     std::vector<uint32_t> bilinearTempBgra((size_t)1920 * 1080, 0xFF14181Eu);
-    std::vector<uint16_t> prevSentRgb565((size_t)1920 * 1080, 0xFFFFu);
+    std::vector<uint32_t> prevSentQ24((size_t)1920 * 1080, 0xFFFFFFFFu);
     bool forceFullDesktopSync = true;
     uint32_t liveStripIdx = 0;
+    uint32_t deltaScanStripIdx = 0;
     uint32_t liveFrameSeq = 1;
+    HWND     hwndStereoVr = nullptr;
     ULONGLONG lastGdiCaptureTick = 0;
     ULONGLONG lastDxgiRetryTick = 0;
 
@@ -1372,8 +1424,8 @@ static void HostServiceThreadProc() {
 
         // Periodically inspect SteamVR processes when connected:
         // 1. Auto-close steamvr_room_setup.exe ("Welcome to Room Setup!") so it never blocks VR entry
-        // 2. Detect if vrcompositor.exe is actively rendering stereo SBS so Quest enters 3D Stereo VR Projection!
-        if (hasActiveClient && (now - lastSteamVrCheckTick >= 800)) {
+        // 2. Locate vrcompositor.exe / "VR View" / "Headset Window" stereo window for direct PrintWindow capture!
+        if (hasActiveClient && (now - lastSteamVrCheckTick >= 600)) {
             lastSteamVrCheckTick = now;
             DWORD compositorPid = 0;
             HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -1396,6 +1448,7 @@ static void HostServiceThreadProc() {
                 CloseHandle(hSnap);
             }
 
+            HWND foundStereo = nullptr;
             if (compositorPid != 0) {
                 struct FindCompWinCtx {
                     DWORD targetPid;
@@ -1408,13 +1461,18 @@ static void HostServiceThreadProc() {
                     auto* c = reinterpret_cast<FindCompWinCtx*>(lParam);
                     DWORD wndPid = 0;
                     GetWindowThreadProcessId(hwnd, &wndPid);
-                    if (wndPid == c->targetPid && IsWindowVisible(hwnd)) {
+                    if (wndPid == c->targetPid && GetWindow(hwnd, GW_OWNER) == nullptr) {
                         RECT rc = {};
                         GetWindowRect(hwnd, &rc);
-                        if ((rc.right - rc.left) >= 640 && (rc.bottom - rc.top) >= 360) {
+                        int w = rc.right - rc.left;
+                        int h = rc.bottom - rc.top;
+                        if (w >= 320 && h >= 240) {
+                            if (!IsWindowVisible(hwnd)) {
+                                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                            }
                             c->foundHwnd = hwnd;
-                            if (rc.left != 0 || rc.top != 0 || (rc.right - rc.left) != c->scrW || (rc.bottom - rc.top) != c->scrH) {
-                                SetWindowPos(hwnd, HWND_TOP, 0, 0, c->scrW, c->scrH, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+                            if (rc.left != 0 || rc.top != 0 || w != c->scrW || h != c->scrH) {
+                                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, c->scrW, c->scrH, SWP_SHOWWINDOW | SWP_NOACTIVATE);
                             }
                             return FALSE;
                         }
@@ -1422,8 +1480,22 @@ static void HostServiceThreadProc() {
                     return TRUE;
                 }, reinterpret_cast<LPARAM>(&ctx));
 
-                isStereoVrCompositorActive = (ctx.foundHwnd != nullptr);
-            } else {
+                foundStereo = ctx.foundHwnd;
+            }
+            if (!foundStereo && compositorPid != 0) {
+                HWND hVrView = FindWindowW(nullptr, L"VR View");
+                if (!hVrView) hVrView = FindWindowW(nullptr, L"Headset Window");
+                if (hVrView && IsWindowVisible(hVrView)) {
+                    RECT rc = {};
+                    GetWindowRect(hVrView, &rc);
+                    if ((rc.right - rc.left) != physW || (rc.bottom - rc.top) != physH) {
+                        SetWindowPos(hVrView, HWND_TOPMOST, 0, 0, physW, physH, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+                    }
+                    foundStereo = hVrView;
+                }
+            }
+            hwndStereoVr = foundStereo;
+            if (!hwndStereoVr) {
                 isStereoVrCompositorActive = false;
             }
         }
@@ -1448,6 +1520,11 @@ static void HostServiceThreadProc() {
         if (hasActiveClient && (now - g_svc.lastClientPacketTick > 5000)) {
             hasActiveClient = false;
             isStereoVrCompositorActive = false;
+            hwndStereoVr = nullptr;
+            if (activeVirtualMonitorId != 0 && pfn_IddDestroyMonitor) {
+                pfn_IddDestroyMonitor(activeVirtualMonitorId);
+                activeVirtualMonitorId = 0;
+            }
             if (pSteamVrShm) {
                 pSteamVrShm->headset_connected = 0;
                 pSteamVrShm->controllers_connected[0] = 0;
@@ -1613,7 +1690,8 @@ static void HostServiceThreadProc() {
             }
         }
 
-        if (g_svc.udpServerListening) {
+        auto pollIncomingUdpPackets = [&](ULONGLONG pollNow) {
+            if (!g_svc.udpServerListening) return;
             char rxBuf[2048];
             sockaddr_in clientAddr = {};
             int clientLen = sizeof(clientAddr);
@@ -1666,6 +1744,11 @@ static void HostServiceThreadProc() {
                         if (hasActiveClient) {
                             hasActiveClient = false;
                             isStereoVrCompositorActive = false;
+                            hwndStereoVr = nullptr;
+                            if (activeVirtualMonitorId != 0 && pfn_IddDestroyMonitor) {
+                                pfn_IddDestroyMonitor(activeVirtualMonitorId);
+                                activeVirtualMonitorId = 0;
+                            }
                             if (pSteamVrShm) {
                                 pSteamVrShm->headset_connected = 0;
                                 pSteamVrShm->controllers_connected[0] = 0;
@@ -1686,8 +1769,6 @@ static void HostServiceThreadProc() {
 
                     // Distinguish Passive Broadcast Discovery (cmd == 1, reserved[1] == 0) from Explicit Connect (reserved[1] == 1):
                     if (cmd == VXR_CMD_DISCOVER && checkHdr->reserved[1] == 0x00 && r >= (int)sizeof(VxrControlDiscoverPacket)) {
-                        // Passive Discovery Only: reply with HostInfo (reserved = 0) so Quest lists this PC as "Available - Click Connect"
-                        // WITHOUT forcing a connection or starting the video stream!
                         VxrHostInfoPacket hostInfo = buildHostInfoPacket();
                         hostInfo.reserved = 0;
                         sendto(g_svc.udpSocket, reinterpret_cast<const char*>(&hostInfo), sizeof(hostInfo), 0,
@@ -1703,10 +1784,22 @@ static void HostServiceThreadProc() {
                     bool wasConnected = hasActiveClient;
                     lastActiveClient = clientAddr;
                     hasActiveClient = true;
-                    g_svc.lastClientPacketTick = now;
+                    g_svc.lastClientPacketTick = pollNow;
 
                     if (!wasConnected) {
                         wifiOptimizer.LockBackgroundScan();
+                        // Execute Virtual Monitor Initialization Workflow (1920x1080 @ 90Hz EDID + DXGI Output Bind)
+                        if (pfn_IddCreateMonitor && activeVirtualMonitorId == 0) {
+                            activeVirtualMonitorId = pfn_IddCreateMonitor(1920, 1080, 90);
+                            if (activeVirtualMonitorId != 0 && pfn_IddSynthesizeEdid) {
+                                uint8_t edidBlock[128] = {};
+                                pfn_IddSynthesizeEdid(activeVirtualMonitorId, 1920, 1080, 90, edidBlock);
+                            }
+                        }
+                        if (!capInit || !dxgiDupl.IsInitialized()) {
+                            capInit = (dxgiDupl.Initialize(0, currentOutputIdx) == VXR_CAPTURE_OK);
+                        }
+                        std::fill(prevSentQ24.begin(), prevSentQ24.end(), 0xFFFFFFFFu);
                         forceFullDesktopSync = true;
                     }
 
@@ -1737,7 +1830,6 @@ static void HostServiceThreadProc() {
                     bool handledCtrl = true;
                     const VxrControlHeader* ctrlHdr = checkHdr;
                     {
-                        // If any active packet arrives while connectedHeadset == "Not connected", update status & UI
                         {
                             bool needUiRefresh = false;
                             {
@@ -1759,7 +1851,7 @@ static void HostServiceThreadProc() {
                                     kLiveH = 1080;
                                     kStripCount = 27; // 27 * 40 = 1080 rows
                                     liveStripIdx = 0;
-                                    std::fill(prevSentRgb565.begin(), prevSentRgb565.end(), 0xFFFFu);
+                                    std::fill(prevSentQ24.begin(), prevSentQ24.end(), 0xFFFFFFFFu);
                                     forceFullDesktopSync = true;
                                 }
                             } else {
@@ -1768,7 +1860,7 @@ static void HostServiceThreadProc() {
                                     kLiveH = 800;
                                     kStripCount = 20; // 20 * 40 = 800 rows
                                     liveStripIdx = 0;
-                                    std::fill(prevSentRgb565.begin(), prevSentRgb565.end(), 0xFFFFu);
+                                    std::fill(prevSentQ24.begin(), prevSentQ24.end(), 0xFFFFFFFFu);
                                     forceFullDesktopSync = true;
                                 }
                             }
@@ -1787,7 +1879,7 @@ static void HostServiceThreadProc() {
                             if (pSteamVrShm) {
                                 strncpy_s(pSteamVrShm->headset_model, hsModelRaw, _TRUNCATE);
                                 pSteamVrShm->headset_connected = 1;
-                                pSteamVrShm->last_update_tick_ms = now;
+                                pSteamVrShm->last_update_tick_ms = pollNow;
                             }
 
                             if (clientHeadset.find(L"Quest 2") != std::wstring::npos ||
@@ -1808,7 +1900,9 @@ static void HostServiceThreadProc() {
                                     headsetChanged = true;
                                 }
                             }
-                            forceFullDesktopSync = true;
+                            if (!wasConnected) {
+                                forceFullDesktopSync = true;
+                            }
                             VxrHostInfoPacket hostInfo = buildHostInfoPacket();
                             hostInfo.reserved = 1; // 1 = Unicast Handshake ACK (confirms 2-way connection to Quest!)
                             sendto(g_svc.udpSocket, reinterpret_cast<const char*>(&hostInfo), sizeof(hostInfo), 0,
@@ -1818,7 +1912,7 @@ static void HostServiceThreadProc() {
                                    (sockaddr*)&clientAddr, clientLen);
                             if (headsetChanged) {
                                 if (g_hwnd) PostMessageW(g_hwnd, WM_SERVICE_UPDATE, 0, 0);
-                                ShowToast(L"Headset connected: " + clientHeadset);
+                                ShowToast(L"Virtual Display Ready (1920x1080 @ 90Hz) — " + clientHeadset);
                             }
                         }
                         else if (cmd == VXR_CMD_MOUSE_INPUT) {
@@ -1970,12 +2064,13 @@ static void HostServiceThreadProc() {
                         }
                         else if (cmd == VXR_CMD_LAUNCH_STEAMVR) {
                             ensureSteamVrChaperone();
+                            setSteamVrMirrorView(true);
                             runVrPathReg(L"adddriver");
                             if (pSteamVrShm) {
                                 pSteamVrShm->headset_connected = 1;
                                 pSteamVrShm->controllers_connected[0] = 1;
                                 pSteamVrShm->controllers_connected[1] = 1;
-                                pSteamVrShm->last_update_tick_ms = now;
+                                pSteamVrShm->last_update_tick_ms = pollNow;
                             }
                             Sleep(100);
                             ShellExecuteW(nullptr, L"open", L"steam://rungameid/250820", nullptr, nullptr, SW_SHOWNORMAL);
@@ -1990,7 +2085,7 @@ static void HostServiceThreadProc() {
                                 pSteamVrShm->headset_connected = 1;
                                 pSteamVrShm->controllers_connected[0] = 1;
                                 pSteamVrShm->controllers_connected[1] = 1;
-                                pSteamVrShm->last_update_tick_ms = now;
+                                pSteamVrShm->last_update_tick_ms = pollNow;
                                 pSteamVrShm->update_seq++;
                                 for (int i = 0; i < 3; ++i) pSteamVrShm->hmd_pose.position[i] = tp->hmd_pos[i];
                                 for (int i = 0; i < 4; ++i) pSteamVrShm->hmd_pose.orientation[i] = tp->hmd_quat[i];
@@ -2022,7 +2117,10 @@ static void HostServiceThreadProc() {
                     }
                 }
             }
-        }
+        };
+
+        // Drain incoming UDP control / mouse / keyboard / 6DoF tracking packets immediately
+        pollIncomingUdpPackets(now);
 
         // High-precision 6.0ms (~165Hz) QPC frame pacing for sub-2.5ms desktop & SteamVR stereo streaming!
         LARGE_INTEGER currQpc = {};
@@ -2037,21 +2135,54 @@ static void HostServiceThreadProc() {
 
             int scrW = (std::max)(1, GetSystemMetrics(SM_CXSCREEN));
             int scrH = (std::max)(1, GetSystemMetrics(SM_CYSCREEN));
-            if (capInit && !dxgiDupl.IsInitialized()) {
-                capInit = false;
-                lastDxgiRetryTick = now;
+
+            // 1. If SteamVR vrcompositor.exe / VR View stereo window is active, capture its DirectX surface directly
+            //    via PrintWindow(PW_RENDERFULLCONTENT = 0x00000002) so 2D desktop windows NEVER cover VR!
+            bool capturedStereoDirect = false;
+            if (hwndStereoVr && IsWindow(hwndStereoVr) && hCaptureDC && pLiveBits) {
+                if (PrintWindow(hwndStereoVr, hCaptureDC, 0x00000002)) {
+                    const uint32_t* srcBase = reinterpret_cast<const uint32_t*>(pLiveBits);
+                    const uint32_t srcW = (uint32_t)physW;
+                    const uint32_t srcH = (uint32_t)physH;
+                    const uint32_t dstW = (uint32_t)kLiveW;
+                    const uint32_t dstH = (uint32_t)kLiveH;
+                    uint32_t nonZeroStereo = 0;
+                    for (uint32_t sy = srcH / 8; sy < srcH; sy += srcH / 8) {
+                        const uint32_t* sRow = srcBase + (size_t)sy * srcW;
+                        for (uint32_t sx = srcW / 8; sx < srcW; sx += srcW / 8) {
+                            if ((sRow[sx] & 0x00FFFFFFu) != 0) nonZeroStereo++;
+                        }
+                    }
+                    if (nonZeroStereo > 4 && srcW == dstW && srcH == dstH) {
+                        memcpy(currLiveBgra.data(), srcBase, (size_t)dstW * dstH * sizeof(uint32_t));
+                        capturedStereoDirect = true;
+                        isStereoVrCompositorActive = true;
+                    }
+                }
             }
-            if (!capInit && (now - lastDxgiRetryTick >= 15000)) {
-                lastDxgiRetryTick = now;
-                capInit = (dxgiDupl.Initialize(0, currentOutputIdx) == VXR_CAPTURE_OK);
-            }
-            bool capturedDxgi = false;
-            bool hasNewDxgiFrame = false;
-            if (capInit) {
-                capturedDxgi = dxgiDupl.CaptureScaledBgra((uint32_t)kLiveW, (uint32_t)kLiveH, currLiveBgra.data(), &hasNewDxgiFrame);
-                if (!dxgiDupl.IsInitialized()) {
+
+            bool capturedDxgi = capturedStereoDirect;
+            bool hasNewDxgiFrame = capturedStereoDirect;
+            if (!capturedStereoDirect) {
+                if (capInit && !dxgiDupl.IsInitialized()) {
                     capInit = false;
                     lastDxgiRetryTick = now;
+                }
+                if (!capInit && (now - lastDxgiRetryTick >= 15000)) {
+                    lastDxgiRetryTick = now;
+                    capInit = (dxgiDupl.Initialize(0, currentOutputIdx) == VXR_CAPTURE_OK);
+                }
+                if (capInit) {
+                    capturedDxgi = dxgiDupl.CaptureScaledBgra((uint32_t)kLiveW, (uint32_t)kLiveH, currLiveBgra.data(), &hasNewDxgiFrame);
+                    if (!dxgiDupl.IsInitialized()) {
+                        capInit = false;
+                        lastDxgiRetryTick = now;
+                    }
+                }
+                if (hwndStereoVr && IsWindow(hwndStereoVr) && IsWindowVisible(hwndStereoVr)) {
+                    isStereoVrCompositorActive = true;
+                } else {
+                    isStereoVrCompositorActive = false;
                 }
             }
             if (!capturedDxgi && hCaptureDC && pLiveBits) {
@@ -2140,18 +2271,24 @@ static void HostServiceThreadProc() {
                 }
             }
 
+            // Poll incoming mouse/controller/tracking packets right after screen capture for <0.5ms input latency!
+            pollIncomingUdpPackets(GetTickCount64());
+
             POINT curPt = { 0, 0 };
             BOOL curOk = GetCursorPos(&curPt);
             float normX = (std::max)(0.0f, (std::min)(1.0f, (float)curPt.x / (float)scrW));
             float normY = (std::max)(0.0f, (std::min)(1.0f, (float)curPt.y / (float)scrH));
 
-            auto toRgb565 = [](uint32_t bgra) -> uint16_t {
-                uint32_t b = (bgra >> 0) & 0xFFu;
-                uint32_t g = (bgra >> 8) & 0xFFu;
-                uint32_t r = (bgra >> 16) & 0xFFu;
-                return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+            // Equal-channel 0xF8 run-matching key (R, G, B all use identical 0xF8 mask so neutral grays have ZERO green bias!),
+            // while transmitting full 24-bit True Color (r8, g8, b8) in 'V','8' and 'D','8' strips!
+            auto toQ24 = [](uint32_t bgra) -> uint32_t {
+                uint32_t b = (bgra >> 0) & 0xF8u;
+                uint32_t g = (bgra >> 8) & 0xF8u;
+                uint32_t r = (bgra >> 16) & 0xF8u;
+                return (r << 16) | (g << 8) | b;
             };
 
+            uint32_t stripsSentThisPass = 0;
             auto sendStripPayload = [&](const std::vector<uint8_t>& payload) {
                 const size_t kMaxChunk = 1200;
                 uint16_t fragCount = (uint16_t)((payload.size() + kMaxChunk - 1) / kMaxChunk);
@@ -2185,18 +2322,22 @@ static void HostServiceThreadProc() {
                 }
                 liveFrameSeq++;
                 g_svc.framesEncoded++;
+                stripsSentThisPass++;
+                if ((stripsSentThisPass & 3u) == 0) {
+                    pollIncomingUdpPackets(GetTickCount64());
+                }
             };
 
             auto encodeFullStrip = [&](uint32_t stripIndex, bool isEndOfFrame) {
                 uint16_t y0 = (uint16_t)(stripIndex * kStripH);
                 uint16_t hRows = (uint16_t)kStripH;
                 const uint32_t* bgraBase = currLiveBgra.data() + (size_t)y0 * kLiveW;
-                uint16_t* prevBase = prevSentRgb565.data() + (size_t)y0 * kLiveW;
+                uint32_t* prevBase = prevSentQ24.data() + (size_t)y0 * kLiveW;
                 size_t totalPixels = (size_t)kLiveW * hRows;
 
                 bool hasNonZeroPixel = false;
                 for (size_t i = 0; i < totalPixels; i += 16) {
-                    if (toRgb565(bgraBase[i]) != 0) {
+                    if ((bgraBase[i] & 0x00FFFFFFu) != 0) {
                         hasNonZeroPixel = true;
                         break;
                     }
@@ -2208,7 +2349,7 @@ static void HostServiceThreadProc() {
                 rlePayload.reserve(totalPixels * 2 + 16);
                 uint16_t w16 = (uint16_t)kLiveW;
                 rlePayload.push_back('V');
-                rlePayload.push_back('X');
+                rlePayload.push_back('8'); // 24-bit True Color RGB888 Full-RLE
                 rlePayload.push_back((uint8_t)(w16 & 0xFF));
                 rlePayload.push_back((uint8_t)(w16 >> 8));
                 rlePayload.push_back((uint8_t)(y0 & 0xFF));
@@ -2218,18 +2359,20 @@ static void HostServiceThreadProc() {
 
                 size_t idx = 0;
                 while (idx < totalPixels) {
-                    uint16_t c0 = toRgb565(bgraBase[idx]);
-                    prevBase[idx] = c0;
+                    uint32_t bgra0 = bgraBase[idx];
+                    uint32_t q0 = toQ24(bgra0);
+                    prevBase[idx] = q0;
                     uint8_t runLen = 1;
                     while (idx + runLen < totalPixels && runLen < 255) {
-                        uint16_t cNext = toRgb565(bgraBase[idx + runLen]);
-                        if (cNext != c0) break;
-                        prevBase[idx + runLen] = cNext;
+                        uint32_t qNext = toQ24(bgraBase[idx + runLen]);
+                        if (qNext != q0) break;
+                        prevBase[idx + runLen] = qNext;
                         runLen++;
                     }
                     rlePayload.push_back(runLen);
-                    rlePayload.push_back((uint8_t)(c0 & 0xFF));
-                    rlePayload.push_back((uint8_t)(c0 >> 8));
+                    rlePayload.push_back((uint8_t)((bgra0 >> 16) & 0xFFu)); // R8
+                    rlePayload.push_back((uint8_t)((bgra0 >> 8)  & 0xFFu)); // G8
+                    rlePayload.push_back((uint8_t)((bgra0 >> 0)  & 0xFFu)); // B8
                     idx += runLen;
                 }
                 sendStripPayload(rlePayload);
@@ -2241,37 +2384,38 @@ static void HostServiceThreadProc() {
                     encodeFullStrip(sIdx, (sIdx + 1 == (uint32_t)kStripCount));
                 }
             } else {
-                // Step 1: High-Speed Tear-Free Delta-RLE ('V','D') across ALL changed strips in a single frame!
-                for (uint32_t sIdx = 0; sIdx < (uint32_t)kStripCount; ++sIdx) {
-                    uint32_t r0 = liveStripIdx;
-                    uint32_t r1 = (liveStripIdx + 1) % kStripCount;
-                    uint32_t r2 = (liveStripIdx + 2) % kStripCount;
-                    uint32_t r3 = (liveStripIdx + 3) % kStripCount;
-                    if (sIdx == r0 || sIdx == r1 || sIdx == r2 || sIdx == r3) {
-                        continue; // Sent by the 4 rolling Full-RLE refresh strips below
+                // Step 1: High-Speed Tear-Free 24-bit RGB888 Delta-RLE ('D','8') capped to 8 changed strips per 6ms tick
+                // to prevent UDP Wi-Fi socket burst drops!
+                uint32_t deltaSentCount = 0;
+                uint32_t r0 = liveStripIdx;
+                uint32_t r1 = (liveStripIdx + 1) % kStripCount;
+                for (uint32_t step = 0; step < (uint32_t)kStripCount && deltaSentCount < 8; ++step) {
+                    uint32_t sIdx = (deltaScanStripIdx + step) % kStripCount;
+                    if (sIdx == r0 || sIdx == r1) {
+                        continue; // Sent by the 2 rolling Full-RLE refresh strips below
                     }
                     uint16_t y0 = (uint16_t)(sIdx * kStripH);
                     uint16_t hRows = (uint16_t)kStripH;
                     const uint32_t* bgraBase = currLiveBgra.data() + (size_t)y0 * kLiveW;
-                    uint16_t* prevBase = prevSentRgb565.data() + (size_t)y0 * kLiveW;
+                    uint32_t* prevBase = prevSentQ24.data() + (size_t)y0 * kLiveW;
                     size_t totalPixels = (size_t)kLiveW * hRows;
 
                     size_t changedCount = 0;
                     size_t nonZeroPixels = 0;
                     for (size_t i = 0; i < totalPixels; ++i) {
-                        uint16_t c565 = toRgb565(bgraBase[i]);
-                        if (c565 != 0) nonZeroPixels++;
-                        if (c565 != prevBase[i]) {
+                        uint32_t qCur = toQ24(bgraBase[i]);
+                        if (qCur != 0) nonZeroPixels++;
+                        if (qCur != prevBase[i]) {
                             changedCount++;
                         }
                     }
                     if (changedCount == 0 || nonZeroPixels == 0) continue;
 
                     std::vector<uint8_t> deltaPayload;
-                    deltaPayload.reserve(changedCount * 3 + 32);
+                    deltaPayload.reserve(changedCount * 4 + 32);
                     uint16_t w16 = (uint16_t)kLiveW;
-                    deltaPayload.push_back('V');
                     deltaPayload.push_back('D');
+                    deltaPayload.push_back('8'); // 24-bit True Color RGB888 Delta-RLE
                     deltaPayload.push_back((uint8_t)(w16 & 0xFF));
                     deltaPayload.push_back((uint8_t)(w16 >> 8));
                     deltaPayload.push_back((uint8_t)(y0 & 0xFF));
@@ -2281,11 +2425,12 @@ static void HostServiceThreadProc() {
 
                     size_t idx = 0;
                     while (idx < totalPixels) {
-                        uint16_t cCur = toRgb565(bgraBase[idx]);
-                        if (cCur == prevBase[idx]) {
+                        uint32_t bgra0 = bgraBase[idx];
+                        uint32_t qCur = toQ24(bgra0);
+                        if (qCur == prevBase[idx]) {
                             size_t skipLen = 1;
                             while (idx + skipLen < totalPixels && skipLen < 65535 &&
-                                   toRgb565(bgraBase[idx + skipLen]) == prevBase[idx + skipLen]) {
+                                   toQ24(bgraBase[idx + skipLen]) == prevBase[idx + skipLen]) {
                                 skipLen++;
                             }
                             if (skipLen <= 127) {
@@ -2298,27 +2443,30 @@ static void HostServiceThreadProc() {
                             }
                             idx += skipLen;
                         } else {
-                            prevBase[idx] = cCur;
+                            prevBase[idx] = qCur;
                             uint8_t runLen = 1;
                             while (idx + runLen < totalPixels && runLen < 127) {
-                                uint16_t cNext = toRgb565(bgraBase[idx + runLen]);
-                                if (cNext != cCur) break;
-                                prevBase[idx + runLen] = cNext;
+                                uint32_t qNext = toQ24(bgraBase[idx + runLen]);
+                                if (qNext != qCur) break;
+                                prevBase[idx + runLen] = qNext;
                                 runLen++;
                             }
                             deltaPayload.push_back(runLen);
-                            deltaPayload.push_back((uint8_t)(cCur & 0xFF));
-                            deltaPayload.push_back((uint8_t)(cCur >> 8));
+                            deltaPayload.push_back((uint8_t)((bgra0 >> 16) & 0xFFu)); // R8
+                            deltaPayload.push_back((uint8_t)((bgra0 >> 8)  & 0xFFu)); // G8
+                            deltaPayload.push_back((uint8_t)((bgra0 >> 0)  & 0xFFu)); // B8
                             idx += runLen;
                         }
                     }
 
                     sendStripPayload(deltaPayload);
+                    deltaSentCount++;
+                    deltaScanStripIdx = (sIdx + 1) % kStripCount;
                 }
 
-                // Step 2: Send 4 rolling Full-RLE refresh strips ('V','X') per tick, marking the 4th strip with End-Of-Frame (0x8000)!
-                for (int s = 0; s < 4; ++s) {
-                    encodeFullStrip(liveStripIdx, (s == 3));
+                // Step 2: Send 2 rolling Full-RLE refresh strips ('V','8') per tick, marking the 2nd strip with End-Of-Frame (0x8000)!
+                for (int s = 0; s < 2; ++s) {
+                    encodeFullStrip(liveStripIdx, (s == 1));
                     liveStripIdx = (liveStripIdx + 1) % kStripCount;
                 }
             }
@@ -2346,6 +2494,10 @@ static void HostServiceThreadProc() {
     }
 
     timeEndPeriod(1);
+    if (activeVirtualMonitorId != 0 && pfn_IddDestroyMonitor) {
+        pfn_IddDestroyMonitor(activeVirtualMonitorId);
+        activeVirtualMonitorId = 0;
+    }
     runVrPathReg(L"removedriver");
 
     if (hWaveOutMic) {

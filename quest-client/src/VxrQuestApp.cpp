@@ -273,7 +273,16 @@ static uint32_t g_liveDesktopH = 800;
 static uint32_t g_compositedW  = 1280;
 static uint32_t g_compositedH  = 800;
 static std::vector<uint32_t> g_desktopStagingBuffer;
-static uint64_t g_lastStagingFlipMs = 0;
+static uint64_t g_lastStagingFlipMs        = 0;
+static bool     g_stagingDirty             = false;
+static bool     g_stagingEndOfFrameReached = false;
+static uint64_t g_lastQuadUploadMs         = 0;
+static uint64_t g_lastMouseMoveSendMs      = 0;
+static float    g_lastSentMouseU           = -1.0f;
+static float    g_lastSentMouseV           = -1.0f;
+static uint8_t  g_lastSentMouseBtnMask     = 0xFF;
+static uint64_t g_connectWorkflowStartMs   = 0;
+static uint64_t g_steamVrLaunchReqMs       = 0;
 
 // Interactive Desktop UI & Gesture state
 static bool     g_virtualKeyboardOpen       = false;
@@ -417,8 +426,11 @@ void VxrQuestApp::ProcessMenuComputerActions() {
         cfg.enter_vr_mode_requested = false;
         g_manualStereoVrMode = !g_manualStereoVrMode;
         if (g_manualStereoVrMode) {
+            g_steamVrLaunchReqMs = GetSteadyTimeMs();
             m_vrMenu.SetVisible(false);
             m_network.SendLaunchSteamVr();
+        } else {
+            m_openXr.SetImmersiveStereoVrMode(false);
         }
     }
 
@@ -426,6 +438,7 @@ void VxrQuestApp::ProcessMenuComputerActions() {
         const VrComputerEntry& pc = comps[static_cast<size_t>(cfg.connect_computer_index)];
         cfg.connect_computer_index = -1;
         if (!pc.ip_address.empty()) {
+            g_connectWorkflowStartMs = GetSteadyTimeMs();
             std::string hsModel = QueryRealHeadsetModel(m_openXr);
             m_network.SendDiscoverAndConnect(pc.ip_address.c_str(), 38810, hsModel.c_str());
             m_network.SendClientSettings(m_vrMenu.GetSettings());
@@ -444,7 +457,8 @@ void VxrQuestApp::UpdateHardwareCursor(float norm_x, float norm_y, bool visible)
 
 void VxrQuestApp::DecodeLiveDesktopStrip(const uint8_t* data, size_t size) {
     // 8-byte header from ProjectVXR.exe:
-    // ['V','X' (Full RLE) or 'V','D' (Delta RLE), uint16_t srcW (1920, 1280, or 640), uint16_t yStart, uint16_t rawStripH]
+    // ['V','8' (24-bit RGB888 Full RLE) | 'D','8' (24-bit RGB888 Delta RLE) | 'V','X' | 'V','D',
+    //  uint16_t srcW (1920, 1280, or 640), uint16_t yStart, uint16_t rawStripH]
     // Bit 15 (0x8000) of rawStripH is the End-Of-Frame flag for tear-free double-buffered presentation!
     if (!data || size < 8) return;
 
@@ -453,11 +467,13 @@ void VxrQuestApp::DecodeLiveDesktopStrip(const uint8_t* data, size_t size) {
     uint16_t yStart    = 0;
     uint16_t rawStripH = 0;
     uint16_t stripH    = 0;
+    bool isRgb888FullRle  = (data[0] == 'V' && data[1] == '8');
+    bool isRgb888DeltaRle = (data[0] == 'D' && data[1] == '8');
     bool isByteTripletRle = (data[0] == 'V' && data[1] == 'X');
     bool isDeltaRle       = (data[0] == 'V' && data[1] == 'D');
     bool isEndOfFrame     = false;
 
-    if (isByteTripletRle || isDeltaRle) {
+    if (isRgb888FullRle || isRgb888DeltaRle || isByteTripletRle || isDeltaRle) {
         srcW      = static_cast<uint16_t>(data[2]) | (static_cast<uint16_t>(data[3]) << 8);
         yStart    = static_cast<uint16_t>(data[4]) | (static_cast<uint16_t>(data[5]) << 8);
         rawStripH = static_cast<uint16_t>(data[6]) | (static_cast<uint16_t>(data[7]) << 8);
@@ -501,7 +517,94 @@ void VxrQuestApp::DecodeLiveDesktopStrip(const uint8_t* data, size_t size) {
     size_t totalStripPixels = static_cast<size_t>(srcW) * stripH;
     size_t pixelIdx = 0;
 
-    if (isDeltaRle) {
+    if (isRgb888DeltaRle) {
+        // True-Color 24-bit RGB888 Delta-RLE strip (zero green tint, 1:1 sRGB fidelity):
+        size_t bytePos = 8;
+        while (bytePos < size && pixelIdx < totalStripPixels) {
+            uint8_t cmd = data[bytePos];
+            if (cmd == 0) break;
+
+            if (cmd == 0x80) {
+                if (bytePos + 2 >= size) break;
+                uint16_t skipLen = static_cast<uint16_t>(data[bytePos + 1]) |
+                                   (static_cast<uint16_t>(data[bytePos + 2]) << 8);
+                bytePos += 3;
+                pixelIdx += skipLen;
+            } else if ((cmd & 0x80) != 0) {
+                uint8_t skipLen = (cmd & 0x7F);
+                bytePos += 1;
+                pixelIdx += skipLen;
+            } else {
+                if (bytePos + 3 >= size) break;
+                uint8_t runLen = cmd;
+                uint8_t r8     = data[bytePos + 1];
+                uint8_t g8     = data[bytePos + 2];
+                uint8_t b8     = data[bytePos + 3];
+                bytePos += 4;
+
+                uint32_t rgba = (0xFFu << 24) | (static_cast<uint32_t>(b8) << 16) |
+                                (static_cast<uint32_t>(g8) << 8) | static_cast<uint32_t>(r8);
+
+                if (isNativeDirect) {
+                    size_t dstOffset = static_cast<size_t>(yStart) * targetW + pixelIdx;
+                    for (uint8_t r = 0; r < runLen && pixelIdx < totalStripPixels; ++r, ++pixelIdx, ++dstOffset) {
+                        if (dstOffset < totalTargetPixels) {
+                            g_desktopStagingBuffer[dstOffset] = rgba;
+                        }
+                    }
+                } else {
+                    for (uint8_t r = 0; r < runLen && pixelIdx < totalStripPixels; ++r, ++pixelIdx) {
+                        uint32_t sx = static_cast<uint32_t>(pixelIdx % srcW);
+                        uint32_t sy = yStart + static_cast<uint32_t>(pixelIdx / srcW);
+                        uint32_t dx = sx * 2;
+                        uint32_t dy = sy * 2;
+                        if (dx + 1 < targetW && dy + 1 < targetH) {
+                            uint32_t* row0 = g_desktopStagingBuffer.data() + dy * targetW + dx;
+                            uint32_t* row1 = row0 + targetW;
+                            row0[0] = rgba; row0[1] = rgba;
+                            row1[0] = rgba; row1[1] = rgba;
+                        }
+                    }
+                }
+            }
+        }
+    } else if (isRgb888FullRle) {
+        // True-Color 24-bit RGB888 Full-RLE strip (zero green tint, 1:1 sRGB fidelity):
+        size_t bytePos = 8;
+        while (bytePos + 3 < size && pixelIdx < totalStripPixels) {
+            uint8_t runLen = data[bytePos];
+            uint8_t r8     = data[bytePos + 1];
+            uint8_t g8     = data[bytePos + 2];
+            uint8_t b8     = data[bytePos + 3];
+            bytePos += 4;
+            if (runLen == 0) break;
+
+            uint32_t rgba = (0xFFu << 24) | (static_cast<uint32_t>(b8) << 16) |
+                            (static_cast<uint32_t>(g8) << 8) | static_cast<uint32_t>(r8);
+
+            if (isNativeDirect) {
+                size_t dstOffset = static_cast<size_t>(yStart) * targetW + pixelIdx;
+                for (uint8_t r = 0; r < runLen && pixelIdx < totalStripPixels; ++r, ++pixelIdx, ++dstOffset) {
+                    if (dstOffset < totalTargetPixels) {
+                        g_desktopStagingBuffer[dstOffset] = rgba;
+                    }
+                }
+            } else {
+                for (uint8_t r = 0; r < runLen && pixelIdx < totalStripPixels; ++r, ++pixelIdx) {
+                    uint32_t sx = static_cast<uint32_t>(pixelIdx % srcW);
+                    uint32_t sy = yStart + static_cast<uint32_t>(pixelIdx / srcW);
+                    uint32_t dx = sx * 2;
+                    uint32_t dy = sy * 2;
+                    if (dx + 1 < targetW && dy + 1 < targetH) {
+                        uint32_t* row0 = g_desktopStagingBuffer.data() + dy * targetW + dx;
+                        uint32_t* row1 = row0 + targetW;
+                        row0[0] = rgba; row0[1] = rgba;
+                        row1[0] = rgba; row1[1] = rgba;
+                    }
+                }
+            }
+        }
+    } else if (isDeltaRle) {
         // High-speed 90Hz Delta-RLE strip decoded into back-buffer g_desktopStagingBuffer:
         size_t bytePos = 8;
         while (bytePos < size && pixelIdx < totalStripPixels) {
@@ -622,11 +725,17 @@ void VxrQuestApp::DecodeLiveDesktopStrip(const uint8_t* data, size_t size) {
         }
     }
 
-    // Atomic frame flip on End-Of-Frame marker (or bottom strip / 20ms fallback) to eliminate horizontal tearing!
-    uint64_t nowMs = GetSteadyTimeMs();
-    if (isEndOfFrame || (yStart + stripH >= srcH) || !m_hasLiveDesktopFrame || (nowMs - g_lastStagingFlipMs >= 20)) {
+    // Mark staging buffer dirty; perform atomic 8.3MB frame flip once per frame in RunFrame()
+    // (or immediately on first frame / offline test) to eliminate redundant RAM copies!
+    g_stagingDirty = true;
+    if (isEndOfFrame || (yStart + stripH >= srcH)) {
+        g_stagingEndOfFrameReached = true;
+    }
+    if (!m_hasLiveDesktopFrame || !m_openXr.IsRealRuntimeActive()) {
         std::memcpy(m_desktopRgbaBuffer.data(), g_desktopStagingBuffer.data(), totalTargetPixels * sizeof(uint32_t));
-        g_lastStagingFlipMs = nowMs;
+        g_lastStagingFlipMs = GetSteadyTimeMs();
+        g_stagingDirty = false;
+        g_stagingEndOfFrameReached = false;
     }
 
     m_hasLiveDesktopFrame = true;
@@ -666,6 +775,22 @@ void VxrQuestApp::CompositeFinalRgbaFrame() {
                             prevX + 8, prevY + 8, 220, 22, 0xD91E1612u);
             DrawOverlayText(m_compositedRgbaBuffer.data(), MENU_OVERLAY_W, MENU_OVERLAY_H,
                             prevX + 14, prevY + 12, "CLICK PREVIEW TO ENTER DESKTOP", 0xFFFFFFFFu, 1);
+
+            uint64_t wfElapsed = (g_connectWorkflowStartMs > 0 && GetSteadyTimeMs() >= g_connectWorkflowStartMs)
+                                 ? (GetSteadyTimeMs() - g_connectWorkflowStartMs) : 9999;
+            if (wfElapsed < 1200) {
+                const char* stepMsg = (wfElapsed < 400)
+                    ? "STEP 1/3: HANDSHAKING WITH PC STREAMER (UDP :38810)..."
+                    : ((wfElapsed < 800)
+                        ? "STEP 2/3: INITIALIZING VIRTUAL DISPLAY (1920x1080 @ 90Hz)..."
+                        : "STEP 3/3: BINDING DXGI DESKTOP DUPLICATION & AUDIO...");
+                DrawOverlayRect(m_compositedRgbaBuffer.data(), MENU_OVERLAY_W, MENU_OVERLAY_H,
+                                prevX + 16, prevY + prevH - 42, prevW - 32, 30, 0xF0221812u);
+                DrawOverlayOutline(m_compositedRgbaBuffer.data(), MENU_OVERLAY_W, MENU_OVERLAY_H,
+                                   prevX + 16, prevY + prevH - 42, prevW - 32, 30, 0xFFFF901Eu);
+                DrawOverlayText(m_compositedRgbaBuffer.data(), MENU_OVERLAY_W, MENU_OVERLAY_H,
+                                prevX + 26, prevY + prevH - 30, stepMsg, 0xFF66FF66u, 1);
+            }
         }
     } else {
         // Full-Screen Live PC Desktop or Immersive 3D Stereo SteamVR Mode (1:1 Native 1920x1080)!
@@ -805,6 +930,22 @@ void VxrQuestApp::CompositeFinalRgbaFrame() {
             }
         }
 
+        // 4b. SteamVR Stereo Compositor Status Banner when waiting for vrcompositor.exe stereo stream
+        if (g_manualStereoVrMode && !g_remoteStereoVrActive) {
+            const uint32_t stW = 540;
+            const uint32_t stH = 30;
+            const uint32_t stX = (g_compositedW > stW) ? (g_compositedW - stW) / 2 : 40;
+            const uint32_t stY = 46;
+            DrawOverlayRect(m_compositedRgbaBuffer.data(), g_compositedW, g_compositedH,
+                            stX, stY, stW, stH, 0xF0261C14u);
+            DrawOverlayOutline(m_compositedRgbaBuffer.data(), g_compositedW, g_compositedH,
+                               stX, stY, stW, stH, 0xFFFF901Eu);
+            DrawOverlayText(m_compositedRgbaBuffer.data(), g_compositedW, g_compositedH,
+                            stX + 18, stY + 11,
+                            "STARTING STEAMVR 3D STEREO COMPOSITOR... PLEASE WAIT",
+                            0xFFFFB84Du, 1);
+        }
+
         // 5. Long-Press Right-Click Gesture Ring + VR Laser Pointer Dot
         int cx = ptrPx;
         int cy = ptrPy;
@@ -878,9 +1019,13 @@ static bool HandleDesktopOverlayClick(float norm_x, float norm_y,
                 } else if (i == 1) {
                     g_virtualKeyboardOpen = !g_virtualKeyboardOpen;
                 } else if (i == 2) {
-                    g_manualStereoVrMode = true;
-                    openXr.SetImmersiveStereoVrMode(true);
-                    network.SendLaunchSteamVr();
+                    g_manualStereoVrMode = !g_manualStereoVrMode;
+                    if (g_manualStereoVrMode) {
+                        g_steamVrLaunchReqMs = GetSteadyTimeMs();
+                        network.SendLaunchSteamVr();
+                    } else {
+                        openXr.SetImmersiveStereoVrMode(false);
+                    }
                 } else if (i == 3) {
                     auto& s = vrMenu.GetSettingsMutable();
                     if (s.screen_distance_m < 1.6f) s.screen_distance_m = 2.0f;
@@ -1040,7 +1185,7 @@ bool VxrQuestApp::RunFrame() {
         if (netFrame.size > 0 && !netFrame.data.empty()) {
             g_remoteStereoVrActive = netFrame.is_stereo_vr;
             if (netFrame.codec_id == 0x55) {
-                // Real Live RLE-RGB565 Desktop / SteamVR Stereo Strip from ProjectVXR.exe
+                // Real Live True-Color RGB888 / RGB565 Desktop / SteamVR Stereo Strip from ProjectVXR.exe
                 DecodeLiveDesktopStrip(netFrame.data.data(), netFrame.size);
             } else if (netFrame.codec_id == 0x56) {
                 m_multiDecoder.FeedSlicedPacket(netFrame.data.data(), netFrame.size, netFrame.is_keyframe);
@@ -1048,6 +1193,21 @@ bool VxrQuestApp::RunFrame() {
                 m_decoder.QueueInputBuffer(netFrame.data.data(), netFrame.size, netFrame.pts_us, netFrame.is_keyframe);
             }
             m_cursor.UpdatePosition(netFrame.cursor_norm_x, netFrame.cursor_norm_y, netFrame.cursor_visible);
+        }
+    }
+
+    // Perform atomic back-buffer flip at most ONCE per RunFrame() after draining UDP video strips!
+    bool videoFrameUpdated = false;
+    if (g_stagingDirty) {
+        if (g_stagingEndOfFrameReached || !m_hasLiveDesktopFrame || (nowMs - g_lastStagingFlipMs >= 16)) {
+            size_t totalTargetPixels = static_cast<size_t>(g_liveDesktopW) * g_liveDesktopH;
+            if (m_desktopRgbaBuffer.size() >= totalTargetPixels && g_desktopStagingBuffer.size() >= totalTargetPixels) {
+                std::memcpy(m_desktopRgbaBuffer.data(), g_desktopStagingBuffer.data(), totalTargetPixels * sizeof(uint32_t));
+            }
+            g_lastStagingFlipMs = nowMs;
+            g_stagingDirty = false;
+            g_stagingEndOfFrameReached = false;
+            videoFrameUpdated = true;
         }
     }
 
@@ -1062,9 +1222,9 @@ bool VxrQuestApp::RunFrame() {
         g_manualStereoVrMode = false;
     }
 
-    // Automatically enter/exit 3D Stereo VR Projection mode when SteamVR compositor is active (and menu is closed)
-    bool wantImmersiveStereoVr = !m_vrMenu.IsVisible() && m_network.IsConnected() &&
-                                 (g_remoteStereoVrActive || g_manualStereoVrMode);
+    // ONLY enter 3D Stereo VR Projection mode when SteamVR compositor (vrcompositor.exe) is actively streaming stereo frames!
+    // Never split the 2D desktop screen into both eyes!
+    bool wantImmersiveStereoVr = !m_vrMenu.IsVisible() && m_network.IsConnected() && g_remoteStereoVrActive;
     m_openXr.SetImmersiveStereoVrMode(wantImmersiveStereoVr);
 
     discoveredHosts = m_network.GetDiscoveredHosts();
@@ -1260,7 +1420,17 @@ bool VxrQuestApp::RunFrame() {
                         (ctrl.thumbstick_y > 0.15f || ctrl.thumbstick_y < -0.15f)) {
                         wheelDelta = static_cast<int16_t>(ctrl.thumbstick_y * 120.0f);
                     }
-                    m_network.SendDesktopMouseInput(pointerU, pointerV, btnMask, wheelDelta);
+                    bool btnStateChanged = (btnMask != g_lastSentMouseBtnMask) || (wheelDelta != 0);
+                    bool posChanged = (std::abs(pointerU - g_lastSentMouseU) > 0.0004f) ||
+                                      (std::abs(pointerV - g_lastSentMouseV) > 0.0004f);
+                    if (btnStateChanged || (posChanged && (nowMs - g_lastMouseMoveSendMs >= 15)) ||
+                        !m_openXr.IsRealRuntimeActive()) {
+                        m_network.SendDesktopMouseInput(pointerU, pointerV, btnMask, wheelDelta);
+                        g_lastSentMouseBtnMask = btnMask;
+                        g_lastSentMouseU       = pointerU;
+                        g_lastSentMouseV       = pointerV;
+                        g_lastMouseMoveSendMs  = nowMs;
+                    }
                 }
             }
         }
@@ -1268,12 +1438,15 @@ bool VxrQuestApp::RunFrame() {
     m_prevTriggerClicked = ctrl.trigger_clicked;
 
     // 6. Sync In-VR Menu Changes & Actions to PC Host & Local Renderer
+    bool uiStateChanged = false;
     auto& menuCfg = m_vrMenu.GetSettingsMutable();
     if (menuCfg.launch_steamvr_requested) {
         m_network.SendLaunchSteamVr();
         menuCfg.launch_steamvr_requested = false;
         g_manualStereoVrMode = true;
+        g_steamVrLaunchReqMs = nowMs;
         m_vrMenu.SetVisible(false);
+        uiStateChanged = true;
     }
     if (m_vrMenu.IsSettingsDirty()) {
         ProcessMenuComputerActions();
@@ -1284,14 +1457,16 @@ bool VxrQuestApp::RunFrame() {
         );
         m_network.SendClientSettings(menuCfg);
         m_vrMenu.ClearSettingsDirty();
+        uiStateChanged = true;
     }
 
     // 7. Update Menu & Performance Overlay Textures
     if (m_vrMenu.IsVisible()) {
         m_vrMenu.RenderMenuToRgba(m_menuRgbaBuffer.data(), MENU_OVERLAY_W, MENU_OVERLAY_H);
         m_renderer.UpdateMenuOverlayTexture(m_menuRgbaBuffer.data(), MENU_OVERLAY_W, MENU_OVERLAY_H);
+        uiStateChanged = true;
     }
-    if (menuCfg.show_performance_overlay) {
+    if (menuCfg.show_performance_overlay && (videoFrameUpdated || (nowMs - g_lastQuadUploadMs >= 22))) {
         VrPerfStats stats = {};
         stats.fps = menuCfg.desktop_frame_rate;
         stats.bitrate_mbps = menuCfg.desktop_bitrate_mbps;
@@ -1312,7 +1487,12 @@ bool VxrQuestApp::RunFrame() {
         m_renderer.UpdatePerformanceHudTexture(m_perfHudRgbaBuffer.data(), PERF_HUD_W, PERF_HUD_H);
     }
 
-    CompositeFinalRgbaFrame();
+    bool needQuadUpload = videoFrameUpdated || uiStateChanged || !m_openXr.IsRealRuntimeActive() ||
+                          (nowMs - g_lastQuadUploadMs >= 20);
+    if (needQuadUpload) {
+        CompositeFinalRgbaFrame();
+        g_lastQuadUploadMs = nowMs;
+    }
 
     // 8. Dequeue decoded frame from AMediaCodec & Render Vulkan Compositor Layers
     DecodedOutputFrame outputFrame = {};
@@ -1348,7 +1528,8 @@ bool VxrQuestApp::RunFrame() {
         g_compositedW,
         g_compositedH,
         menuCfg.screen_distance_m,
-        menuCfg.screen_size_scale
+        menuCfg.screen_size_scale,
+        needQuadUpload
     );
     m_openXr.EndFrame(predictedDisplayTimeNs);
     m_totalFramesRendered++;

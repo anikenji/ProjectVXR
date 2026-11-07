@@ -72,6 +72,8 @@ private:
     std::string m_modelName;
     uint32_t m_objectId;
     vr::PropertyContainerHandle_t m_propertyContainer;
+    vr::VRInputComponentHandle_t m_hProximity = vr::k_ulInvalidInputComponentHandle;
+    vr::VRInputComponentHandle_t m_hUserHeadProximity = vr::k_ulInvalidInputComponentHandle;
 
     std::mutex m_poseMutex;
     vr::DriverPose_t m_currentPose;
