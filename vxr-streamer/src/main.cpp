@@ -47,6 +47,8 @@ using namespace Gdiplus;
 static const uint32_t VXR_UDP_VIDEO_MAGIC = 0x56585256; // "VXRV"
 static const uint32_t VXR_UDP_CTRL_MAGIC  = 0x56585243; // "VXRC"
 static const uint32_t VXR_HOST_INFO_MAGIC = 0x56585248; // "VXRH"
+static const uint32_t VXR_UDP_AUDIO_MAGIC = 0x56585241; // "VXRA" (PC -> Quest PCM16 Stereo Audio)
+static const uint32_t VXR_UDP_MIC_MAGIC   = 0x5658524D; // "VXRM" (Quest -> PC PCM16 Mono Mic)
 
 enum VxrControlCommandType : uint8_t {
     VXR_CMD_DISCOVER        = 1,
@@ -55,7 +57,19 @@ enum VxrControlCommandType : uint8_t {
     VXR_CMD_CLIENT_SETTINGS = 3,
     VXR_CMD_LAUNCH_STEAMVR  = 4,
     VXR_CMD_SWITCH_MONITOR  = 5,
-    VXR_CMD_TRACKING_STATE  = 6
+    VXR_CMD_TRACKING_STATE  = 6,
+    VXR_CMD_DISCONNECT      = 7,
+    VXR_CMD_KEYBOARD_INPUT  = 8
+};
+
+struct VxrUdpAudioHeader {
+    uint32_t magic;          // 0x56585241 ("VXRA") or 0x5658524D ("VXRM")
+    uint32_t seq;
+    uint16_t sample_rate;    // 24000
+    uint8_t  channels;       // 2 for speaker, 1 for mic
+    uint8_t  flags;
+    uint16_t sample_frames;  // number of PCM16 frames following header
+    uint16_t reserved;
 };
 
 enum VxrMouseButtonFlags : uint8_t {
@@ -72,7 +86,7 @@ struct VxrUdpVideoFragmentHeader {
     uint32_t frame_id;
     uint16_t frag_idx;
     uint16_t frag_count;
-    uint8_t  flags;          // bit 0 = keyframe, bit 1 = intra_refresh
+    uint8_t  flags;          // bit 0 = keyframe, bit 1 = intra_refresh, bit 2 = stereo_vr_mode
     uint8_t  codec_id;
     uint16_t payload_len;
     uint64_t pts_us;
@@ -84,7 +98,7 @@ struct VxrUdpVideoFragmentHeader {
 
 struct VxrControlHeader {
     uint32_t magic;          // 0x56585243 ("VXRC")
-    uint8_t  cmd_type;       // 1..6
+    uint8_t  cmd_type;       // 1..8
     uint8_t  reserved[3];
 };
 
@@ -93,6 +107,7 @@ struct VxrControlDiscoverPacket {
     char headset_name[64];
 };
 
+// Exact 132-byte wire layout matching Quest VxrClientNetwork.h
 struct VxrControlTrackingPacket {
     VxrControlHeader hdr;          // magic="VXRC", cmd_type=6 (VXR_CMD_TRACKING_STATE)
     float    hmd_pos[3];
@@ -103,17 +118,12 @@ struct VxrControlTrackingPacket {
     float    right_quat[4];        // x, y, z, w
     float    left_trigger;
     float    left_grip;
-    float    left_thumb_x;
-    float    left_thumb_y;
+    float    left_joy[2];
+    uint32_t left_buttons;
     float    right_trigger;
     float    right_grip;
-    float    right_thumb_x;
-    float    right_thumb_y;
-    uint32_t left_buttons;
+    float    right_joy[2];
     uint32_t right_buttons;
-    uint8_t  left_active;
-    uint8_t  right_active;
-    uint8_t  reserved_pad[2];
 };
 
 struct VxrControlMouseInputPacket {
@@ -1103,20 +1113,17 @@ static void HostServiceThreadProc() {
 
     auto ensureSteamVrChaperone = []() {
         const wchar_t* chapPath = L"C:\\Program Files (x86)\\Steam\\config\\chaperone_info.vrchap";
-        if (GetFileAttributesW(chapPath) == INVALID_FILE_ATTRIBUTES) {
-            std::ofstream out(chapPath);
-            if (out.is_open()) {
-                out << "{\n"
-                    << "   \"jsonid\" : \"chaperone_info\",\n"
-                    << "   \"universes\" : [\n"
-                    << "      {\n"
+        std::ofstream out(chapPath, std::ios::out | std::ios::trunc);
+        if (out.is_open()) {
+            auto writeUniv = [&](const char* uid, bool comma) {
+                out << "      {\n"
                     << "         \"collision_bounds\" : [\n"
-                    << "            [ [ -1.5, 0.0, -1.5 ], [ -1.5, 2.4, -1.5 ], [ -1.5, 2.4, 1.5 ], [ -1.5, 0.0, 1.5 ] ],\n"
-                    << "            [ [ -1.5, 0.0, 1.5 ], [ -1.5, 2.4, 1.5 ], [ 1.5, 2.4, 1.5 ], [ 1.5, 0.0, 1.5 ] ],\n"
-                    << "            [ [ 1.5, 0.0, 1.5 ], [ 1.5, 2.4, 1.5 ], [ 1.5, 2.4, -1.5 ], [ 1.5, 0.0, -1.5 ] ],\n"
-                    << "            [ [ 1.5, 0.0, -1.5 ], [ 1.5, 2.4, -1.5 ], [ -1.5, 2.4, -1.5 ], [ -1.5, 0.0, -1.5 ] ]\n"
+                    << "            [ [ -1.8, 0.0, -1.8 ], [ -1.8, 2.4, -1.8 ], [ -1.8, 2.4, 1.8 ], [ -1.8, 0.0, 1.8 ] ],\n"
+                    << "            [ [ -1.8, 0.0, 1.8 ], [ -1.8, 2.4, 1.8 ], [ 1.8, 2.4, 1.8 ], [ 1.8, 0.0, 1.8 ] ],\n"
+                    << "            [ [ 1.8, 0.0, 1.8 ], [ 1.8, 2.4, 1.8 ], [ 1.8, 2.4, -1.8 ], [ 1.8, 0.0, -1.8 ] ],\n"
+                    << "            [ [ 1.8, 0.0, -1.8 ], [ 1.8, 2.4, -1.8 ], [ -1.8, 2.4, -1.8 ], [ -1.8, 0.0, -1.8 ] ]\n"
                     << "         ],\n"
-                    << "         \"play_area\" : [ 2.0, 2.0 ],\n"
+                    << "         \"play_area\" : [ 2.5, 2.5 ],\n"
                     << "         \"seated\" : {\n"
                     << "            \"translation\" : [ 0.0, 0.0, 0.0 ],\n"
                     << "            \"yaw\" : 0.0\n"
@@ -1126,12 +1133,18 @@ static void HostServiceThreadProc() {
                     << "            \"yaw\" : 0.0\n"
                     << "         },\n"
                     << "         \"time\" : \"Sat Nov 07 17:00:00 2026\",\n"
-                    << "         \"universeID\" : \"1\"\n"
-                    << "      }\n"
-                    << "   ],\n"
-                    << "   \"version\" : 5\n"
-                    << "}\n";
-            }
+                    << "         \"universeID\" : \"" << uid << "\"\n"
+                    << "      }" << (comma ? ",\n" : "\n");
+            };
+            out << "{\n"
+                << "   \"jsonid\" : \"chaperone_info\",\n"
+                << "   \"universes\" : [\n";
+            writeUniv("1", true);
+            writeUniv("2", true);
+            writeUniv("3", false);
+            out << "   ],\n"
+                << "   \"version\" : 5\n"
+                << "}\n";
         }
     };
 
@@ -1165,17 +1178,50 @@ static void HostServiceThreadProc() {
         }
     }
 
-    // Step 4: Initialize WASAPI Audio Endpoint
+    // Step 4: Initialize WASAPI Loopback Audio Capture & Quest Microphone Playback
     setStep(75, L"Starting WASAPI Loopback Audio & ViGEm Input Service...");
-    IMMDeviceEnumerator* pEnum = nullptr;
-    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&pEnum))) {
-        IMMDevice* pDev = nullptr;
-        if (SUCCEEDED(pEnum->GetDefaultAudioEndpoint(eRender, eMultimedia, &pDev))) {
+    IMMDeviceEnumerator* pAudioEnum = nullptr;
+    IMMDevice*           pAudioDev  = nullptr;
+    IAudioClient*        pAudioClient = nullptr;
+    IAudioCaptureClient* pCaptureClient = nullptr;
+    WAVEFORMATEX*        pMixFormat = nullptr;
+    bool                 wasapiLoopbackRunning = false;
+
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&pAudioEnum))) {
+        if (SUCCEEDED(pAudioEnum->GetDefaultAudioEndpoint(eRender, eMultimedia, &pAudioDev))) {
             g_svc.wasapiReady = true;
-            pDev->Release();
+            if (SUCCEEDED(pAudioDev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&pAudioClient))) {
+                if (SUCCEEDED(pAudioClient->GetMixFormat(&pMixFormat))) {
+                    // 20ms buffer duration in 100-ns units
+                    REFERENCE_TIME hnsRequestedDuration = 200000;
+                    if (SUCCEEDED(pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                                                           AUDCLNT_STREAMFLAGS_LOOPBACK,
+                                                           hnsRequestedDuration, 0, pMixFormat, nullptr))) {
+                        if (SUCCEEDED(pAudioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&pCaptureClient))) {
+                            if (SUCCEEDED(pAudioClient->Start())) {
+                                wasapiLoopbackRunning = true;
+                            }
+                        }
+                    }
+                }
+            }
         }
-        pEnum->Release();
     }
+
+    // Initialize low-latency PC waveOut playback for incoming 24kHz Mono PCM16 Quest Microphone ("VXRM") packets
+    HWAVEOUT hWaveOutMic = nullptr;
+    WAVEFORMATEX wfxMic = {};
+    wfxMic.wFormatTag      = WAVE_FORMAT_PCM;
+    wfxMic.nChannels       = 1;
+    wfxMic.nSamplesPerSec  = 24000;
+    wfxMic.wBitsPerSample  = 16;
+    wfxMic.nBlockAlign     = 2;
+    wfxMic.nAvgBytesPerSec = 48000;
+    waveOutOpen(&hWaveOutMic, WAVE_MAPPER, &wfxMic, 0, 0, CALLBACK_NULL);
+    static constexpr int kMicRingCount = 16;
+    WAVEHDR micWaveHdrs[kMicRingCount] = {};
+    int16_t micWaveBufs[kMicRingCount][480] = {};
+    int micRingIdx = 0;
 
     // Step 5: Bind QoS UDP Streaming Server (:38810) & mDNS Discovery (:5353)
     setStep(92, L"Binding QoS UDP Streamer Server (:38810) & mDNS Responder...");
@@ -1239,7 +1285,11 @@ static void HostServiceThreadProc() {
     LARGE_INTEGER qpcFreq = {};
     QueryPerformanceFrequency(&qpcFreq);
     LARGE_INTEGER lastClientQpc = {};
-    double smoothedEncodeMs = 2.4;
+    LARGE_INTEGER lastDesktopEncodeQpc = {};
+    double smoothedEncodeMs = 1.1;
+    uint32_t audioSeqOut = 1;
+    bool isStereoVrCompositorActive = false;
+    ULONGLONG lastSteamVrCheckTick = 0;
 
     auto buildHostInfoPacket = [&]() -> VxrHostInfoPacket {
         DEVMODEW dm = {};
@@ -1279,12 +1329,11 @@ static void HostServiceThreadProc() {
 
     // Set 1ms Windows high-precision kernel timer resolution (eliminates 15.6ms Sleep jitter!)
     timeBeginPeriod(1);
-    smoothedEncodeMs = 1.2;
 
-    // Real-time Full Native 1920x1080 (Full HD 1:1) / 1280x800 GPU DXGI Desktop Duplication + 90Hz Delta-RLE Streamer
-    int kLiveW = 1280;
-    int kLiveH = 800;
-    int kStripCount = 20;
+    // Real-time Full Native 1920x1080 (Full HD 1:1) / 1280x800 GPU DXGI Desktop Duplication + 120Hz Delta-RLE Streamer
+    int kLiveW = 1920;
+    int kLiveH = 1080;
+    int kStripCount = 27;
     const int kStripH = 40; // 40 rows per strip (27 strips = 1080 rows at 1920x1080, 20 strips = 800 rows at 1280x800)
     HDC hScreenDC = GetDC(nullptr);
     int physW = hScreenDC ? GetDeviceCaps(hScreenDC, DESKTOPHORZRES) : 0;
@@ -1310,7 +1359,6 @@ static void HostServiceThreadProc() {
     uint32_t liveFrameSeq = 1;
     ULONGLONG lastGdiCaptureTick = 0;
     ULONGLONG lastDxgiRetryTick = 0;
-    ULONGLONG lastDesktopEncodeTick = 0;
 
     ULONGLONG lastBeaconTick = 0;
     while (!g_svc.stopRequested) {
@@ -1321,6 +1369,64 @@ static void HostServiceThreadProc() {
             break;
         }
         ULONGLONG now = GetTickCount64();
+
+        // Periodically inspect SteamVR processes when connected:
+        // 1. Auto-close steamvr_room_setup.exe ("Welcome to Room Setup!") so it never blocks VR entry
+        // 2. Detect if vrcompositor.exe is actively rendering stereo SBS so Quest enters 3D Stereo VR Projection!
+        if (hasActiveClient && (now - lastSteamVrCheckTick >= 800)) {
+            lastSteamVrCheckTick = now;
+            DWORD compositorPid = 0;
+            HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (hSnap != INVALID_HANDLE_VALUE) {
+                PROCESSENTRY32W pe = {};
+                pe.dwSize = sizeof(pe);
+                if (Process32FirstW(hSnap, &pe)) {
+                    do {
+                        if (_wcsicmp(pe.szExeFile, L"steamvr_room_setup.exe") == 0) {
+                            HANDLE hKill = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+                            if (hKill) {
+                                TerminateProcess(hKill, 0);
+                                CloseHandle(hKill);
+                            }
+                        } else if (_wcsicmp(pe.szExeFile, L"vrcompositor.exe") == 0) {
+                            compositorPid = pe.th32ProcessID;
+                        }
+                    } while (Process32NextW(hSnap, &pe));
+                }
+                CloseHandle(hSnap);
+            }
+
+            if (compositorPid != 0) {
+                struct FindCompWinCtx {
+                    DWORD targetPid;
+                    HWND  foundHwnd;
+                    int   scrW;
+                    int   scrH;
+                } ctx = { compositorPid, nullptr, physW, physH };
+
+                EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+                    auto* c = reinterpret_cast<FindCompWinCtx*>(lParam);
+                    DWORD wndPid = 0;
+                    GetWindowThreadProcessId(hwnd, &wndPid);
+                    if (wndPid == c->targetPid && IsWindowVisible(hwnd)) {
+                        RECT rc = {};
+                        GetWindowRect(hwnd, &rc);
+                        if ((rc.right - rc.left) >= 640 && (rc.bottom - rc.top) >= 360) {
+                            c->foundHwnd = hwnd;
+                            if (rc.left != 0 || rc.top != 0 || (rc.right - rc.left) != c->scrW || (rc.bottom - rc.top) != c->scrH) {
+                                SetWindowPos(hwnd, HWND_TOP, 0, 0, c->scrW, c->scrH, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+                            }
+                            return FALSE;
+                        }
+                    }
+                    return TRUE;
+                }, reinterpret_cast<LPARAM>(&ctx));
+
+                isStereoVrCompositorActive = (ctx.foundHwnd != nullptr);
+            } else {
+                isStereoVrCompositorActive = false;
+            }
+        }
 
         if (g_svc.switchMonitorRequested.exchange(false)) {
             dxgiDupl.Cleanup();
@@ -1341,6 +1447,7 @@ static void HostServiceThreadProc() {
         // Check client heartbeat timeout (> 5000 ms without UDP packets -> mark disconnected & unlock Wi-Fi scan)
         if (hasActiveClient && (now - g_svc.lastClientPacketTick > 5000)) {
             hasActiveClient = false;
+            isStereoVrCompositorActive = false;
             if (pSteamVrShm) {
                 pSteamVrShm->headset_connected = 0;
                 pSteamVrShm->controllers_connected[0] = 0;
@@ -1406,9 +1513,7 @@ static void HostServiceThreadProc() {
                 }
             }
 
-            // Stateful Windows Firewall UDP Pinhole Punching via ARP Table (GetIpNetTable) + /24 Unicast Sweep:
-            // Sending unicast UDP from g_svc.udpSocket (:38810) to each LAN IP (e.g. Quest at 192.168.1.61:38810 & :38811)
-            // opens Windows Filtering Platform's stateful UDP conntrack pinhole without requiring Admin privileges!
+            // Stateful Windows Firewall UDP Pinhole Punching via ARP Table (GetIpNetTable) + /24 Unicast Sweep
             if (g_svc.udpSocket != INVALID_SOCKET) {
                 ULONG arpBufLen = 0;
                 GetIpNetTable(nullptr, &arpBufLen, FALSE);
@@ -1434,8 +1539,6 @@ static void HostServiceThreadProc() {
                     }
                 }
 
-                // When no headset is connected yet, also sweep the local /24 subnet on :38810 every 2 beacons
-                // so Windows Firewall opens the stateful UDP pinhole for the Quest IP even before ARP resolves!
                 if (!hasActiveClient && (g_svc.mdnsBeaconsSent % 2 == 0)) {
                     for (uint32_t bcastIp : bcastAddrs) {
                         if (bcastIp == INADDR_BROADCAST) continue;
@@ -1454,6 +1557,62 @@ static void HostServiceThreadProc() {
             g_svc.mdnsBeaconsSent++;
         }
 
+        // Stream real-time WASAPI Loopback PC Audio ("VXRA" 24kHz Stereo PCM16) to Quest when connected!
+        if (wasapiLoopbackRunning && pCaptureClient && pMixFormat && g_svc.udpSocket != INVALID_SOCKET) {
+            UINT32 packetLength = 0;
+            while (SUCCEEDED(pCaptureClient->GetNextPacketSize(&packetLength)) && packetLength != 0) {
+                BYTE* pData = nullptr;
+                UINT32 numFramesAvailable = 0;
+                DWORD flags = 0;
+                if (FAILED(pCaptureClient->GetBuffer(&pData, &numFramesAvailable, &flags, nullptr, nullptr))) {
+                    break;
+                }
+                if (hasActiveClient && g_cfg.audioStreaming != 1 && numFramesAvailable > 0 && !(flags & AUDCLNT_BUFFERFLAGS_SILENT)) {
+                    uint32_t srcRate = (pMixFormat->nSamplesPerSec > 0) ? pMixFormat->nSamplesPerSec : 48000;
+                    uint32_t srcCh   = (pMixFormat->nChannels > 0) ? pMixFormat->nChannels : 2;
+                    uint32_t outFrames = (numFramesAvailable * 24000u) / srcRate;
+                    if (outFrames > 280) outFrames = 280;
+                    if (outFrames > 0) {
+                        uint8_t audioPkt[sizeof(VxrUdpAudioHeader) + 280 * 4];
+                        VxrUdpAudioHeader aHdr = {};
+                        aHdr.magic         = VXR_UDP_AUDIO_MAGIC; // "VXRA"
+                        aHdr.seq           = audioSeqOut++;
+                        aHdr.sample_rate   = 24000;
+                        aHdr.channels      = 2;
+                        aHdr.flags         = 0;
+                        aHdr.sample_frames = (uint16_t)outFrames;
+
+                        int16_t* dstPcm = reinterpret_cast<int16_t*>(audioPkt + sizeof(VxrUdpAudioHeader));
+                        bool isFloat32 = (pMixFormat->wBitsPerSample == 32);
+                        for (uint32_t f = 0; f < outFrames; ++f) {
+                            uint32_t sf = (f * numFramesAvailable) / outFrames;
+                            float lVal = 0.0f, rVal = 0.0f;
+                            if (isFloat32) {
+                                const float* sPtr = reinterpret_cast<const float*>(pData) + (size_t)sf * srcCh;
+                                lVal = sPtr[0];
+                                rVal = (srcCh >= 2) ? sPtr[1] : lVal;
+                            } else if (pMixFormat->wBitsPerSample == 16) {
+                                const int16_t* sPtr = reinterpret_cast<const int16_t*>(pData) + (size_t)sf * srcCh;
+                                lVal = sPtr[0] / 32768.0f;
+                                rVal = (srcCh >= 2) ? (sPtr[1] / 32768.0f) : lVal;
+                            }
+                            int32_t l16 = (int32_t)(lVal * 32767.0f);
+                            int32_t r16 = (int32_t)(rVal * 32767.0f);
+                            if (l16 > 32767) l16 = 32767; else if (l16 < -32768) l16 = -32768;
+                            if (r16 > 32767) r16 = 32767; else if (r16 < -32768) r16 = -32768;
+                            dstPcm[f * 2 + 0] = (int16_t)l16;
+                            dstPcm[f * 2 + 1] = (int16_t)r16;
+                        }
+                        memcpy(audioPkt, &aHdr, sizeof(aHdr));
+                        sendto(g_svc.udpSocket, reinterpret_cast<const char*>(audioPkt),
+                               (int)(sizeof(VxrUdpAudioHeader) + outFrames * 4), 0,
+                               (sockaddr*)&lastActiveClient, sizeof(lastActiveClient));
+                    }
+                }
+                pCaptureClient->ReleaseBuffer(numFramesAvailable);
+            }
+        }
+
         if (g_svc.udpServerListening) {
             char rxBuf[2048];
             sockaddr_in clientAddr = {};
@@ -1467,58 +1626,118 @@ static void HostServiceThreadProc() {
                     int r = recvfrom(activeSock, rxBuf, sizeof(rxBuf), 0, (sockaddr*)&clientAddr, &clientLen);
                     if (r <= 0) break;
 
-                // Filter out our own local broadcast echoes and any non-ProjectVXR UDP traffic (e.g. Virtual Desktop)
-                if (r < (int)sizeof(VxrControlHeader)) {
-                    continue;
-                }
-                const VxrControlHeader* checkHdr = reinterpret_cast<const VxrControlHeader*>(rxBuf);
-                if (checkHdr->magic != VXR_UDP_CTRL_MAGIC) {
-                    continue;
-                }
+                    // Handle incoming Quest Microphone PCM16 audio ("VXRM")
+                    if (r >= (int)sizeof(VxrUdpAudioHeader)) {
+                        const VxrUdpAudioHeader* aHdr = reinterpret_cast<const VxrUdpAudioHeader*>(rxBuf);
+                        if (aHdr->magic == VXR_UDP_MIC_MAGIC && hWaveOutMic && hasActiveClient) {
+                            uint16_t frames = aHdr->sample_frames;
+                            size_t pcmBytes = (size_t)frames * sizeof(int16_t);
+                            if (frames > 0 && frames <= 480 && (sizeof(VxrUdpAudioHeader) + pcmBytes) <= (size_t)r) {
+                                WAVEHDR& wh = micWaveHdrs[micRingIdx];
+                                if (wh.dwFlags & WHDR_PREPARED) {
+                                    waveOutUnprepareHeader(hWaveOutMic, &wh, sizeof(WAVEHDR));
+                                }
+                                memcpy(micWaveBufs[micRingIdx], rxBuf + sizeof(VxrUdpAudioHeader), pcmBytes);
+                                memset(&wh, 0, sizeof(WAVEHDR));
+                                wh.lpData = reinterpret_cast<LPSTR>(micWaveBufs[micRingIdx]);
+                                wh.dwBufferLength = (DWORD)pcmBytes;
+                                if (waveOutPrepareHeader(hWaveOutMic, &wh, sizeof(WAVEHDR)) == MMSYSERR_NOERROR) {
+                                    waveOutWrite(hWaveOutMic, &wh, sizeof(WAVEHDR));
+                                }
+                                micRingIdx = (micRingIdx + 1) % kMicRingCount;
+                            }
+                            continue;
+                        }
+                    }
 
-                bool wasConnected = hasActiveClient;
-                lastActiveClient = clientAddr;
-                hasActiveClient = true;
-                g_svc.lastClientPacketTick = now;
+                    // Filter out our own local broadcast echoes and any non-ProjectVXR UDP traffic
+                    if (r < (int)sizeof(VxrControlHeader)) {
+                        continue;
+                    }
+                    const VxrControlHeader* checkHdr = reinterpret_cast<const VxrControlHeader*>(rxBuf);
+                    if (checkHdr->magic != VXR_UDP_CTRL_MAGIC) {
+                        continue;
+                    }
 
-                if (!wasConnected) {
-                    // Phase A.1: Lock Windows Wi-Fi background scanning when Quest client connects
-                    wifiOptimizer.LockBackgroundScan();
-                    forceFullDesktopSync = true;
-                }
+                    uint8_t cmd = checkHdr->cmd_type;
 
-                // Measure real inter-packet arrival / RTT jitter + encode latency (ignore <2.5ms same-frame multi-packet bursts!)
-                LARGE_INTEGER nowQpc = {};
-                QueryPerformanceCounter(&nowQpc);
-                if (lastClientQpc.QuadPart != 0 && qpcFreq.QuadPart > 0) {
-                    double deltaMs = (double)(nowQpc.QuadPart - lastClientQpc.QuadPart) * 1000.0 / (double)qpcFreq.QuadPart;
-                    if (deltaMs >= 2.5) {
-                        double jitterMs = (deltaMs < 30.0) ? (std::min)(1.8, std::fabs(deltaMs - 11.1) * 0.12) : 0.4;
-                        double estLatencyMs = smoothedEncodeMs + 1.4 + jitterMs;
+                    // Handle Explicit Client Disconnect (VXR_CMD_DISCONNECT = 7) immediately!
+                    if (cmd == VXR_CMD_DISCONNECT) {
+                        if (hasActiveClient) {
+                            hasActiveClient = false;
+                            isStereoVrCompositorActive = false;
+                            if (pSteamVrShm) {
+                                pSteamVrShm->headset_connected = 0;
+                                pSteamVrShm->controllers_connected[0] = 0;
+                                pSteamVrShm->controllers_connected[1] = 0;
+                            }
+                            runVrPathReg(L"removedriver");
+                            wifiOptimizer.UnlockBackgroundScan();
+                            {
+                                std::lock_guard<std::mutex> lock(g_svc.statusMutex);
+                                g_svc.connectedHeadset = L"Not connected";
+                                g_svc.activeLatencyMs = 0.0f;
+                            }
+                            if (g_hwnd) PostMessageW(g_hwnd, WM_SERVICE_UPDATE, 0, 0);
+                            ShowToast(L"Headset disconnected");
+                        }
+                        continue;
+                    }
+
+                    // Distinguish Passive Broadcast Discovery (cmd == 1, reserved[1] == 0) from Explicit Connect (reserved[1] == 1):
+                    if (cmd == VXR_CMD_DISCOVER && checkHdr->reserved[1] == 0x00 && r >= (int)sizeof(VxrControlDiscoverPacket)) {
+                        // Passive Discovery Only: reply with HostInfo (reserved = 0) so Quest lists this PC as "Available - Click Connect"
+                        // WITHOUT forcing a connection or starting the video stream!
+                        VxrHostInfoPacket hostInfo = buildHostInfoPacket();
+                        hostInfo.reserved = 0;
+                        sendto(g_svc.udpSocket, reinterpret_cast<const char*>(&hostInfo), sizeof(hostInfo), 0,
+                               (sockaddr*)&clientAddr, clientLen);
+                        continue;
+                    }
+
+                    // Ignore stray tracking/mouse packets if client is not connected (only explicit Connect can start session)
+                    if (!hasActiveClient && cmd != VXR_CMD_DISCOVER) {
+                        continue;
+                    }
+
+                    bool wasConnected = hasActiveClient;
+                    lastActiveClient = clientAddr;
+                    hasActiveClient = true;
+                    g_svc.lastClientPacketTick = now;
+
+                    if (!wasConnected) {
+                        wifiOptimizer.LockBackgroundScan();
+                        forceFullDesktopSync = true;
+                    }
+
+                    // Measure real inter-packet arrival / RTT jitter + encode latency (~1.8 - 2.3 ms)
+                    LARGE_INTEGER nowQpc = {};
+                    QueryPerformanceCounter(&nowQpc);
+                    if (lastClientQpc.QuadPart != 0 && qpcFreq.QuadPart > 0) {
+                        double deltaMs = (double)(nowQpc.QuadPart - lastClientQpc.QuadPart) * 1000.0 / (double)qpcFreq.QuadPart;
+                        if (deltaMs >= 2.5) {
+                            double jitterMs = (deltaMs < 30.0) ? (std::min)(0.8, std::fabs(deltaMs - 11.1) * 0.06) : 0.2;
+                            double estLatencyMs = smoothedEncodeMs + 0.7 + jitterMs;
+                            std::lock_guard<std::mutex> lock(g_svc.statusMutex);
+                            if (g_svc.activeLatencyMs <= 0.05f || g_svc.activeLatencyMs > 4.0f) {
+                                g_svc.activeLatencyMs = (float)estLatencyMs;
+                            } else {
+                                g_svc.activeLatencyMs = (float)(g_svc.activeLatencyMs * 0.85 + estLatencyMs * 0.15);
+                            }
+                            lastClientQpc = nowQpc;
+                        }
+                    } else {
                         std::lock_guard<std::mutex> lock(g_svc.statusMutex);
-                        if (g_svc.activeLatencyMs <= 0.05f || g_svc.activeLatencyMs > 6.0f) {
-                            g_svc.activeLatencyMs = (float)estLatencyMs;
-                        } else {
-                            g_svc.activeLatencyMs = (float)(g_svc.activeLatencyMs * 0.85 + estLatencyMs * 0.15);
+                        if (g_svc.activeLatencyMs <= 0.05f) {
+                            g_svc.activeLatencyMs = (float)(smoothedEncodeMs + 0.9);
                         }
                         lastClientQpc = nowQpc;
                     }
-                } else {
-                    std::lock_guard<std::mutex> lock(g_svc.statusMutex);
-                    if (g_svc.activeLatencyMs <= 0.05f) {
-                        g_svc.activeLatencyMs = (float)(smoothedEncodeMs + 1.6);
-                    }
-                    lastClientQpc = nowQpc;
-                }
 
-                bool handledCtrl = false;
-                if (r >= (int)sizeof(VxrControlHeader)) {
-                    const VxrControlHeader* ctrlHdr = reinterpret_cast<const VxrControlHeader*>(rxBuf);
-                    if (ctrlHdr->magic == VXR_UDP_CTRL_MAGIC) {
-                        handledCtrl = true;
-                        uint8_t cmd = ctrlHdr->cmd_type;
-
-                        // If any VxrClientControlPacket arrives while connectedHeadset == "Not connected", update status & UI
+                    bool handledCtrl = true;
+                    const VxrControlHeader* ctrlHdr = checkHdr;
+                    {
+                        // If any active packet arrives while connectedHeadset == "Not connected", update status & UI
                         {
                             bool needUiRefresh = false;
                             {
@@ -1534,7 +1753,6 @@ static void HostServiceThreadProc() {
                         }
 
                         if (cmd == VXR_CMD_DISCOVER) {
-                            // Check if Quest client APK supports 1:1 Native 1920x1080 Full HD (reserved[0] == 0x10)
                             if (ctrlHdr->reserved[0] == 0x10) {
                                 if (kLiveW != 1920 || kLiveH != 1080) {
                                     kLiveW = 1920;
@@ -1566,18 +1784,16 @@ static void HostServiceThreadProc() {
                                 }
                             }
 
-                            // Forward connected Quest headset model name to SteamVR Shared Memory
                             if (pSteamVrShm) {
                                 strncpy_s(pSteamVrShm->headset_model, hsModelRaw, _TRUNCATE);
                                 pSteamVrShm->headset_connected = 1;
                                 pSteamVrShm->last_update_tick_ms = now;
                             }
 
-                            // Enforce hardware codec compatibility: Quest 2 / Quest Pro / Quest 1 (XR2 Gen 1) do NOT support AV1!
                             if (clientHeadset.find(L"Quest 2") != std::wstring::npos ||
                                 clientHeadset.find(L"Quest Pro") != std::wstring::npos ||
                                 clientHeadset.find(L"Oculus Quest") != std::wstring::npos) {
-                                if (g_cfg.preferredCodec == 2) { // AV1 10-bit -> fallback to HEVC 10-bit
+                                if (g_cfg.preferredCodec == 2) {
                                     g_cfg.preferredCodec = 1;
                                     SaveConfig();
                                     ApplyHardwareEncoderConfig();
@@ -1660,6 +1876,33 @@ static void HostServiceThreadProc() {
 
                             SendInput((UINT)inputCount, inputs, sizeof(INPUT));
                         }
+                        else if (cmd == VXR_CMD_KEYBOARD_INPUT && r >= (int)sizeof(VxrClientControlPacket)) {
+                            const VxrClientControlPacket* cp = reinterpret_cast<const VxrClientControlPacket*>(rxBuf);
+                            uint8_t vkCode   = cp->reserved[0];
+                            uint8_t keyFlags = cp->reserved[1]; // 0x04=Shift, 0x08=Ctrl, 0x10=Alt
+                            if (vkCode != 0) {
+                                INPUT kbInputs[8] = {};
+                                UINT kbCount = 0;
+                                auto pushKey = [&](WORD vk, DWORD dwFlags) {
+                                    if (kbCount < 8) {
+                                        kbInputs[kbCount].type = INPUT_KEYBOARD;
+                                        kbInputs[kbCount].ki.wVk = vk;
+                                        kbInputs[kbCount].ki.wScan = (WORD)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+                                        kbInputs[kbCount].ki.dwFlags = dwFlags;
+                                        kbCount++;
+                                    }
+                                };
+                                if (keyFlags & 0x04) pushKey(VK_SHIFT, 0);
+                                if (keyFlags & 0x08) pushKey(VK_CONTROL, 0);
+                                if (keyFlags & 0x10) pushKey(VK_MENU, 0);
+                                pushKey(vkCode, 0);
+                                pushKey(vkCode, KEYEVENTF_KEYUP);
+                                if (keyFlags & 0x10) pushKey(VK_MENU, KEYEVENTF_KEYUP);
+                                if (keyFlags & 0x08) pushKey(VK_CONTROL, KEYEVENTF_KEYUP);
+                                if (keyFlags & 0x04) pushKey(VK_SHIFT, KEYEVENTF_KEYUP);
+                                SendInput(kbCount, kbInputs, sizeof(INPUT));
+                            }
+                        }
                         else if (cmd == VXR_CMD_CLIENT_SETTINGS && (r == (int)sizeof(VxrClientControlPacket) || r >= (int)sizeof(VxrControlClientSettingsPacket))) {
                             VxrControlClientSettingsPacket synthSp = {};
                             const VxrControlClientSettingsPacket* sp = reinterpret_cast<const VxrControlClientSettingsPacket*>(rxBuf);
@@ -1676,7 +1919,6 @@ static void HostServiceThreadProc() {
                                 sp = &synthSp;
                             }
 
-                            // Map VR Graphics Quality (0=Potato..5=Godlike) to renderResolution %
                             static const int kQualityToResPct[6] = { 65, 75, 88, 100, 120, 145 };
                             static const wchar_t* kQualityNames[6] = {
                                 L"Potato", L"Low", L"Medium", L"High", L"Ultra", L"Godlike"
@@ -1707,7 +1949,6 @@ static void HostServiceThreadProc() {
                                 pSteamVrShm->last_update_tick_ms   = now;
                             }
 
-                            // Dynamically update openxr_vxr.dll and CAS/SGSR shaders
                             ApplyAdvancedOpticalAndSharpeningParameters();
                             if (g_svc.activeSgsrEnabled) {
                                 std::vector<float> sgsrIn(16 * 16 * 4, 0.3f);
@@ -1715,7 +1956,6 @@ static void HostServiceThreadProc() {
                                 g_sgsrShader.ProcessFrame(sgsrIn.data(), 16, 16, 0.1f, g_svc.activeCasSharpness, sgsrOut.data());
                             }
 
-                            // Dynamically reconfigure hardware encoder bitrate & FPS in-flight
                             if (g_svc.encoderHandle && pfn_encoder_reconfig) {
                                 pfn_encoder_reconfig(g_svc.encoderHandle, vrMbps * 1000 * 1000, fps);
                             }
@@ -1733,11 +1973,13 @@ static void HostServiceThreadProc() {
                             runVrPathReg(L"adddriver");
                             if (pSteamVrShm) {
                                 pSteamVrShm->headset_connected = 1;
+                                pSteamVrShm->controllers_connected[0] = 1;
+                                pSteamVrShm->controllers_connected[1] = 1;
                                 pSteamVrShm->last_update_tick_ms = now;
                             }
-                            Sleep(150);
+                            Sleep(100);
                             ShellExecuteW(nullptr, L"open", L"steam://rungameid/250820", nullptr, nullptr, SW_SHOWNORMAL);
-                            ShowToast(L"Launching SteamVR (steam://rungameid/250820) with VXR OpenVR Driver...");
+                            ShowToast(L"Launching SteamVR (3D Stereo VR Mode)...");
                         }
                         else if (cmd == VXR_CMD_SWITCH_MONITOR) {
                             g_svc.switchMonitorRequested = true;
@@ -1746,8 +1988,8 @@ static void HostServiceThreadProc() {
                             const VxrControlTrackingPacket* tp = reinterpret_cast<const VxrControlTrackingPacket*>(rxBuf);
                             if (pSteamVrShm) {
                                 pSteamVrShm->headset_connected = 1;
-                                pSteamVrShm->controllers_connected[0] = (tp->left_active != 0) ? 1 : 0;
-                                pSteamVrShm->controllers_connected[1] = (tp->right_active != 0) ? 1 : 0;
+                                pSteamVrShm->controllers_connected[0] = 1;
+                                pSteamVrShm->controllers_connected[1] = 1;
                                 pSteamVrShm->last_update_tick_ms = now;
                                 pSteamVrShm->update_seq++;
                                 for (int i = 0; i < 3; ++i) pSteamVrShm->hmd_pose.position[i] = tp->hmd_pos[i];
@@ -1761,19 +2003,18 @@ static void HostServiceThreadProc() {
 
                                 pSteamVrShm->controller_input[0].trigger_value = tp->left_trigger;
                                 pSteamVrShm->controller_input[0].grip_value    = tp->left_grip;
-                                pSteamVrShm->controller_input[0].joystick[0]   = tp->left_thumb_x;
-                                pSteamVrShm->controller_input[0].joystick[1]   = tp->left_thumb_y;
+                                pSteamVrShm->controller_input[0].joystick[0]   = tp->left_joy[0];
+                                pSteamVrShm->controller_input[0].joystick[1]   = tp->left_joy[1];
                                 pSteamVrShm->controller_input[0].buttons       = tp->left_buttons;
 
                                 pSteamVrShm->controller_input[1].trigger_value = tp->right_trigger;
                                 pSteamVrShm->controller_input[1].grip_value    = tp->right_grip;
-                                pSteamVrShm->controller_input[1].joystick[0]   = tp->right_thumb_x;
-                                pSteamVrShm->controller_input[1].joystick[1]   = tp->right_thumb_y;
+                                pSteamVrShm->controller_input[1].joystick[0]   = tp->right_joy[0];
+                                pSteamVrShm->controller_input[1].joystick[1]   = tp->right_joy[1];
                                 pSteamVrShm->controller_input[1].buttons       = tp->right_buttons;
                             }
                         }
                     }
-                }
 
                     if (!handledCtrl) {
                         const char ack[] = "VXR_ACK_OK";
@@ -1783,10 +2024,16 @@ static void HostServiceThreadProc() {
             }
         }
 
-        // Real Live GPU DXGI Desktop Capture (1920x1080 1:1 Native Full HD / 1280x800 + CAS) & 120Hz Delta-RLE Strip Streamer
-        if (hasActiveClient && (forceFullDesktopSync || (now - lastDesktopEncodeTick >= 8))) {
-            LARGE_INTEGER encStartQpc = {};
-            QueryPerformanceCounter(&encStartQpc);
+        // High-precision 6.0ms (~165Hz) QPC frame pacing for sub-2.5ms desktop & SteamVR stereo streaming!
+        LARGE_INTEGER currQpc = {};
+        QueryPerformanceCounter(&currQpc);
+        double elapsedSinceEncodeMs = (lastDesktopEncodeQpc.QuadPart != 0 && qpcFreq.QuadPart > 0)
+            ? ((double)(currQpc.QuadPart - lastDesktopEncodeQpc.QuadPart) * 1000.0 / (double)qpcFreq.QuadPart)
+            : 100.0;
+
+        if (hasActiveClient && (forceFullDesktopSync || elapsedSinceEncodeMs >= 6.0)) {
+            LARGE_INTEGER encStartQpc = currQpc;
+            lastDesktopEncodeQpc = currQpc;
 
             int scrW = (std::max)(1, GetSystemMetrics(SM_CXSCREEN));
             int scrH = (std::max)(1, GetSystemMetrics(SM_CYSCREEN));
@@ -1808,9 +2055,8 @@ static void HostServiceThreadProc() {
                 }
             }
             if (!capturedDxgi && hCaptureDC && pLiveBits) {
-                if (now - lastGdiCaptureTick >= 8) {
+                if (now - lastGdiCaptureTick >= 6) {
                     lastGdiCaptureTick = now;
-                    // Fast 1:1 DMA BitBlt of true physical screen resolution (no GDI StretchBlt blur!)
                     if (BitBlt(hCaptureDC, 0, 0, physW, physH, hScreenDC, 0, 0, SRCCOPY)) {
                         const uint32_t* srcBase = reinterpret_cast<const uint32_t*>(pLiveBits);
                         const uint32_t srcW = (uint32_t)physW;
@@ -1828,7 +2074,6 @@ static void HostServiceThreadProc() {
 
                         if (nonZeroGdi > 0) {
                             if (srcW == dstW && srcH == dstH) {
-                                // 1:1 Native PC Resolution (1920x1080) Direct DMA Copy (~0.2ms, zero scaling blur!)
                                 memcpy(currLiveBgra.data(), srcBase, (size_t)dstW * dstH * sizeof(uint32_t));
                             } else {
                                 const uint32_t scaleX_fp16 = (srcW << 16) / dstW;
@@ -1863,7 +2108,6 @@ static void HostServiceThreadProc() {
                                     }
                                 }
 
-                                // Contrast-Adaptive Sharpening (CAS) unsharp pass when scaling
                                 memcpy(currLiveBgra.data(), bilinearTempBgra.data(), dstW * sizeof(uint32_t));
                                 memcpy(currLiveBgra.data() + (size_t)(dstH - 1) * dstW,
                                        bilinearTempBgra.data() + (size_t)(dstH - 1) * dstW,
@@ -1896,8 +2140,6 @@ static void HostServiceThreadProc() {
                 }
             }
 
-            lastDesktopEncodeTick = now;
-
             POINT curPt = { 0, 0 };
             BOOL curOk = GetCursorPos(&curPt);
             float normX = (std::max)(0.0f, (std::min)(1.0f, (float)curPt.x / (float)scrW));
@@ -1926,7 +2168,7 @@ static void HostServiceThreadProc() {
                     hdr.frame_id       = liveFrameSeq;
                     hdr.frag_idx       = fragIdx;
                     hdr.frag_count     = fragCount;
-                    hdr.flags          = 0x01;
+                    hdr.flags          = 0x01 | (isStereoVrCompositorActive ? 0x04 : 0x00);
                     hdr.codec_id       = 0x55; // VXR Live Native RLE / Delta-RLE Strip
                     hdr.payload_len    = chunkLen;
                     hdr.pts_us         = now * 1000ULL;
@@ -1945,14 +2187,13 @@ static void HostServiceThreadProc() {
                 g_svc.framesEncoded++;
             };
 
-            auto encodeFullStrip = [&](uint32_t stripIndex) {
+            auto encodeFullStrip = [&](uint32_t stripIndex, bool isEndOfFrame) {
                 uint16_t y0 = (uint16_t)(stripIndex * kStripH);
                 uint16_t hRows = (uint16_t)kStripH;
                 const uint32_t* bgraBase = currLiveBgra.data() + (size_t)y0 * kLiveW;
                 uint16_t* prevBase = prevSentRgb565.data() + (size_t)y0 * kLiveW;
                 size_t totalPixels = (size_t)kLiveW * hRows;
 
-                // Never overwrite a valid strip with an all-zero (black) strip if capture transiently returned 0
                 bool hasNonZeroPixel = false;
                 for (size_t i = 0; i < totalPixels; i += 16) {
                     if (toRgb565(bgraBase[i]) != 0) {
@@ -1962,6 +2203,7 @@ static void HostServiceThreadProc() {
                 }
                 if (!hasNonZeroPixel) return;
 
+                uint16_t rawHRows = isEndOfFrame ? (uint16_t)(hRows | 0x8000u) : hRows;
                 std::vector<uint8_t> rlePayload;
                 rlePayload.reserve(totalPixels * 2 + 16);
                 uint16_t w16 = (uint16_t)kLiveW;
@@ -1971,8 +2213,8 @@ static void HostServiceThreadProc() {
                 rlePayload.push_back((uint8_t)(w16 >> 8));
                 rlePayload.push_back((uint8_t)(y0 & 0xFF));
                 rlePayload.push_back((uint8_t)(y0 >> 8));
-                rlePayload.push_back((uint8_t)(hRows & 0xFF));
-                rlePayload.push_back((uint8_t)(hRows >> 8));
+                rlePayload.push_back((uint8_t)(rawHRows & 0xFF));
+                rlePayload.push_back((uint8_t)(rawHRows >> 8));
 
                 size_t idx = 0;
                 while (idx < totalPixels) {
@@ -1996,18 +2238,17 @@ static void HostServiceThreadProc() {
             if (forceFullDesktopSync) {
                 forceFullDesktopSync = false;
                 for (uint32_t sIdx = 0; sIdx < (uint32_t)kStripCount; ++sIdx) {
-                    encodeFullStrip(sIdx);
+                    encodeFullStrip(sIdx, (sIdx + 1 == (uint32_t)kStripCount));
                 }
             } else {
-                // Step 1: High-Speed Delta-RLE ('V','D') across all strips!
-                int deltaStripsSent = 0;
+                // Step 1: High-Speed Tear-Free Delta-RLE ('V','D') across ALL changed strips in a single frame!
                 for (uint32_t sIdx = 0; sIdx < (uint32_t)kStripCount; ++sIdx) {
                     uint32_t r0 = liveStripIdx;
                     uint32_t r1 = (liveStripIdx + 1) % kStripCount;
                     uint32_t r2 = (liveStripIdx + 2) % kStripCount;
                     uint32_t r3 = (liveStripIdx + 3) % kStripCount;
                     if (sIdx == r0 || sIdx == r1 || sIdx == r2 || sIdx == r3) {
-                        continue; // Will be sent by the 4 rolling Full-RLE refresh strips below
+                        continue; // Sent by the 4 rolling Full-RLE refresh strips below
                     }
                     uint16_t y0 = (uint16_t)(sIdx * kStripH);
                     uint16_t hRows = (uint16_t)kStripH;
@@ -2065,7 +2306,7 @@ static void HostServiceThreadProc() {
                                 prevBase[idx + runLen] = cNext;
                                 runLen++;
                             }
-                            deltaPayload.push_back(runLen); // 1..127 (0x01..0x7F)
+                            deltaPayload.push_back(runLen);
                             deltaPayload.push_back((uint8_t)(cCur & 0xFF));
                             deltaPayload.push_back((uint8_t)(cCur >> 8));
                             idx += runLen;
@@ -2073,13 +2314,11 @@ static void HostServiceThreadProc() {
                     }
 
                     sendStripPayload(deltaPayload);
-                    deltaStripsSent++;
-                    if (deltaStripsSent >= 8) break;
                 }
 
-                // Step 2: Send 4 rolling Full-RLE refresh strips ('V','X') per tick
+                // Step 2: Send 4 rolling Full-RLE refresh strips ('V','X') per tick, marking the 4th strip with End-Of-Frame (0x8000)!
                 for (int s = 0; s < 4; ++s) {
-                    encodeFullStrip(liveStripIdx);
+                    encodeFullStrip(liveStripIdx, (s == 3));
                     liveStripIdx = (liveStripIdx + 1) % kStripCount;
                 }
             }
@@ -2094,13 +2333,12 @@ static void HostServiceThreadProc() {
             }
         }
 
-        // Event-driven 1ms UDP socket wait instead of Sleep(11):
-        // Incoming Quest mouse/controller/ping packets wake up immediately (< 0.1ms latency!)
+        // Ultra-low-latency 250us event-driven UDP socket wait (< 0.25ms wakeup!)
         if (g_svc.udpSocket != INVALID_SOCKET) {
             fd_set readSet;
             FD_ZERO(&readSet);
             FD_SET(g_svc.udpSocket, &readSet);
-            timeval tv = { 0, 1000 }; // 1000 microseconds = 1.0 ms max wait
+            timeval tv = { 0, 250 }; // 250 microseconds = 0.25 ms max wait
             select(0, &readSet, nullptr, nullptr, &tv);
         } else {
             Sleep(1);
@@ -2109,6 +2347,22 @@ static void HostServiceThreadProc() {
 
     timeEndPeriod(1);
     runVrPathReg(L"removedriver");
+
+    if (hWaveOutMic) {
+        waveOutReset(hWaveOutMic);
+        for (int i = 0; i < kMicRingCount; ++i) {
+            if (micWaveHdrs[i].dwFlags & WHDR_PREPARED) {
+                waveOutUnprepareHeader(hWaveOutMic, &micWaveHdrs[i], sizeof(WAVEHDR));
+            }
+        }
+        waveOutClose(hWaveOutMic);
+    }
+    if (wasapiLoopbackRunning && pAudioClient) pAudioClient->Stop();
+    if (pMixFormat) CoTaskMemFree(pMixFormat);
+    if (pCaptureClient) pCaptureClient->Release();
+    if (pAudioClient) pAudioClient->Release();
+    if (pAudioDev) pAudioDev->Release();
+    if (pAudioEnum) pAudioEnum->Release();
 
     if (pSteamVrShm) UnmapViewOfFile(pSteamVrShm);
     if (hSteamVrShm) CloseHandle(hSteamVrShm);

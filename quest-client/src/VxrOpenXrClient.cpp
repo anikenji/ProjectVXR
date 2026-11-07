@@ -266,6 +266,7 @@ VxrOpenXrClient::VxrOpenXrClient()
     , m_shouldRenderFrame(true)
     , m_fbRenderModelSupported(false)
     , m_passthroughEnabled(false)
+    , m_immersiveStereoVrMode(false)
     , m_sessionState(OpenXrSessionState::Unknown)
     , m_frameIndex(0)
     , m_lastPredictedDisplayTimeNs(0)
@@ -1279,7 +1280,8 @@ void VxrOpenXrClient::SubmitQuadSwapchainRgba(const uint32_t* rgbaPixels,
     }
 
     // 2. Render 3D Stereo Environment, 3D Quest Touch Controllers & 3D Laser Beam into m_skySwapchain (1024x1024)
-    if (m_skySwapchain && !m_skySwapchainTexIds.empty()) {
+    // Skip when in full-FOV SteamVR Stereo VR Mode (m_immersiveStereoVrMode) so 100% of GPU budget goes to VR!
+    if (!m_immersiveStereoVrMode && m_skySwapchain && !m_skySwapchainTexIds.empty()) {
         XrSwapchain skySc = reinterpret_cast<XrSwapchain>(m_skySwapchain);
         XrSwapchainImageAcquireInfo acqInfo = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
         uint32_t imgIdx = 0;
@@ -1310,47 +1312,71 @@ bool VxrOpenXrClient::EndFrame(uint64_t display_time_ns) {
         const XrCompositionLayerBaseHeader* layers[2] = {};
         uint32_t layerCount = 0;
 
-        // Layer 0: Stereo Projection Layer (1024x1024 side-by-side stereo: 3D Environment + 3D Controllers + 3D Laser)
         XrCompositionLayerProjectionView projViews[2] = {
             { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW },
             { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW }
         };
         XrCompositionLayerProjection projLayer = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
-        if (m_skySwapchain && m_shouldRenderFrame) {
-            XrSwapchain skySc = reinterpret_cast<XrSwapchain>(m_skySwapchain);
-            const int32_t halfW = static_cast<int32_t>(m_skyWidth / 2);
-            const int32_t fullH = static_cast<int32_t>(m_skyHeight);
+        XrCompositionLayerQuad quadLayer = { XR_TYPE_COMPOSITION_LAYER_QUAD };
+
+        if (m_immersiveStereoVrMode && m_quadSwapchain && m_shouldRenderFrame) {
+            // Full-FOV 3D Stereo SteamVR Mode (like ALVR / Virtual Desktop):
+            // Split the 1920x1080 Side-by-Side (SBS) SteamVR compositor texture directly into Left Eye (0..960)
+            // and Right Eye (960..1920) of XrCompositionLayerProjection!
+            XrSwapchain vrSc = reinterpret_cast<XrSwapchain>(m_quadSwapchain);
+            const int32_t halfW = static_cast<int32_t>(g_activeQuadW / 2);
+            const int32_t fullH = static_cast<int32_t>(g_activeQuadH);
             for (int i = 0; i < 2; ++i) {
                 projViews[i].pose.position = { m_cachedViews[i].position[0], m_cachedViews[i].position[1], m_cachedViews[i].position[2] };
                 projViews[i].pose.orientation = { m_cachedViews[i].orientation[0], m_cachedViews[i].orientation[1], m_cachedViews[i].orientation[2], m_cachedViews[i].orientation[3] };
                 projViews[i].fov = { m_cachedViews[i].fov_left, m_cachedViews[i].fov_right, m_cachedViews[i].fov_top, m_cachedViews[i].fov_bottom };
-                projViews[i].subImage.swapchain = skySc;
+                projViews[i].subImage.swapchain = vrSc;
                 projViews[i].subImage.imageRect.offset = { i * halfW, 0 };
                 projViews[i].subImage.imageRect.extent = { halfW, fullH };
                 projViews[i].subImage.imageArrayIndex = 0;
             }
-            projLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            projLayer.layerFlags = 0;
             projLayer.space = localSp;
             projLayer.viewCount = 2;
             projLayer.views = projViews;
             layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projLayer);
-        }
+        } else {
+            // Layer 0: Stereo Projection Layer (1024x1024 side-by-side stereo: 3D Environment + 3D Controllers + 3D Laser)
+            if (m_skySwapchain && m_shouldRenderFrame) {
+                XrSwapchain skySc = reinterpret_cast<XrSwapchain>(m_skySwapchain);
+                const int32_t halfW = static_cast<int32_t>(m_skyWidth / 2);
+                const int32_t fullH = static_cast<int32_t>(m_skyHeight);
+                for (int i = 0; i < 2; ++i) {
+                    projViews[i].pose.position = { m_cachedViews[i].position[0], m_cachedViews[i].position[1], m_cachedViews[i].position[2] };
+                    projViews[i].pose.orientation = { m_cachedViews[i].orientation[0], m_cachedViews[i].orientation[1], m_cachedViews[i].orientation[2], m_cachedViews[i].orientation[3] };
+                    projViews[i].fov = { m_cachedViews[i].fov_left, m_cachedViews[i].fov_right, m_cachedViews[i].fov_top, m_cachedViews[i].fov_bottom };
+                    projViews[i].subImage.swapchain = skySc;
+                    projViews[i].subImage.imageRect.offset = { i * halfW, 0 };
+                    projViews[i].subImage.imageRect.extent = { halfW, fullH };
+                    projViews[i].subImage.imageArrayIndex = 0;
+                }
+                projLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                projLayer.space = localSp;
+                projLayer.viewCount = 2;
+                projLayer.views = projViews;
+                layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projLayer);
+            }
 
-        // Layer 1: High-Resolution 1920x1080 Native Desktop / 1280x800 VR Menu Cinema Quad in 3D VR Space at Y = m_screenCenterY
-        XrCompositionLayerQuad quadLayer = { XR_TYPE_COMPOSITION_LAYER_QUAD };
-        if (m_quadSwapchain && m_shouldRenderFrame) {
-            XrSwapchain quadSc = reinterpret_cast<XrSwapchain>(m_quadSwapchain);
-            quadLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-            quadLayer.space = localSp;
-            quadLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-            quadLayer.subImage.swapchain = quadSc;
-            quadLayer.subImage.imageRect.offset = { 0, 0 };
-            quadLayer.subImage.imageRect.extent = { static_cast<int32_t>(g_activeQuadW), static_cast<int32_t>(g_activeQuadH) };
-            quadLayer.subImage.imageArrayIndex = 0;
-            quadLayer.pose.orientation = { 0.0f, 0.0f, 0.0f, 1.0f };
-            quadLayer.pose.position = { 0.0f, m_screenCenterY, -m_quadDistM };
-            quadLayer.size = { m_quadWidthM, m_quadHeightM };
-            layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quadLayer);
+            // Layer 1: High-Resolution 1920x1080 Native Desktop / 1280x800 VR Menu Cinema Quad in 3D VR Space at Y = m_screenCenterY
+            if (m_quadSwapchain && m_shouldRenderFrame) {
+                XrSwapchain quadSc = reinterpret_cast<XrSwapchain>(m_quadSwapchain);
+                quadLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                quadLayer.space = localSp;
+                quadLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                quadLayer.subImage.swapchain = quadSc;
+                quadLayer.subImage.imageRect.offset = { 0, 0 };
+                quadLayer.subImage.imageRect.extent = { static_cast<int32_t>(g_activeQuadW), static_cast<int32_t>(g_activeQuadH) };
+                quadLayer.subImage.imageArrayIndex = 0;
+                quadLayer.pose.orientation = { 0.0f, 0.0f, 0.0f, 1.0f };
+                quadLayer.pose.position = { 0.0f, m_screenCenterY, -m_quadDistM };
+                quadLayer.size = { m_quadWidthM, m_quadHeightM };
+                layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quadLayer);
+            }
         }
 
         XrFrameEndInfo endInfo = { XR_TYPE_FRAME_END_INFO };
@@ -1421,13 +1447,13 @@ bool VxrOpenXrClient::PollControllerInput(XrControllerInputState* out_state) {
 
             m_controllerState.trigger_value = (std::max)(anyTrig, (std::max)(leftTrig, rightTrig));
             m_controllerState.grip_value    = (std::max)(anyGrip, (std::max)(leftGrip, rightGrip));
-            m_controllerState.button_a      = btnA || btnX;
+            m_controllerState.button_a      = btnA;
             m_controllerState.button_x      = btnX;
             m_controllerState.button_b      = btnB;
             m_controllerState.button_y      = btnY;
-            m_controllerState.button_menu   = btnMenu || btnY;
+            m_controllerState.button_menu   = btnMenu;
 
-            m_triggerPressed = (m_controllerState.trigger_value > 0.50f) || btnA || btnX;
+            m_triggerPressed = (m_controllerState.trigger_value > 0.50f) || btnA;
             m_gripPressed    = (m_controllerState.grip_value > 0.50f);
 
             if (m_thumbstickAction) {

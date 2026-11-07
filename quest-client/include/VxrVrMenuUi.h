@@ -110,7 +110,8 @@ struct VrMenuSettings {
 
     // --- SETTINGS TAB (Screenshot 3) ---
     // Computers
-    bool auto_connect = true;
+    bool auto_connect = false;
+    bool enter_vr_mode_requested = false;
     bool show_games_on_connect = false;
     bool use_optimal_resolution = true;
     bool arrange_monitors_on_recenter = false;

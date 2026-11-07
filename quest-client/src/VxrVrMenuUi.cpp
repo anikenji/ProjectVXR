@@ -50,6 +50,7 @@ enum HitActionId : uint32_t {
 
     // COMPUTERS Tab
     HIT_COMPUTER_TOGGLE_CONNECT = 100,
+    HIT_COMPUTER_ENTER_VR       = 101,
 
     // ENVIRONMENTS Tab
     HIT_ENV_SELECT          = 200,
@@ -266,7 +267,8 @@ void VrMenuSettings::ResetToDefaults() {
     create_desk_portal_requested = false;
 
     // SETTINGS
-    auto_connect = true;
+    auto_connect = false;
+    enter_vr_mode_requested = false;
     show_games_on_connect = false;
     use_optimal_resolution = true;
     arrange_monitors_on_recenter = false;
@@ -619,9 +621,18 @@ void VxrVrMenuUi::DrawSlider(uint32_t* buf, uint32_t bw, uint32_t bh, int x, int
 }
 
 void VxrVrMenuUi::DrawButton(uint32_t* buf, uint32_t bw, uint32_t bh, int x, int y, int w, int h, const char* label, bool primaryBlue, uint32_t hitId, int32_t param) {
-    uint32_t bg = primaryBlue ? COLOR_ACCENT_BLUE : COLOR_CONTROL_BG;
+    bool isDanger = (label && std::strcmp(label, "Disconnect") == 0);
+    int px = static_cast<int>(Clamp01(m_pointerX) * static_cast<float>(bw));
+    int py = static_cast<int>(Clamp01(m_pointerY) * static_cast<float>(bh));
+    bool hovered = (px >= x && px <= (x + w) && py >= y && py <= (y + h));
+
+    uint32_t bg = isDanger ? (hovered ? Rgba(0xFF, 0x5E, 0x4D) : COLOR_DANGER_RED)
+                           : (primaryBlue ? (hovered ? COLOR_ACCENT_HOVER : COLOR_ACCENT_BLUE)
+                                          : (hovered ? Rgba(0x3A, 0x44, 0x58) : COLOR_CONTROL_BG));
+    uint32_t borderCol = hovered ? COLOR_TEXT_PRIMARY : (isDanger ? COLOR_DANGER_RED : (primaryBlue ? COLOR_ACCENT_HOVER : COLOR_BORDER));
+
     FillRect(buf, bw, bh, x, y, w, h, bg);
-    DrawRectBorder(buf, bw, bh, x, y, w, h, 1, primaryBlue ? COLOR_ACCENT_HOVER : COLOR_BORDER);
+    DrawRectBorder(buf, bw, bh, x, y, w, h, hovered ? 2 : 1, borderCol);
 
     int textW = MeasureTextWidth5x7(label, 1);
     int tx = x + (w - textW) / 2;
@@ -748,6 +759,9 @@ void VxrVrMenuUi::RenderComputersTab(uint32_t* buf, uint32_t bw, uint32_t bh, in
     DrawText5x7(buf, bw, bh, contentX + 24, contentY + 20, "COMPUTERS", 2, COLOR_TEXT_PRIMARY);
     DrawText5x7(buf, bw, bh, contentX + 24, contentY + 44, "Select a computer on your local network to connect", 1, COLOR_TEXT_SECONDARY);
 
+    // Quick Auto-Connect checkbox right on the Computers tab header
+    DrawCheckbox(buf, bw, bh, contentX + contentW - 220, contentY + 24, "Auto-connect on startup", m_settings.auto_connect, HIT_SET_AUTO_CONNECT);
+
     int cardY = contentY + 72;
     if (m_computers.empty()) {
         int emptyX = contentX + 24;
@@ -764,7 +778,7 @@ void VxrVrMenuUi::RenderComputersTab(uint32_t* buf, uint32_t bw, uint32_t bh, in
         int cardH = 88;
 
         FillRect(buf, bw, bh, cardX, cardY, cardW, cardH, COLOR_BG_CARD);
-        DrawRectBorder(buf, bw, bh, cardX, cardY, cardW, cardH, 1, pc.connected ? COLOR_ACCENT_BLUE : COLOR_BORDER);
+        DrawRectBorder(buf, bw, bh, cardX, cardY, cardW, cardH, pc.connected ? 2 : 1, pc.connected ? COLOR_ACCENT_BLUE : COLOR_BORDER);
 
         // Windows Monitor Icon
         int monX = cardX + 20;
@@ -783,7 +797,7 @@ void VxrVrMenuUi::RenderComputersTab(uint32_t* buf, uint32_t bw, uint32_t bh, in
         DrawText5x7(buf, bw, bh, monX + 64, cardY + 46, subInfo, 1, COLOR_TEXT_SECONDARY);
 
         // Status indicator
-        const char* statusStr = pc.connected ? "Connected - Live Desktop Ready" : (pc.available ? "Available - Click Connect" : "Offline");
+        const char* statusStr = pc.connected ? "Connected - Live Stream Active" : (pc.available ? "Available - Click Connect" : "Offline");
         uint32_t statusColor = pc.connected ? COLOR_STATUS_GREEN : (pc.available ? COLOR_TEXT_SECONDARY : COLOR_DANGER_RED);
         DrawCircleFill(buf, bw, bh, monX + 68, cardY + 67, 4, statusColor);
         DrawText5x7(buf, bw, bh, monX + 78, cardY + 64, statusStr, 1, statusColor);
@@ -792,8 +806,12 @@ void VxrVrMenuUi::RenderComputersTab(uint32_t* buf, uint32_t bw, uint32_t bh, in
             // Allow clicking anywhere on the PC card row to connect when not yet connected
             RegisterHitBox(HIT_COMPUTER_TOGGLE_CONNECT, cardX, cardY, cardW, cardH, bw, bh, static_cast<int32_t>(i));
         } else {
-            DrawButton(buf, bw, bh, cardX + cardW - 268, cardY + 26, 118, 36, "View Desktop", true,
+            DrawButton(buf, bw, bh, cardX + cardW - 392, cardY + 26, 118, 36, "View Desktop", true,
                        HIT_BTN_VIEW_DESKTOP, static_cast<int32_t>(i));
+            DrawButton(buf, bw, bh, cardX + cardW - 266, cardY + 26, 118, 36, "Enter VR", true,
+                       HIT_COMPUTER_ENTER_VR, static_cast<int32_t>(i));
+            // Also make the Live Preview area below clickable to enter Full-Screen Desktop!
+            RegisterHitBox(HIT_BTN_VIEW_DESKTOP, 260, 360, 560, 350, bw, bh, static_cast<int32_t>(i));
         }
 
         // Connect / Disconnect button
@@ -1373,6 +1391,14 @@ bool VxrVrMenuUi::HandleHitAction(const VrUiHitBox& box, float normX, float norm
 
         case HIT_BTN_STEAMVR:
             m_settings.launch_steamvr_requested = true;
+            m_settings.enter_vr_mode_requested = true;
+            m_visible = false;
+            MarkSettingsDirty();
+            return true;
+        case HIT_COMPUTER_ENTER_VR:
+            m_settings.enter_vr_mode_requested = true;
+            m_settings.launch_steamvr_requested = true;
+            m_visible = false;
             MarkSettingsDirty();
             return true;
         case HIT_BTN_QUIT:
@@ -1380,6 +1406,7 @@ bool VxrVrMenuUi::HandleHitAction(const VrUiHitBox& box, float normX, float norm
             MarkSettingsDirty();
             return true;
         case HIT_BTN_VIEW_DESKTOP:
+            m_settings.enter_vr_mode_requested = false;
             m_visible = false;
             return true;
 
@@ -1397,6 +1424,7 @@ bool VxrVrMenuUi::HandleHitAction(const VrUiHitBox& box, float normX, float norm
                 } else {
                     pc.connected = false;
                     m_settings.is_pc_connected = false;
+                    m_settings.auto_connect = false; // Prevent auto-connect from re-connecting after explicit Disconnect!
                     m_settings.connect_computer_index = -1;
                     m_settings.disconnect_computer_requested = true;
                 }
@@ -1413,6 +1441,7 @@ bool VxrVrMenuUi::HandleHitAction(const VrUiHitBox& box, float normX, float norm
                     m_settings.connect_computer_index = box.param;
                     m_settings.disconnect_computer_requested = false;
                 } else {
+                    m_settings.auto_connect = false;
                     m_settings.connect_computer_index = -1;
                     m_settings.disconnect_computer_requested = true;
                 }

@@ -14,15 +14,27 @@ struct VrMenuSettings;
 static constexpr uint32_t VXR_UDP_VIDEO_MAGIC = 0x56585256; // "VXRV"
 static constexpr uint32_t VXR_UDP_CTRL_MAGIC  = 0x56585243; // "VXRC"
 static constexpr uint32_t VXR_HOST_INFO_MAGIC = 0x56585248; // "VXRH"
+static constexpr uint32_t VXR_UDP_AUDIO_MAGIC = 0x56585241; // "VXRA" (PC -> Quest PCM16 Stereo Audio)
+static constexpr uint32_t VXR_UDP_MIC_MAGIC   = 0x5658524D; // "VXRM" (Quest -> PC PCM16 Mono Mic)
 static constexpr size_t   VXR_UDP_FRAGMENT_STRIDE = 1200;
 
 #pragma pack(push, 1)
+struct VxrUdpAudioHeader {
+    uint32_t magic;          // 0x56585241 ("VXRA") or 0x5658524D ("VXRM")
+    uint32_t seq;
+    uint16_t sample_rate;    // e.g. 24000
+    uint8_t  channels;       // 2 for speaker, 1 for mic
+    uint8_t  flags;
+    uint16_t sample_frames;  // number of PCM16 frames following header
+    uint16_t reserved;
+};
+
 struct VxrUdpVideoFragmentHeader {
     uint32_t magic;          // 0x56585256 ("VXRV")
     uint32_t frame_id;
     uint16_t frag_idx;
     uint16_t frag_count;
-    uint8_t  flags;          // bit 0 = keyframe, bit 1 = intra_refresh
+    uint8_t  flags;          // bit 0 = keyframe, bit 1 = intra_refresh, bit 2 = stereo_vr_mode
     uint8_t  codec_id;
     uint16_t payload_len;
     uint64_t pts_us;
@@ -101,6 +113,7 @@ struct ReassembledVideoFrame {
     uint64_t pts_us;
     bool     is_keyframe;
     bool     is_intra_refresh;
+    bool     is_stereo_vr;
     uint8_t  codec_id;
     float    cursor_norm_x;
     float    cursor_norm_y;
@@ -169,6 +182,10 @@ public:
     bool SendLaunchSteamVr();
     bool SendSwitchMonitor();
     bool SendVrTrackingState(const VxrControlTrackingPacket& trackingPkt);
+    bool SendVirtualKeyInput(uint8_t vkCode, uint8_t keyFlags = 0x03);
+    void PollAndSendMicrophone(bool micEnabled, uint32_t micVolumePct = 80);
+    void SetAudioMuted(bool muted) { m_audioMuted = muted; }
+    bool IsAudioMuted() const { return m_audioMuted; }
 
     bool IsInitialized() const { return m_initialized; }
     bool IsConnected() const { return m_connected; }
@@ -202,10 +219,17 @@ private:
     bool SendControlPacketInternal(const VxrClientControlPacket& pkt);
     bool HandleIncomingControlOrBeaconPacket(const uint8_t* rxBuf, size_t len, const char* senderIp);
     void RecordHostArrivalTiming();
+    void InitAndroidAudioStreams();
+    void CleanupAndroidAudioStreams();
 
     bool m_initialized;
     bool m_connected;
     bool m_userRequestedConnect;
+    bool m_audioMuted;
+    void* m_aaudioLib;
+    void* m_aaudioPlayStream;
+    void* m_aaudioMicStream;
+    uint32_t m_micSeq;
     uint16_t m_streamPort;
     uint16_t m_beaconPort;
     uint16_t m_mdnsPort;

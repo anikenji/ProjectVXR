@@ -25,8 +25,51 @@ static constexpr VxrRawSocket VXR_INVALID_SOCK = INVALID_SOCKET;
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#ifdef __ANDROID__
+#include <dlfcn.h>
+#endif
 typedef int VxrRawSocket;
 static constexpr VxrRawSocket VXR_INVALID_SOCK = static_cast<VxrRawSocket>(-1);
+#endif
+
+#ifdef __ANDROID__
+// Dynamic Android AAudio function pointers (libaaudio.so) for 24kHz low-latency Speaker & Mic streaming
+typedef struct AAudioStreamStruct AAudioStream;
+typedef struct AAudioStreamBuilderStruct AAudioStreamBuilder;
+typedef int32_t aaudio_result_t;
+typedef int32_t aaudio_direction_t;
+typedef int32_t aaudio_format_t;
+typedef int32_t aaudio_performance_mode_t;
+
+typedef aaudio_result_t (*PFN_AAudio_createStreamBuilder)(AAudioStreamBuilder** builder);
+typedef void (*PFN_AAudioStreamBuilder_setDirection)(AAudioStreamBuilder* builder, aaudio_direction_t direction);
+typedef void (*PFN_AAudioStreamBuilder_setSampleRate)(AAudioStreamBuilder* builder, int32_t sampleRate);
+typedef void (*PFN_AAudioStreamBuilder_setChannelCount)(AAudioStreamBuilder* builder, int32_t channelCount);
+typedef void (*PFN_AAudioStreamBuilder_setFormat)(AAudioStreamBuilder* builder, aaudio_format_t format);
+typedef void (*PFN_AAudioStreamBuilder_setPerformanceMode)(AAudioStreamBuilder* builder, aaudio_performance_mode_t mode);
+typedef void (*PFN_AAudioStreamBuilder_setBufferCapacityInFrames)(AAudioStreamBuilder* builder, int32_t numFrames);
+typedef aaudio_result_t (*PFN_AAudioStreamBuilder_openStream)(AAudioStreamBuilder* builder, AAudioStream** stream);
+typedef aaudio_result_t (*PFN_AAudioStreamBuilder_delete)(AAudioStreamBuilder* builder);
+typedef aaudio_result_t (*PFN_AAudioStream_requestStart)(AAudioStream* stream);
+typedef aaudio_result_t (*PFN_AAudioStream_requestStop)(AAudioStream* stream);
+typedef aaudio_result_t (*PFN_AAudioStream_close)(AAudioStream* stream);
+typedef aaudio_result_t (*PFN_AAudioStream_write)(AAudioStream* stream, const void* buffer, int32_t numFrames, int64_t timeoutNanoseconds);
+typedef aaudio_result_t (*PFN_AAudioStream_read)(AAudioStream* stream, void* buffer, int32_t numFrames, int64_t timeoutNanoseconds);
+
+static PFN_AAudio_createStreamBuilder              pfn_AAudio_createStreamBuilder = nullptr;
+static PFN_AAudioStreamBuilder_setDirection        pfn_AAudioStreamBuilder_setDirection = nullptr;
+static PFN_AAudioStreamBuilder_setSampleRate       pfn_AAudioStreamBuilder_setSampleRate = nullptr;
+static PFN_AAudioStreamBuilder_setChannelCount     pfn_AAudioStreamBuilder_setChannelCount = nullptr;
+static PFN_AAudioStreamBuilder_setFormat           pfn_AAudioStreamBuilder_setFormat = nullptr;
+static PFN_AAudioStreamBuilder_setPerformanceMode  pfn_AAudioStreamBuilder_setPerformanceMode = nullptr;
+static PFN_AAudioStreamBuilder_setBufferCapacityInFrames pfn_AAudioStreamBuilder_setBufferCapacity = nullptr;
+static PFN_AAudioStreamBuilder_openStream          pfn_AAudioStreamBuilder_openStream = nullptr;
+static PFN_AAudioStreamBuilder_delete              pfn_AAudioStreamBuilder_delete = nullptr;
+static PFN_AAudioStream_requestStart               pfn_AAudioStream_requestStart = nullptr;
+static PFN_AAudioStream_requestStop                pfn_AAudioStream_requestStop = nullptr;
+static PFN_AAudioStream_close                       pfn_AAudioStream_close = nullptr;
+static PFN_AAudioStream_write                       pfn_AAudioStream_write = nullptr;
+static PFN_AAudioStream_read                        pfn_AAudioStream_read = nullptr;
 #endif
 
 namespace vxr {
@@ -64,6 +107,11 @@ VxrClientNetwork::VxrClientNetwork()
     : m_initialized(false)
     , m_connected(false)
     , m_userRequestedConnect(false)
+    , m_audioMuted(false)
+    , m_aaudioLib(nullptr)
+    , m_aaudioPlayStream(nullptr)
+    , m_aaudioMicStream(nullptr)
+    , m_micSeq(1)
     , m_streamPort(38810)
     , m_beaconPort(38811)
     , m_mdnsPort(5353)
@@ -219,6 +267,8 @@ bool VxrClientNetwork::Initialize(uint16_t streamPort, uint16_t mdnsPort) {
     m_pendingFrames.clear();
     m_pendingFrameOrder.clear();
 
+    InitAndroidAudioStreams();
+
     std::cout << "[VXR-Net] Initialized Quest UDP Network Client (localIp=" << m_localWifiIp
               << ", subnetBcast=" << m_subnetBroadcastIp
               << ", streamPort=:" << m_streamPort
@@ -227,7 +277,90 @@ bool VxrClientNetwork::Initialize(uint16_t streamPort, uint16_t mdnsPort) {
     return m_initialized;
 }
 
+void VxrClientNetwork::InitAndroidAudioStreams() {
+#ifdef __ANDROID__
+    if (m_aaudioLib) return;
+    m_aaudioLib = dlopen("libaaudio.so", RTLD_NOW);
+    if (!m_aaudioLib) return;
+
+    pfn_AAudio_createStreamBuilder          = reinterpret_cast<PFN_AAudio_createStreamBuilder>(dlsym(m_aaudioLib, "AAudio_createStreamBuilder"));
+    pfn_AAudioStreamBuilder_setDirection    = reinterpret_cast<PFN_AAudioStreamBuilder_setDirection>(dlsym(m_aaudioLib, "AAudioStreamBuilder_setDirection"));
+    pfn_AAudioStreamBuilder_setSampleRate   = reinterpret_cast<PFN_AAudioStreamBuilder_setSampleRate>(dlsym(m_aaudioLib, "AAudioStreamBuilder_setSampleRate"));
+    pfn_AAudioStreamBuilder_setChannelCount = reinterpret_cast<PFN_AAudioStreamBuilder_setChannelCount>(dlsym(m_aaudioLib, "AAudioStreamBuilder_setChannelCount"));
+    pfn_AAudioStreamBuilder_setFormat       = reinterpret_cast<PFN_AAudioStreamBuilder_setFormat>(dlsym(m_aaudioLib, "AAudioStreamBuilder_setFormat"));
+    pfn_AAudioStreamBuilder_setPerformanceMode = reinterpret_cast<PFN_AAudioStreamBuilder_setPerformanceMode>(dlsym(m_aaudioLib, "AAudioStreamBuilder_setPerformanceMode"));
+    pfn_AAudioStreamBuilder_setBufferCapacity  = reinterpret_cast<PFN_AAudioStreamBuilder_setBufferCapacityInFrames>(dlsym(m_aaudioLib, "AAudioStreamBuilder_setBufferCapacityInFrames"));
+    pfn_AAudioStreamBuilder_openStream      = reinterpret_cast<PFN_AAudioStreamBuilder_openStream>(dlsym(m_aaudioLib, "AAudioStreamBuilder_openStream"));
+    pfn_AAudioStreamBuilder_delete          = reinterpret_cast<PFN_AAudioStreamBuilder_delete>(dlsym(m_aaudioLib, "AAudioStreamBuilder_delete"));
+    pfn_AAudioStream_requestStart           = reinterpret_cast<PFN_AAudioStream_requestStart>(dlsym(m_aaudioLib, "AAudioStream_requestStart"));
+    pfn_AAudioStream_requestStop            = reinterpret_cast<PFN_AAudioStream_requestStop>(dlsym(m_aaudioLib, "AAudioStream_requestStop"));
+    pfn_AAudioStream_close                  = reinterpret_cast<PFN_AAudioStream_close>(dlsym(m_aaudioLib, "AAudioStream_close"));
+    pfn_AAudioStream_write                  = reinterpret_cast<PFN_AAudioStream_write>(dlsym(m_aaudioLib, "AAudioStream_write"));
+    pfn_AAudioStream_read                   = reinterpret_cast<PFN_AAudioStream_read>(dlsym(m_aaudioLib, "AAudioStream_read"));
+
+    if (!pfn_AAudio_createStreamBuilder || !pfn_AAudioStreamBuilder_openStream || !pfn_AAudioStream_write) {
+        return;
+    }
+
+    // 1. Open Low-Latency Speaker Output Stream (24,000 Hz, Stereo, PCM_I16 = 1, LOW_LATENCY = 12)
+    AAudioStreamBuilder* builder = nullptr;
+    if (pfn_AAudio_createStreamBuilder(&builder) == 0 && builder) {
+        if (pfn_AAudioStreamBuilder_setDirection)    pfn_AAudioStreamBuilder_setDirection(builder, 0); // AAUDIO_DIRECTION_OUTPUT
+        if (pfn_AAudioStreamBuilder_setSampleRate)   pfn_AAudioStreamBuilder_setSampleRate(builder, 24000);
+        if (pfn_AAudioStreamBuilder_setChannelCount) pfn_AAudioStreamBuilder_setChannelCount(builder, 2);
+        if (pfn_AAudioStreamBuilder_setFormat)       pfn_AAudioStreamBuilder_setFormat(builder, 1); // AAUDIO_FORMAT_PCM_I16
+        if (pfn_AAudioStreamBuilder_setPerformanceMode) pfn_AAudioStreamBuilder_setPerformanceMode(builder, 12); // AAUDIO_PERFORMANCE_MODE_LOW_LATENCY
+        if (pfn_AAudioStreamBuilder_setBufferCapacity)  pfn_AAudioStreamBuilder_setBufferCapacity(builder, 4800);
+
+        AAudioStream* outStream = nullptr;
+        if (pfn_AAudioStreamBuilder_openStream(builder, &outStream) == 0 && outStream) {
+            if (pfn_AAudioStream_requestStart) pfn_AAudioStream_requestStart(outStream);
+            m_aaudioPlayStream = outStream;
+        }
+        if (pfn_AAudioStreamBuilder_delete) pfn_AAudioStreamBuilder_delete(builder);
+    }
+
+    // 2. Open Low-Latency Headset Microphone Input Stream (24,000 Hz, Mono, PCM_I16 = 1, LOW_LATENCY = 12)
+    AAudioStreamBuilder* micBuilder = nullptr;
+    if (pfn_AAudio_createStreamBuilder(&micBuilder) == 0 && micBuilder) {
+        if (pfn_AAudioStreamBuilder_setDirection)    pfn_AAudioStreamBuilder_setDirection(micBuilder, 1); // AAUDIO_DIRECTION_INPUT
+        if (pfn_AAudioStreamBuilder_setSampleRate)   pfn_AAudioStreamBuilder_setSampleRate(micBuilder, 24000);
+        if (pfn_AAudioStreamBuilder_setChannelCount) pfn_AAudioStreamBuilder_setChannelCount(micBuilder, 1);
+        if (pfn_AAudioStreamBuilder_setFormat)       pfn_AAudioStreamBuilder_setFormat(micBuilder, 1); // AAUDIO_FORMAT_PCM_I16
+        if (pfn_AAudioStreamBuilder_setPerformanceMode) pfn_AAudioStreamBuilder_setPerformanceMode(micBuilder, 12);
+        if (pfn_AAudioStreamBuilder_setBufferCapacity)  pfn_AAudioStreamBuilder_setBufferCapacity(micBuilder, 4800);
+
+        AAudioStream* inStream = nullptr;
+        if (pfn_AAudioStreamBuilder_openStream(micBuilder, &inStream) == 0 && inStream) {
+            if (pfn_AAudioStream_requestStart) pfn_AAudioStream_requestStart(inStream);
+            m_aaudioMicStream = inStream;
+        }
+        if (pfn_AAudioStreamBuilder_delete) pfn_AAudioStreamBuilder_delete(micBuilder);
+    }
+#endif
+}
+
+void VxrClientNetwork::CleanupAndroidAudioStreams() {
+#ifdef __ANDROID__
+    if (m_aaudioPlayStream) {
+        if (pfn_AAudioStream_requestStop) pfn_AAudioStream_requestStop(reinterpret_cast<AAudioStream*>(m_aaudioPlayStream));
+        if (pfn_AAudioStream_close)       pfn_AAudioStream_close(reinterpret_cast<AAudioStream*>(m_aaudioPlayStream));
+        m_aaudioPlayStream = nullptr;
+    }
+    if (m_aaudioMicStream) {
+        if (pfn_AAudioStream_requestStop) pfn_AAudioStream_requestStop(reinterpret_cast<AAudioStream*>(m_aaudioMicStream));
+        if (pfn_AAudioStream_close)       pfn_AAudioStream_close(reinterpret_cast<AAudioStream*>(m_aaudioMicStream));
+        m_aaudioMicStream = nullptr;
+    }
+    if (m_aaudioLib) {
+        dlclose(m_aaudioLib);
+        m_aaudioLib = nullptr;
+    }
+#endif
+}
+
 void VxrClientNetwork::Cleanup() {
+    CleanupAndroidAudioStreams();
     ClosePlatformSocket(m_udpSock);
     ClosePlatformSocket(m_beaconSock);
     ClosePlatformSocket(m_mdnsSock);
@@ -244,9 +377,20 @@ void VxrClientNetwork::Cleanup() {
 }
 
 void VxrClientNetwork::Disconnect() {
+    // Send explicit Disconnect command (cmd_type = 7) 3 times to the PC Host so it immediately stops streaming!
+    if (!m_connectedHostIp.empty() && m_initialized) {
+        VxrClientControlPacket pkt = {};
+        pkt.magic = VXR_UDP_CTRL_MAGIC;
+        pkt.cmd_type = 7; // VXR_CMD_DISCONNECT
+        for (int i = 0; i < 3; ++i) {
+            SendControlPacketInternal(pkt);
+        }
+    }
     m_connected = false;
     m_userRequestedConnect = false;
     m_connectedHostIp.clear();
+    m_pendingFrames.clear();
+    m_pendingFrameOrder.clear();
 }
 
 void VxrClientNetwork::RecordHostArrivalTiming() {
@@ -295,6 +439,7 @@ bool VxrClientNetwork::ReassembleFrame(const uint8_t* packetData, size_t packetL
                 outFrame->pts_us = hdr->pts_us;
                 outFrame->is_keyframe = (hdr->flags & 0x01) != 0;
                 outFrame->is_intra_refresh = (hdr->flags & 0x02) != 0;
+                outFrame->is_stereo_vr = (hdr->flags & 0x04) != 0;
                 outFrame->codec_id = hdr->codec_id;
                 outFrame->cursor_norm_x = hdr->cursor_norm_x;
                 outFrame->cursor_norm_y = hdr->cursor_norm_y;
@@ -374,6 +519,7 @@ bool VxrClientNetwork::ReassembleFrame(const uint8_t* packetData, size_t packetL
                 outFrame->pts_us = slot.pts_us;
                 outFrame->is_keyframe = (slot.flags & 0x01) != 0;
                 outFrame->is_intra_refresh = (slot.flags & 0x02) != 0;
+                outFrame->is_stereo_vr = (slot.flags & 0x04) != 0;
                 outFrame->codec_id = slot.codec_id;
                 outFrame->cursor_norm_x = slot.cursor_norm_x;
                 outFrame->cursor_norm_y = slot.cursor_norm_y;
@@ -417,10 +563,27 @@ bool VxrClientNetwork::HandleIncomingControlOrBeaconPacket(const uint8_t* rxBuf,
         return false;
     }
 
-    // 1. Check for binary VXR_HOST_INFO_MAGIC (0x56585248 "VXRH")
+    // 1. Check for binary VXR_HOST_INFO_MAGIC (0x56585248 "VXRH") or VXR_UDP_AUDIO_MAGIC (0x56585241 "VXRA")
     if (len >= 4) {
         uint32_t magic = 0;
         std::memcpy(&magic, rxBuf, 4);
+        if (magic == VXR_UDP_AUDIO_MAGIC) {
+            if (m_connected && !m_audioMuted && len > sizeof(VxrUdpAudioHeader)) {
+#ifdef __ANDROID__
+                const VxrUdpAudioHeader* aHdr = reinterpret_cast<const VxrUdpAudioHeader*>(rxBuf);
+                const int16_t* pcmSamples = reinterpret_cast<const int16_t*>(rxBuf + sizeof(VxrUdpAudioHeader));
+                size_t availBytes = len - sizeof(VxrUdpAudioHeader);
+                uint32_t ch = (aHdr->channels > 0) ? aHdr->channels : 2;
+                int32_t framesAvail = static_cast<int32_t>(availBytes / (sizeof(int16_t) * ch));
+                int32_t numFrames = (aHdr->sample_frames > 0 && aHdr->sample_frames <= framesAvail)
+                    ? static_cast<int32_t>(aHdr->sample_frames) : framesAvail;
+                if (m_aaudioPlayStream && pfn_AAudioStream_write && numFrames > 0) {
+                    pfn_AAudioStream_write(reinterpret_cast<AAudioStream*>(m_aaudioPlayStream), pcmSamples, numFrames, 0);
+                }
+#endif
+            }
+            return true;
+        }
         if (magic == VXR_HOST_INFO_MAGIC) {
             uint8_t isHandshakeAck = (len >= 16) ? rxBuf[15] : 0; // wire->reserved == 1 means unicast handshake ACK from PC
             if (isHandshakeAck == 1) {
@@ -529,12 +692,14 @@ bool VxrClientNetwork::PollNetwork(ReassembledVideoFrame* outFrame) {
         }
 
         if (outFrame && ReassembleFrame(rxBuf, static_cast<size_t>(r), outFrame)) {
+            if (!m_userRequestedConnect) {
+                // User has not clicked Connect (or explicitly clicked Disconnect): drop stray in-flight frames!
+                continue;
+            }
             RecordHostArrivalTiming();
-            if (m_userRequestedConnect) {
-                m_connected = true;
-                if (senderIp[0] != '\0' && m_connectedHostIp.empty()) {
-                    m_connectedHostIp = senderIp;
-                }
+            m_connected = true;
+            if (senderIp[0] != '\0' && m_connectedHostIp.empty()) {
+                m_connectedHostIp = senderIp;
             }
             return true;
         }
@@ -654,6 +819,7 @@ bool VxrClientNetwork::SendBroadcastDiscovery(const char* headsetModelName, uint
     discPkt.hdr.magic = VXR_UDP_CTRL_MAGIC; // 0x56585243 ("VXRC")
     discPkt.hdr.cmd_type = 1;               // VXR_CMD_DISCOVER
     discPkt.hdr.reserved[0] = 0x10;         // Native 1920x1080 Full HD capability flag
+    discPkt.hdr.reserved[1] = 0x00;         // 0x00 = Passive Discovery Only (DO NOT auto-connect!)
     const char* model = (headsetModelName && headsetModelName[0] != '\0') ? headsetModelName : "Meta Quest";
     std::strncpy(discPkt.headset_name, model, sizeof(discPkt.headset_name) - 1);
 
@@ -735,6 +901,7 @@ bool VxrClientNetwork::SendDiscoverAndConnect(const char* hostIp, uint16_t port,
     discPkt.hdr.magic = VXR_UDP_CTRL_MAGIC; // 0x56585243 ("VXRC")
     discPkt.hdr.cmd_type = 1;               // VXR_CMD_CONNECT
     discPkt.hdr.reserved[0] = 0x10;         // Native 1920x1080 Full HD capability flag
+    discPkt.hdr.reserved[1] = 0x01;         // 0x01 = Explicit User Connect Request!
     const char* model = (headsetModelName && headsetModelName[0] != '\0') ? headsetModelName : "Meta Quest";
     std::strncpy(discPkt.headset_name, model, sizeof(discPkt.headset_name) - 1);
 
@@ -832,6 +999,72 @@ bool VxrClientNetwork::SendVrTrackingState(const VxrControlTrackingPacket& track
     int sent = sendto(s, reinterpret_cast<const char*>(&trackingPkt), sizeof(trackingPkt), 0,
                       reinterpret_cast<const sockaddr*>(&destAddr), sizeof(destAddr));
     return (sent == static_cast<int>(sizeof(trackingPkt)));
+}
+
+bool VxrClientNetwork::SendVirtualKeyInput(uint8_t vkCode, uint8_t keyFlags) {
+    VxrClientControlPacket pkt = {};
+    pkt.magic = VXR_UDP_CTRL_MAGIC; // 0x56585243 ("VXRC")
+    pkt.cmd_type = 8;               // VXR_CMD_KEYBOARD_INPUT
+    pkt.reserved[0] = vkCode;
+    pkt.reserved[1] = keyFlags;     // 0x01=down, 0x02=up, 0x04=shift, 0x08=ctrl, 0x10=alt
+    return SendControlPacketInternal(pkt);
+}
+
+void VxrClientNetwork::PollAndSendMicrophone(bool micEnabled, uint32_t micVolumePct) {
+#ifdef __ANDROID__
+    if (!m_initialized || !m_connected || !micEnabled || m_connectedHostIp.empty()) {
+        return;
+    }
+    if (!m_aaudioMicStream || !pfn_AAudioStream_read) {
+        return;
+    }
+
+    VxrRawSocket s = static_cast<VxrRawSocket>(m_udpSock);
+    if (s == VXR_INVALID_SOCK) {
+        return;
+    }
+
+    int16_t micPcm[240]; // 10ms of 24kHz mono audio
+    int32_t framesRead = pfn_AAudioStream_read(reinterpret_cast<AAudioStream*>(m_aaudioMicStream), micPcm, 240, 0);
+    if (framesRead <= 0) {
+        return;
+    }
+
+    if (micVolumePct != 100) {
+        int32_t scale = static_cast<int32_t>(micVolumePct);
+        for (int32_t i = 0; i < framesRead; ++i) {
+            int32_t v = (static_cast<int32_t>(micPcm[i]) * scale) / 100;
+            if (v > 32767) v = 32767;
+            if (v < -32768) v = -32768;
+            micPcm[i] = static_cast<int16_t>(v);
+        }
+    }
+
+    uint8_t pktBuf[sizeof(VxrUdpAudioHeader) + sizeof(micPcm)];
+    VxrUdpAudioHeader hdr = {};
+    hdr.magic         = VXR_UDP_MIC_MAGIC; // 0x5658524D ("VXRM")
+    hdr.seq           = m_micSeq++;
+    hdr.sample_rate   = 24000;
+    hdr.channels      = 1;
+    hdr.flags         = 0;
+    hdr.sample_frames = static_cast<uint16_t>(framesRead);
+
+    size_t payloadBytes = static_cast<size_t>(framesRead) * sizeof(int16_t);
+    std::memcpy(pktBuf, &hdr, sizeof(hdr));
+    std::memcpy(pktBuf + sizeof(hdr), micPcm, payloadBytes);
+
+    sockaddr_in destAddr = {};
+    destAddr.sin_family = AF_INET;
+    destAddr.sin_port = htons(m_connectedHostPort);
+    if (inet_pton(AF_INET, m_connectedHostIp.c_str(), &destAddr.sin_addr) == 1) {
+        sendto(s, reinterpret_cast<const char*>(pktBuf),
+               static_cast<int>(sizeof(hdr) + payloadBytes), 0,
+               reinterpret_cast<const sockaddr*>(&destAddr), sizeof(destAddr));
+    }
+#else
+    (void)micEnabled;
+    (void)micVolumePct;
+#endif
 }
 
 } // namespace vxr

@@ -135,6 +135,9 @@ public:
     void SetPassthroughEnabled(bool enabled) { m_passthroughEnabled = enabled; }
     bool IsPassthroughEnabled() const { return m_passthroughEnabled; }
 
+    void SetImmersiveStereoVrMode(bool enabled) { m_immersiveStereoVrMode = enabled; }
+    bool IsImmersiveStereoVrMode() const { return m_immersiveStereoVrMode; }
+
     void TriggerRecenter() { m_recenterHeld = true; }
     float GetScreenCenterY() const { return m_screenCenterY; }
     int GetActiveHand() const { return m_activeHand; }
@@ -171,6 +174,7 @@ private:
     bool m_shouldRenderFrame;
     bool m_fbRenderModelSupported;
     bool m_passthroughEnabled;
+    bool m_immersiveStereoVrMode;
     OpenXrSessionState m_sessionState;
     uint64_t m_frameIndex;
     uint64_t m_lastPredictedDisplayTimeNs;
