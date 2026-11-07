@@ -93,32 +93,29 @@ VxrCaptureStatus DxgiDuplicator::CreateD3DDevice(IDXGIAdapter* adapter) {
 }
 
 VxrCaptureStatus DxgiDuplicator::CreateDuplication(IDXGIOutput* output) {
-    HRESULT hr = E_FAIL;
-
-    ComPtr<IDXGIOutput5> output5;
-    if (SUCCEEDED(output->QueryInterface(__uuidof(IDXGIOutput5), &output5)) && output5) {
-        const DXGI_FORMAT supportedFormats[] = {
-            DXGI_FORMAT_B8G8R8A8_UNORM,
-            DXGI_FORMAT_R8G8B8A8_UNORM,
-            DXGI_FORMAT_R16G16B16A16_FLOAT
-        };
-        hr = output5->DuplicateOutput1(
-            m_device.Get(),
-            0,
-            ARRAYSIZE(supportedFormats),
-            supportedFormats,
-            &m_duplication
-        );
+    ComPtr<IDXGIOutput1> output1;
+    HRESULT hr = output->QueryInterface(__uuidof(IDXGIOutput1), &output1);
+    if (FAILED(hr)) {
+        std::cerr << "[VXR-Capture] QueryInterface IDXGIOutput1 failed: 0x" << std::hex << hr << std::endl;
+        return VXR_CAPTURE_D3D_ERROR;
     }
 
-    if (FAILED(hr) || !m_duplication) {
-        ComPtr<IDXGIOutput1> output1;
-        hr = output->QueryInterface(__uuidof(IDXGIOutput1), &output1);
-        if (FAILED(hr)) {
-            std::cerr << "[VXR-Capture] QueryInterface IDXGIOutput1 failed: 0x" << std::hex << hr << std::endl;
-            return VXR_CAPTURE_D3D_ERROR;
+    hr = output1->DuplicateOutput(m_device.Get(), &m_duplication);
+    if (FAILED(hr) && hr != E_ACCESSDENIED) {
+        ComPtr<IDXGIOutput5> output5;
+        if (SUCCEEDED(output->QueryInterface(__uuidof(IDXGIOutput5), &output5)) && output5) {
+            const DXGI_FORMAT supportedFormats[] = {
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                DXGI_FORMAT_R8G8B8A8_UNORM
+            };
+            hr = output5->DuplicateOutput1(
+                m_device.Get(),
+                0,
+                ARRAYSIZE(supportedFormats),
+                supportedFormats,
+                &m_duplication
+            );
         }
-        hr = output1->DuplicateOutput(m_device.Get(), &m_duplication);
     }
 
     if (FAILED(hr)) {
@@ -297,16 +294,22 @@ VxrCaptureStatus DxgiDuplicator::AcquireFrame(uint32_t timeoutMs, VxrCapturedFra
 
     m_frameAcquired = true;
 
-    ComPtr<ID3D11Texture2D> acquiredTexture;
-    hr = desktopResource.As(&acquiredTexture);
-    if (FAILED(hr)) {
-        ReleaseFrame();
-        return VXR_CAPTURE_D3D_ERROR;
-    }
+    // Per Microsoft IDXGIOutputDuplication::AcquireNextFrame specification:
+    // If LastPresentTime.QuadPart == 0, ONLY the mouse cursor moved and desktopResource is empty/black!
+    // Never copy desktopResource into m_sharedTexture / m_stagingTexture when LastPresentTime == 0.
+    bool hasDesktopImageUpdate = (frameInfo.LastPresentTime.QuadPart > 0);
+    if (hasDesktopImageUpdate && desktopResource) {
+        ComPtr<ID3D11Texture2D> acquiredTexture;
+        hr = desktopResource.As(&acquiredTexture);
+        if (FAILED(hr) || !acquiredTexture) {
+            ReleaseFrame();
+            return VXR_CAPTURE_D3D_ERROR;
+        }
 
-    m_context->CopyResource(m_sharedTexture.Get(), acquiredTexture.Get());
-    if (m_stagingTexture) {
-        m_context->CopyResource(m_stagingTexture.Get(), acquiredTexture.Get());
+        m_context->CopyResource(m_sharedTexture.Get(), acquiredTexture.Get());
+        if (m_stagingTexture) {
+            m_context->CopyResource(m_stagingTexture.Get(), acquiredTexture.Get());
+        }
     }
 
     if (outFrame) {
@@ -314,7 +317,7 @@ VxrCaptureStatus DxgiDuplicator::AcquireFrame(uint32_t timeoutMs, VxrCapturedFra
         outFrame->shared_handle = m_sharedHandle;
         outFrame->present_time_qpc = frameInfo.LastPresentTime.QuadPart;
         outFrame->accumulated_frames = frameInfo.AccumulatedFrames;
-        outFrame->has_new_frame = (frameInfo.AccumulatedFrames > 0 || frameInfo.LastPresentTime.QuadPart > 0) ? 1 : 0;
+        outFrame->has_new_frame = hasDesktopImageUpdate ? 1 : 0;
 
         outFrame->cursor.visible = frameInfo.PointerPosition.Visible ? 1 : 0;
         outFrame->cursor.x = frameInfo.PointerPosition.Position.x;
@@ -354,24 +357,21 @@ bool DxgiDuplicator::CaptureScaledBgra(uint32_t dstWidth, uint32_t dstHeight, ui
     if (outHasNewFrame) *outHasNewFrame = false;
 
     if (!m_initialized) {
-        if (Reinitialize() != VXR_CAPTURE_OK) {
-            return false;
-        }
+        return false;
     }
 
     VxrCapturedFrame capFrame = {};
     uint32_t timeoutMs = m_hasValidStagingFrame ? 2 : 16;
     VxrCaptureStatus status = AcquireFrame(timeoutMs, &capFrame);
     if (status == VXR_CAPTURE_ACCESS_LOST || status == VXR_CAPTURE_DEVICE_RESET) {
-        if (Reinitialize() == VXR_CAPTURE_OK) {
-            status = AcquireFrame(16, &capFrame);
-        }
+        Cleanup();
+        return false;
     }
 
     if (status == VXR_CAPTURE_OK) {
         ReleaseFrame();
 
-        if (m_stagingTexture && m_desc.width > 0 && m_desc.height > 0) {
+        if (capFrame.has_new_frame && m_stagingTexture && m_desc.width > 0 && m_desc.height > 0) {
             D3D11_MAPPED_SUBRESOURCE mapped = {};
             HRESULT mapHr = m_context->Map(m_stagingTexture.Get(), 0, D3D11_MAP_READ, 0, &mapped);
             if (SUCCEEDED(mapHr) && mapped.pData != nullptr) {
@@ -379,6 +379,22 @@ bool DxgiDuplicator::CaptureScaledBgra(uint32_t dstWidth, uint32_t dstHeight, ui
                 const uint32_t srcH = m_desc.height;
                 const uint32_t srcPitchPixels = mapped.RowPitch / 4;
                 const uint32_t* srcBase = static_cast<const uint32_t*>(mapped.pData);
+
+                // Verify the DXGI staging surface actually contains non-zero desktop pixels
+                uint32_t nonZeroSamples = 0;
+                for (uint32_t sy = srcH / 8; sy < srcH; sy += srcH / 4) {
+                    const uint32_t* sRow = srcBase + (size_t)sy * srcPitchPixels;
+                    for (uint32_t sx = srcW / 8; sx < srcW; sx += srcW / 4) {
+                        if ((sRow[sx] & 0x00FFFFFFu) != 0) {
+                            nonZeroSamples++;
+                        }
+                    }
+                }
+
+                if (nonZeroSamples == 0) {
+                    m_context->Unmap(m_stagingTexture.Get(), 0);
+                    return false;
+                }
 
                 if (m_cachedScaledBgra.size() != (size_t)dstWidth * dstHeight) {
                     m_cachedScaledBgra.resize((size_t)dstWidth * dstHeight);

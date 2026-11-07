@@ -1044,6 +1044,7 @@ static void HostServiceThreadProc() {
         VXR_STEAMVR_SHM_NAME
     );
     VxrSteamVrSharedState* pSteamVrShm = nullptr;
+    const DWORD myPid = GetCurrentProcessId();
     if (hSteamVrShm) {
         pSteamVrShm = reinterpret_cast<VxrSteamVrSharedState*>(
             MapViewOfFile(hSteamVrShm, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(VxrSteamVrSharedState))
@@ -1051,8 +1052,8 @@ static void HostServiceThreadProc() {
         if (pSteamVrShm) {
             memset(pSteamVrShm, 0, sizeof(VxrSteamVrSharedState));
             pSteamVrShm->magic = VXR_STEAMVR_SHM_MAGIC;
-            pSteamVrShm->version = 1;
-            pSteamVrShm->headset_connected = 0; // Only set to 1 when Quest is actively connected to Project VXR!
+            pSteamVrShm->version = (uint32_t)myPid; // Active instance PID for single-instance enforcement
+            pSteamVrShm->headset_connected = 0;     // Only set to 1 when Quest is actively connected to Project VXR!
             pSteamVrShm->controllers_connected[0] = 0;
             pSteamVrShm->controllers_connected[1] = 0;
             pSteamVrShm->last_update_tick_ms = GetTickCount64();
@@ -1078,8 +1079,7 @@ static void HostServiceThreadProc() {
         }
     }
 
-    // Auto-register our OpenVR driver ("drivers\openvr") with SteamVR's vrpathreg.exe
-    auto registerSteamVrDriver = []() {
+    auto runVrPathReg = [](const wchar_t* verb) {
         wchar_t cwdBuf[MAX_PATH] = {};
         GetCurrentDirectoryW(MAX_PATH, cwdBuf);
         std::wstring driverDir = std::wstring(cwdBuf) + L"\\drivers\\openvr";
@@ -1089,7 +1089,7 @@ static void HostServiceThreadProc() {
                 L"D:\\SteamLibrary\\steamapps\\common\\SteamVR\\bin\\win64\\vrpathreg.exe",
                 L"E:\\SteamLibrary\\steamapps\\common\\SteamVR\\bin\\win64\\vrpathreg.exe"
             };
-            std::wstring args = L"adddriver \"" + driverDir + L"\"";
+            std::wstring args = std::wstring(verb) + L" \"" + driverDir + L"\"";
             for (const wchar_t* vrpathExe : vrpathCandidates) {
                 if (GetFileAttributesW(vrpathExe) != INVALID_FILE_ATTRIBUTES) {
                     ShellExecuteW(nullptr, L"open", vrpathExe, args.c_str(), nullptr, SW_HIDE);
@@ -1098,7 +1098,43 @@ static void HostServiceThreadProc() {
             }
         }
     };
-    registerSteamVrDriver();
+
+    auto ensureSteamVrChaperone = []() {
+        const wchar_t* chapPath = L"C:\\Program Files (x86)\\Steam\\config\\chaperone_info.vrchap";
+        if (GetFileAttributesW(chapPath) == INVALID_FILE_ATTRIBUTES) {
+            std::ofstream out(chapPath);
+            if (out.is_open()) {
+                out << "{\n"
+                    << "   \"jsonid\" : \"chaperone_info\",\n"
+                    << "   \"universes\" : [\n"
+                    << "      {\n"
+                    << "         \"collision_bounds\" : [\n"
+                    << "            [ [ -1.5, 0.0, -1.5 ], [ -1.5, 2.4, -1.5 ], [ -1.5, 2.4, 1.5 ], [ -1.5, 0.0, 1.5 ] ],\n"
+                    << "            [ [ -1.5, 0.0, 1.5 ], [ -1.5, 2.4, 1.5 ], [ 1.5, 2.4, 1.5 ], [ 1.5, 0.0, 1.5 ] ],\n"
+                    << "            [ [ 1.5, 0.0, 1.5 ], [ 1.5, 2.4, 1.5 ], [ 1.5, 2.4, -1.5 ], [ 1.5, 0.0, -1.5 ] ],\n"
+                    << "            [ [ 1.5, 0.0, -1.5 ], [ 1.5, 2.4, -1.5 ], [ -1.5, 2.4, -1.5 ], [ -1.5, 0.0, -1.5 ] ]\n"
+                    << "         ],\n"
+                    << "         \"play_area\" : [ 2.0, 2.0 ],\n"
+                    << "         \"seated\" : {\n"
+                    << "            \"translation\" : [ 0.0, 0.0, 0.0 ],\n"
+                    << "            \"yaw\" : 0.0\n"
+                    << "         },\n"
+                    << "         \"standing\" : {\n"
+                    << "            \"translation\" : [ 0.0, 0.0, 0.0 ],\n"
+                    << "            \"yaw\" : 0.0\n"
+                    << "         },\n"
+                    << "         \"time\" : \"Sat Nov 07 17:00:00 2026\",\n"
+                    << "         \"universeID\" : \"1\"\n"
+                    << "      }\n"
+                    << "   ],\n"
+                    << "   \"version\" : 5\n"
+                    << "}\n";
+            }
+        }
+    };
+
+    // Unregister driver_vxr at startup so Virtual Desktop & other VR streamers are NEVER hijacked when VXR is idle!
+    runVrPathReg(L"removedriver");
 
     g_svc.hIddCxDll = LoadLibraryW(L"VxrIddCx.dll");
     g_svc.iddcxDllLoaded = (g_svc.hIddCxDll != nullptr);
@@ -1271,6 +1307,12 @@ static void HostServiceThreadProc() {
 
     ULONGLONG lastBeaconTick = 0;
     while (!g_svc.stopRequested) {
+        // Single-instance check: if a newer ProjectVXR.exe process wrote its PID to pSteamVrShm->version, exit immediately!
+        if (pSteamVrShm && pSteamVrShm->version != 0 && pSteamVrShm->version != (uint32_t)myPid) {
+            g_svc.stopRequested = true;
+            if (g_hwnd) PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+            break;
+        }
         ULONGLONG now = GetTickCount64();
 
         if (g_svc.switchMonitorRequested.exchange(false)) {
@@ -1297,6 +1339,7 @@ static void HostServiceThreadProc() {
                 pSteamVrShm->controllers_connected[0] = 0;
                 pSteamVrShm->controllers_connected[1] = 0;
             }
+            runVrPathReg(L"removedriver");
             wifiOptimizer.UnlockBackgroundScan();
             {
                 std::lock_guard<std::mutex> lock(g_svc.statusMutex);
@@ -1417,14 +1460,12 @@ static void HostServiceThreadProc() {
                     int r = recvfrom(activeSock, rxBuf, sizeof(rxBuf), 0, (sockaddr*)&clientAddr, &clientLen);
                     if (r <= 0) break;
 
-                // Filter out our own local broadcast echoes on port 38810
-                if (r == (int)sizeof(VxrHostInfoPacket)) {
-                    const VxrHostInfoPacket* maybeHost = reinterpret_cast<const VxrHostInfoPacket*>(rxBuf);
-                    if (maybeHost->magic == VXR_HOST_INFO_MAGIC) {
-                        continue;
-                    }
+                // Filter out our own local broadcast echoes and any non-ProjectVXR UDP traffic (e.g. Virtual Desktop)
+                if (r < (int)sizeof(VxrControlHeader)) {
+                    continue;
                 }
-                if (r >= 16 && memcmp(rxBuf, "VXR_MDNS_BEACON:", 16) == 0) {
+                const VxrControlHeader* checkHdr = reinterpret_cast<const VxrControlHeader*>(rxBuf);
+                if (checkHdr->magic != VXR_UDP_CTRL_MAGIC) {
                     continue;
                 }
 
@@ -1658,11 +1699,13 @@ static void HostServiceThreadProc() {
                             ShowToast(toastBuf);
                         }
                         else if (cmd == VXR_CMD_LAUNCH_STEAMVR) {
-                            registerSteamVrDriver();
+                            ensureSteamVrChaperone();
+                            runVrPathReg(L"adddriver");
                             if (pSteamVrShm) {
                                 pSteamVrShm->headset_connected = 1;
                                 pSteamVrShm->last_update_tick_ms = now;
                             }
+                            Sleep(150);
                             ShellExecuteW(nullptr, L"open", L"steam://rungameid/250820", nullptr, nullptr, SW_SHOWNORMAL);
                             ShowToast(L"Launching SteamVR (steam://rungameid/250820) with VXR OpenVR Driver...");
                         }
@@ -1710,86 +1753,15 @@ static void HostServiceThreadProc() {
             }
         }
 
-        // Live Capture -> Encode -> UDP Pacing Pipeline
-        if (g_svc.encoderHandle && pfn_encoder_encode) {
-            void* texToEncode = dxgiDupl.GetDevice() ? dxgiDupl.GetDevice() : static_cast<void*>(pD3DDevice);
-            if (capInit) {
-                VxrCapturedFrame capFrame = {};
-                if (dxgiDupl.AcquireFrame(0, &capFrame) == VXR_CAPTURE_OK && capFrame.d3d11_texture) {
-                    texToEncode = capFrame.d3d11_texture;
-                }
-            }
-
-            VxrBitstreamFrame frame = {};
-            LARGE_INTEGER encStartQpc = {}, encEndQpc = {};
-            QueryPerformanceCounter(&encStartQpc);
-            if (pfn_encoder_encode(g_svc.encoderHandle, texToEncode, now * 1000ULL, 0, &frame)) {
-                QueryPerformanceCounter(&encEndQpc);
-                if (qpcFreq.QuadPart > 0) {
-                    double encMs = (double)(encEndQpc.QuadPart - encStartQpc.QuadPart) * 1000.0 / (double)qpcFreq.QuadPart;
-                    smoothedEncodeMs = smoothedEncodeMs * 0.90 + (std::max)(0.4, encMs) * 0.10;
-                }
-                g_svc.framesEncoded++;
-                // Stream packet over UDP socket to connected Quest headset using MTU Packet Fragmentation
-                if (hasActiveClient && frame.data && frame.size > 0) {
-                    POINT curPt = { 0, 0 };
-                    BOOL curOk = GetCursorPos(&curPt);
-                    int scrW = (std::max)(1, GetSystemMetrics(SM_CXSCREEN));
-                    int scrH = (std::max)(1, GetSystemMetrics(SM_CYSCREEN));
-                    float normX = (std::max)(0.0f, (std::min)(1.0f, (float)curPt.x / (float)scrW));
-                    float normY = (std::max)(0.0f, (std::min)(1.0f, (float)curPt.y / (float)scrH));
-
-                    const size_t kMaxPayloadBytes = 1200;
-                    uint16_t fragCount = (uint16_t)((frame.size + kMaxPayloadBytes - 1) / kMaxPayloadBytes);
-                    if (fragCount == 0) fragCount = 1;
-
-                    uint8_t pktFlags = 0;
-                    if (frame.is_keyframe)      pktFlags |= (1 << 0);
-                    if (frame.is_intra_refresh) pktFlags |= (1 << 1);
-
-                    uint8_t pktBuf[sizeof(VxrUdpVideoFragmentHeader) + 1200];
-                    for (uint16_t fragIdx = 0; fragIdx < fragCount; ++fragIdx) {
-                        size_t offset = (size_t)fragIdx * kMaxPayloadBytes;
-                        size_t rem = frame.size - offset;
-                        uint16_t chunkLen = (uint16_t)((rem > kMaxPayloadBytes) ? kMaxPayloadBytes : rem);
-
-                        VxrUdpVideoFragmentHeader hdr = {};
-                        hdr.magic          = VXR_UDP_VIDEO_MAGIC;
-                        hdr.frame_id       = frame.frame_index;
-                        hdr.frag_idx       = fragIdx;
-                        hdr.frag_count     = fragCount;
-                        hdr.flags          = pktFlags;
-                        hdr.codec_id       = (uint8_t)frame.codec_id;
-                        hdr.payload_len    = chunkLen;
-                        hdr.pts_us         = frame.pts_us;
-                        hdr.cursor_norm_x  = normX;
-                        hdr.cursor_norm_y  = normY;
-                        hdr.cursor_visible = curOk ? 1 : 0;
-
-                        memcpy(pktBuf, &hdr, sizeof(hdr));
-                        memcpy(pktBuf + sizeof(hdr), frame.data + offset, chunkLen);
-
-                        sendto(g_svc.udpSocket, reinterpret_cast<const char*>(pktBuf),
-                               (int)(sizeof(hdr) + chunkLen), 0,
-                               (sockaddr*)&lastActiveClient, sizeof(lastActiveClient));
-
-                        if ((fragIdx % 8) == 7) {
-                            SwitchToThread();
-                        }
-                    }
-                }
-            }
-
-            if (capInit) {
-                dxgiDupl.ReleaseFrame();
-            }
-        }
-
         // Real Live GPU DXGI Desktop Capture (1280x800 1:1 Native + CAS Sharpening) & 90Hz Delta-RLE Strip Streamer
         if (hasActiveClient) {
             int scrW = (std::max)(1, GetSystemMetrics(SM_CXSCREEN));
             int scrH = (std::max)(1, GetSystemMetrics(SM_CYSCREEN));
-            if (!capInit && (now - lastDxgiRetryTick >= 2000)) {
+            if (capInit && !dxgiDupl.IsInitialized()) {
+                capInit = false;
+                lastDxgiRetryTick = now;
+            }
+            if (!capInit && (now - lastDxgiRetryTick >= 15000)) {
                 lastDxgiRetryTick = now;
                 capInit = (dxgiDupl.Initialize(0, currentOutputIdx) == VXR_CAPTURE_OK);
             }
@@ -1797,74 +1769,90 @@ static void HostServiceThreadProc() {
             bool hasNewDxgiFrame = false;
             if (capInit) {
                 capturedDxgi = dxgiDupl.CaptureScaledBgra((uint32_t)kLiveW, (uint32_t)kLiveH, currLiveBgra.data(), &hasNewDxgiFrame);
+                if (!dxgiDupl.IsInitialized()) {
+                    capInit = false;
+                    lastDxgiRetryTick = now;
+                }
             }
             if (!capturedDxgi && hCaptureDC && pLiveBits) {
                 if (now - lastGdiCaptureTick >= 11) {
                     lastGdiCaptureTick = now;
                     // Fast 1:1 DMA BitBlt of true physical screen resolution (no GDI StretchBlt blur!)
-                    BitBlt(hCaptureDC, 0, 0, physW, physH, hScreenDC, 0, 0, SRCCOPY);
-                    const uint32_t* srcBase = reinterpret_cast<const uint32_t*>(pLiveBits);
-                    const uint32_t srcW = (uint32_t)physW;
-                    const uint32_t srcH = (uint32_t)physH;
-                    const uint32_t dstW = (uint32_t)kLiveW;
-                    const uint32_t dstH = (uint32_t)kLiveH;
-                    const uint32_t scaleX_fp16 = (srcW << 16) / dstW;
-                    const uint32_t scaleY_fp16 = (srcH << 16) / dstH;
+                    if (BitBlt(hCaptureDC, 0, 0, physW, physH, hScreenDC, 0, 0, SRCCOPY)) {
+                        const uint32_t* srcBase = reinterpret_cast<const uint32_t*>(pLiveBits);
+                        const uint32_t srcW = (uint32_t)physW;
+                        const uint32_t srcH = (uint32_t)physH;
+                        const uint32_t dstW = (uint32_t)kLiveW;
+                        const uint32_t dstH = (uint32_t)kLiveH;
 
-                    for (uint32_t dy = 0; dy < dstH; ++dy) {
-                        uint32_t sy_fp = dy * scaleY_fp16;
-                        uint32_t sy0 = sy_fp >> 16;
-                        uint32_t sy1 = (sy0 + 1 < srcH) ? (sy0 + 1) : sy0;
-                        uint32_t wy = (sy_fp >> 8) & 0xFFu;
-                        uint32_t iwy = 256u - wy;
-                        const uint32_t* row0 = srcBase + (size_t)sy0 * srcW;
-                        const uint32_t* row1 = srcBase + (size_t)sy1 * srcW;
-                        uint32_t* dstRow = bilinearTempBgra.data() + (size_t)dy * dstW;
-
-                        for (uint32_t dx = 0; dx < dstW; ++dx) {
-                            uint32_t sx_fp = dx * scaleX_fp16;
-                            uint32_t sx0 = sx_fp >> 16;
-                            uint32_t sx1 = (sx0 + 1 < srcW) ? (sx0 + 1) : sx0;
-                            uint32_t wx = (sx_fp >> 8) & 0xFFu;
-                            uint32_t iwx = 256u - wx;
-                            uint32_t w00 = iwx * iwy;
-                            uint32_t w10 = wx  * iwy;
-                            uint32_t w01 = iwx * wy;
-                            uint32_t w11 = wx  * wy;
-
-                            uint32_t p00 = row0[sx0], p10 = row0[sx1], p01 = row1[sx0], p11 = row1[sx1];
-                            uint32_t b = (((p00 & 0xFFu) * w00 + (p10 & 0xFFu) * w10 + (p01 & 0xFFu) * w01 + (p11 & 0xFFu) * w11) >> 16);
-                            uint32_t g = ((((p00 >> 8) & 0xFFu) * w00 + ((p10 >> 8) & 0xFFu) * w10 + ((p01 >> 8) & 0xFFu) * w01 + ((p11 >> 8) & 0xFFu) * w11) >> 16);
-                            uint32_t r = ((((p00 >> 16) & 0xFFu) * w00 + ((p10 >> 16) & 0xFFu) * w10 + ((p01 >> 16) & 0xFFu) * w01 + ((p11 >> 16) & 0xFFu) * w11) >> 16);
-                            dstRow[dx] = 0xFF000000u | (r << 16) | (g << 8) | b;
+                        uint32_t nonZeroGdi = 0;
+                        for (uint32_t sy = srcH / 8; sy < srcH; sy += srcH / 4) {
+                            const uint32_t* sRow = srcBase + (size_t)sy * srcW;
+                            for (uint32_t sx = srcW / 8; sx < srcW; sx += srcW / 4) {
+                                if ((sRow[sx] & 0x00FFFFFFu) != 0) nonZeroGdi++;
+                            }
                         }
-                    }
 
-                    // Contrast-Adaptive Sharpening (CAS) unsharp pass on 1280x800
-                    memcpy(currLiveBgra.data(), bilinearTempBgra.data(), dstW * sizeof(uint32_t));
-                    memcpy(currLiveBgra.data() + (size_t)(dstH - 1) * dstW,
-                           bilinearTempBgra.data() + (size_t)(dstH - 1) * dstW,
-                           dstW * sizeof(uint32_t));
-                    for (uint32_t y = 1; y + 1 < dstH; ++y) {
-                        const uint32_t* rPrev = bilinearTempBgra.data() + (size_t)(y - 1) * dstW;
-                        const uint32_t* rCurr = bilinearTempBgra.data() + (size_t)y * dstW;
-                        const uint32_t* rNext = bilinearTempBgra.data() + (size_t)(y + 1) * dstW;
-                        uint32_t* rOut = currLiveBgra.data() + (size_t)y * dstW;
-                        rOut[0] = rCurr[0];
-                        rOut[dstW - 1] = rCurr[dstW - 1];
-                        for (uint32_t x = 1; x + 1 < dstW; ++x) {
-                            uint32_t c = rCurr[x], n = rPrev[x], s = rNext[x], w = rCurr[x - 1], e = rCurr[x + 1];
-                            int cb = (int)(c & 0xFFu), cg = (int)((c >> 8) & 0xFFu), cr = (int)((c >> 16) & 0xFFu);
-                            int sumB = (int)(n & 0xFFu) + (int)(s & 0xFFu) + (int)(w & 0xFFu) + (int)(e & 0xFFu);
-                            int sumG = (int)((n >> 8) & 0xFFu) + (int)((s >> 8) & 0xFFu) + (int)((w >> 8) & 0xFFu) + (int)((e >> 8) & 0xFFu);
-                            int sumR = (int)((n >> 16) & 0xFFu) + (int)((s >> 16) & 0xFFu) + (int)((w >> 16) & 0xFFu) + (int)((e >> 16) & 0xFFu);
-                            int ob = cb + (((4 * cb - sumB) * 3) >> 5);
-                            int og = cg + (((4 * cg - sumG) * 3) >> 5);
-                            int or_ = cr + (((4 * cr - sumR) * 3) >> 5);
-                            if (ob < 0) ob = 0; else if (ob > 255) ob = 255;
-                            if (og < 0) og = 0; else if (og > 255) og = 255;
-                            if (or_ < 0) or_ = 0; else if (or_ > 255) or_ = 255;
-                            rOut[x] = 0xFF000000u | ((uint32_t)or_ << 16) | ((uint32_t)og << 8) | (uint32_t)ob;
+                        if (nonZeroGdi > 0) {
+                            const uint32_t scaleX_fp16 = (srcW << 16) / dstW;
+                            const uint32_t scaleY_fp16 = (srcH << 16) / dstH;
+
+                            for (uint32_t dy = 0; dy < dstH; ++dy) {
+                                uint32_t sy_fp = dy * scaleY_fp16;
+                                uint32_t sy0 = sy_fp >> 16;
+                                uint32_t sy1 = (sy0 + 1 < srcH) ? (sy0 + 1) : sy0;
+                                uint32_t wy = (sy_fp >> 8) & 0xFFu;
+                                uint32_t iwy = 256u - wy;
+                                const uint32_t* row0 = srcBase + (size_t)sy0 * srcW;
+                                const uint32_t* row1 = srcBase + (size_t)sy1 * srcW;
+                                uint32_t* dstRow = bilinearTempBgra.data() + (size_t)dy * dstW;
+
+                                for (uint32_t dx = 0; dx < dstW; ++dx) {
+                                    uint32_t sx_fp = dx * scaleX_fp16;
+                                    uint32_t sx0 = sx_fp >> 16;
+                                    uint32_t sx1 = (sx0 + 1 < srcW) ? (sx0 + 1) : sx0;
+                                    uint32_t wx = (sx_fp >> 8) & 0xFFu;
+                                    uint32_t iwx = 256u - wx;
+                                    uint32_t w00 = iwx * iwy;
+                                    uint32_t w10 = wx  * iwy;
+                                    uint32_t w01 = iwx * wy;
+                                    uint32_t w11 = wx  * wy;
+
+                                    uint32_t p00 = row0[sx0], p10 = row0[sx1], p01 = row1[sx0], p11 = row1[sx1];
+                                    uint32_t b = (((p00 & 0xFFu) * w00 + (p10 & 0xFFu) * w10 + (p01 & 0xFFu) * w01 + (p11 & 0xFFu) * w11) >> 16);
+                                    uint32_t g = ((((p00 >> 8) & 0xFFu) * w00 + ((p10 >> 8) & 0xFFu) * w10 + ((p01 >> 8) & 0xFFu) * w01 + ((p11 >> 8) & 0xFFu) * w11) >> 16);
+                                    uint32_t r = ((((p00 >> 16) & 0xFFu) * w00 + ((p10 >> 16) & 0xFFu) * w10 + ((p01 >> 16) & 0xFFu) * w01 + ((p11 >> 16) & 0xFFu) * w11) >> 16);
+                                    dstRow[dx] = 0xFF000000u | (r << 16) | (g << 8) | b;
+                                }
+                            }
+
+                            // Contrast-Adaptive Sharpening (CAS) unsharp pass on 1280x800
+                            memcpy(currLiveBgra.data(), bilinearTempBgra.data(), dstW * sizeof(uint32_t));
+                            memcpy(currLiveBgra.data() + (size_t)(dstH - 1) * dstW,
+                                   bilinearTempBgra.data() + (size_t)(dstH - 1) * dstW,
+                                   dstW * sizeof(uint32_t));
+                            for (uint32_t y = 1; y + 1 < dstH; ++y) {
+                                const uint32_t* rPrev = bilinearTempBgra.data() + (size_t)(y - 1) * dstW;
+                                const uint32_t* rCurr = bilinearTempBgra.data() + (size_t)y * dstW;
+                                const uint32_t* rNext = bilinearTempBgra.data() + (size_t)(y + 1) * dstW;
+                                uint32_t* rOut = currLiveBgra.data() + (size_t)y * dstW;
+                                rOut[0] = rCurr[0];
+                                rOut[dstW - 1] = rCurr[dstW - 1];
+                                for (uint32_t x = 1; x + 1 < dstW; ++x) {
+                                    uint32_t c = rCurr[x], n = rPrev[x], s = rNext[x], w = rCurr[x - 1], e = rCurr[x + 1];
+                                    int cb = (int)(c & 0xFFu), cg = (int)((c >> 8) & 0xFFu), cr = (int)((c >> 16) & 0xFFu);
+                                    int sumB = (int)(n & 0xFFu) + (int)(s & 0xFFu) + (int)(w & 0xFFu) + (int)(e & 0xFFu);
+                                    int sumG = (int)((n >> 8) & 0xFFu) + (int)((s >> 8) & 0xFFu) + (int)((w >> 8) & 0xFFu) + (int)((e >> 8) & 0xFFu);
+                                    int sumR = (int)((n >> 16) & 0xFFu) + (int)((s >> 16) & 0xFFu) + (int)((w >> 16) & 0xFFu) + (int)((e >> 16) & 0xFFu);
+                                    int ob = cb + (((4 * cb - sumB) * 3) >> 5);
+                                    int og = cg + (((4 * cg - sumG) * 3) >> 5);
+                                    int or_ = cr + (((4 * cr - sumR) * 3) >> 5);
+                                    if (ob < 0) ob = 0; else if (ob > 255) ob = 255;
+                                    if (og < 0) og = 0; else if (og > 255) og = 255;
+                                    if (or_ < 0) or_ = 0; else if (or_ > 255) or_ = 255;
+                                    rOut[x] = 0xFF000000u | ((uint32_t)or_ << 16) | ((uint32_t)og << 8) | (uint32_t)ob;
+                                }
+                            }
                         }
                     }
                 }
@@ -1914,6 +1902,7 @@ static void HostServiceThreadProc() {
                            (sockaddr*)&lastActiveClient, sizeof(lastActiveClient));
                 }
                 liveFrameSeq++;
+                g_svc.framesEncoded++;
             };
 
             auto encodeFullStrip = [&](uint32_t stripIndex) {
@@ -1922,6 +1911,16 @@ static void HostServiceThreadProc() {
                 const uint32_t* bgraBase = currLiveBgra.data() + (size_t)y0 * kLiveW;
                 uint16_t* prevBase = prevSentRgb565.data() + (size_t)y0 * kLiveW;
                 size_t totalPixels = (size_t)kLiveW * hRows;
+
+                // Never overwrite a valid strip with an all-zero (black) strip if capture transiently returned 0
+                bool hasNonZeroPixel = false;
+                for (size_t i = 0; i < totalPixels; i += 16) {
+                    if (toRgb565(bgraBase[i]) != 0) {
+                        hasNonZeroPixel = true;
+                        break;
+                    }
+                }
+                if (!hasNonZeroPixel) return;
 
                 std::vector<uint8_t> rlePayload;
                 rlePayload.reserve(totalPixels * 2 + 16);
@@ -1961,11 +1960,18 @@ static void HostServiceThreadProc() {
                 }
             } else {
                 // Step 1: High-Speed 90Hz Delta-RLE ('V','D') across all 20 strips in a single 11ms tick!
-                // Any strip that has changed pixels is immediately transmitted at 90 FPS.
+                // Wire format matched 100% with VxrQuestApp::DecodeLiveDesktopStrip:
+                // - 0x80 followed by uint16_t skipLen (LE): skip 128..65535 unchanged pixels
+                // - 0x81..0xFF: skip (cmd & 0x7F) unchanged pixels (1..127)
+                // - 0x01..0x7F: Color-Run of cmd pixels (1..127) followed by uint16_t c565 (LE)
                 int deltaStripsSent = 0;
                 for (uint32_t sIdx = 0; sIdx < (uint32_t)kStripCount; ++sIdx) {
-                    if (sIdx == liveStripIdx || sIdx == ((liveStripIdx + 1) % kStripCount)) {
-                        continue; // Will be sent by the rolling Full-RLE refresh below
+                    uint32_t r0 = liveStripIdx;
+                    uint32_t r1 = (liveStripIdx + 1) % kStripCount;
+                    uint32_t r2 = (liveStripIdx + 2) % kStripCount;
+                    uint32_t r3 = (liveStripIdx + 3) % kStripCount;
+                    if (sIdx == r0 || sIdx == r1 || sIdx == r2 || sIdx == r3) {
+                        continue; // Will be sent by the 4 rolling Full-RLE refresh strips below
                     }
                     uint16_t y0 = (uint16_t)(sIdx * kStripH);
                     uint16_t hRows = (uint16_t)kStripH;
@@ -1974,12 +1980,15 @@ static void HostServiceThreadProc() {
                     size_t totalPixels = (size_t)kLiveW * hRows;
 
                     size_t changedCount = 0;
+                    size_t nonZeroPixels = 0;
                     for (size_t i = 0; i < totalPixels; ++i) {
-                        if (toRgb565(bgraBase[i]) != prevBase[i]) {
+                        uint16_t c565 = toRgb565(bgraBase[i]);
+                        if (c565 != 0) nonZeroPixels++;
+                        if (c565 != prevBase[i]) {
                             changedCount++;
                         }
                     }
-                    if (changedCount == 0) continue;
+                    if (changedCount == 0 || nonZeroPixels == 0) continue;
 
                     std::vector<uint8_t> deltaPayload;
                     deltaPayload.reserve(changedCount * 3 + 32);
@@ -1997,24 +2006,30 @@ static void HostServiceThreadProc() {
                     while (idx < totalPixels) {
                         uint16_t cCur = toRgb565(bgraBase[idx]);
                         if (cCur == prevBase[idx]) {
-                            uint8_t skipLen = 1;
-                            while (idx + skipLen < totalPixels && skipLen < 255 &&
+                            size_t skipLen = 1;
+                            while (idx + skipLen < totalPixels && skipLen < 65535 &&
                                    toRgb565(bgraBase[idx + skipLen]) == prevBase[idx + skipLen]) {
                                 skipLen++;
                             }
-                            deltaPayload.push_back(0); // op == 0 -> skip unchanged run
-                            deltaPayload.push_back(skipLen);
+                            if (skipLen <= 127) {
+                                deltaPayload.push_back((uint8_t)(0x80u | skipLen));
+                            } else {
+                                uint16_t s16 = (uint16_t)skipLen;
+                                deltaPayload.push_back(0x80u);
+                                deltaPayload.push_back((uint8_t)(s16 & 0xFF));
+                                deltaPayload.push_back((uint8_t)(s16 >> 8));
+                            }
                             idx += skipLen;
                         } else {
                             prevBase[idx] = cCur;
                             uint8_t runLen = 1;
-                            while (idx + runLen < totalPixels && runLen < 255) {
+                            while (idx + runLen < totalPixels && runLen < 127) {
                                 uint16_t cNext = toRgb565(bgraBase[idx + runLen]);
                                 if (cNext != cCur) break;
                                 prevBase[idx + runLen] = cNext;
                                 runLen++;
                             }
-                            deltaPayload.push_back(runLen);
+                            deltaPayload.push_back(runLen); // 1..127 (0x01..0x7F)
                             deltaPayload.push_back((uint8_t)(cCur & 0xFF));
                             deltaPayload.push_back((uint8_t)(cCur >> 8));
                             idx += runLen;
@@ -2023,11 +2038,11 @@ static void HostServiceThreadProc() {
 
                     sendStripPayload(deltaPayload);
                     deltaStripsSent++;
-                    if (deltaStripsSent >= 10) break; // Cap UDP burst per 11ms tick
+                    if (deltaStripsSent >= 8) break; // Cap UDP burst per 11ms tick
                 }
 
-                // Step 2: Send 2 rolling Full-RLE refresh strips ('V','X') per tick for zero-loss self-healing
-                for (int s = 0; s < 2; ++s) {
+                // Step 2: Send 4 rolling Full-RLE refresh strips ('V','X') per tick (full 1280x800 refresh every 55ms!)
+                for (int s = 0; s < 4; ++s) {
                     encodeFullStrip(liveStripIdx);
                     liveStripIdx = (liveStripIdx + 1) % kStripCount;
                 }
@@ -2036,6 +2051,8 @@ static void HostServiceThreadProc() {
 
         Sleep(11); // ~90 fps tick rate
     }
+
+    runVrPathReg(L"removedriver");
 
     if (pSteamVrShm) UnmapViewOfFile(pSteamVrShm);
     if (hSteamVrShm) CloseHandle(hSteamVrShm);
