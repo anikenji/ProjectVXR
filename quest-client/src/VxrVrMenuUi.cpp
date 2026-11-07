@@ -1387,6 +1387,20 @@ bool VxrVrMenuUi::HandleHitAction(const VrUiHitBox& box, float normX, float norm
         case HIT_COMPUTER_TOGGLE_CONNECT:
             if (box.param >= 0 && static_cast<size_t>(box.param) < m_computers.size()) {
                 VrComputerEntry& pc = m_computers[static_cast<size_t>(box.param)];
+#ifdef __ANDROID__
+                // On Android Quest hardware, NEVER fake pc.connected = true locally!
+                // Wait for real 2-way UDP handshake (isHandshakeAck == 1 or video frames) from ProjectVXR.exe.
+                if (!pc.connected) {
+                    m_settings.connected_hostname = pc.hostname;
+                    m_settings.connect_computer_index = box.param;
+                    m_settings.disconnect_computer_requested = false;
+                } else {
+                    pc.connected = false;
+                    m_settings.is_pc_connected = false;
+                    m_settings.connect_computer_index = -1;
+                    m_settings.disconnect_computer_requested = true;
+                }
+#else
                 pc.connected = !pc.connected;
                 m_settings.is_pc_connected = pc.connected;
                 if (pc.connected) {
@@ -1402,6 +1416,7 @@ bool VxrVrMenuUi::HandleHitAction(const VrUiHitBox& box, float normX, float norm
                     m_settings.connect_computer_index = -1;
                     m_settings.disconnect_computer_requested = true;
                 }
+#endif
                 MarkSettingsDirty();
                 return true;
             }

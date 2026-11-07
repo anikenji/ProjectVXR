@@ -61,8 +61,8 @@ struct VrPerfStats {
     float decoding_ms = 4.6f;
     uint32_t bitrate_mbps = 150;
     bool ssw_active = false;
-    std::string codec_name = "AV1 10-bit";
-    std::string soc_name = "XR2 Gen 2";
+    std::string codec_name = "HEVC 10-bit";
+    std::string soc_name = "XR2 Gen 1";
     std::string wifi_info = "5 GHz | 1,200 Mbps";
 };
 

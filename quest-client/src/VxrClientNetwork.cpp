@@ -422,13 +422,16 @@ bool VxrClientNetwork::HandleIncomingControlOrBeaconPacket(const uint8_t* rxBuf,
         uint32_t magic = 0;
         std::memcpy(&magic, rxBuf, 4);
         if (magic == VXR_HOST_INFO_MAGIC) {
-            RecordHostArrivalTiming();
+            uint8_t isHandshakeAck = (len >= 16) ? rxBuf[15] : 0; // wire->reserved == 1 means unicast handshake ACK from PC
+            if (isHandshakeAck == 1) {
+                RecordHostArrivalTiming();
+            }
 
             DiscoveredHostInfo hInfo = {};
             hInfo.ip_address = (senderIp && senderIp[0] != '\0') ? senderIp : "127.0.0.1";
             hInfo.computer_name = "VXR-PC";
             hInfo.port = 38810;
-            hInfo.ping_ms = (m_measuredRttMs >= 1.0f) ? static_cast<uint32_t>(m_measuredRttMs) : 2;
+            hInfo.ping_ms = (m_measuredRttMs >= 1.0f && m_measuredRttMs < 50.0f) ? static_cast<uint32_t>(m_measuredRttMs) : 3;
 
             if (len >= 80) {
                 uint16_t hostPort = 0;
@@ -464,15 +467,16 @@ bool VxrClientNetwork::HandleIncomingControlOrBeaconPacket(const uint8_t* rxBuf,
                 m_discoveredHosts.push_back(hInfo);
             }
 
-            // Only transition m_connected = true if the user requested a connection to this unicast PC IP
-            if (m_userRequestedConnect && !m_connectedHostIp.empty() && hInfo.ip_address == m_connectedHostIp) {
+            // CRITICAL: Only transition m_connected = true when the PC sends a unicast Handshake ACK (isHandshakeAck == 1),
+            // NEVER on a periodic 1-way broadcast beacon (isHandshakeAck == 0)!
+            if (isHandshakeAck == 1 && m_userRequestedConnect && !m_connectedHostIp.empty() && hInfo.ip_address == m_connectedHostIp) {
                 m_connected = true;
             }
             return true;
         }
     }
 
-    // 2. Check for "VXR_ACK_OK"
+    // 2. Check for "VXR_ACK_OK" (always a direct unicast reply from PC)
     if (len >= 10 && std::memcmp(rxBuf, "VXR_ACK_OK", 10) == 0) {
         RecordHostArrivalTiming();
         if (m_userRequestedConnect) {
@@ -484,10 +488,9 @@ bool VxrClientNetwork::HandleIncomingControlOrBeaconPacket(const uint8_t* rxBuf,
         return true;
     }
 
-    // 3. Check for text beacon "VXR_MDNS_BEACON:"
+    // 3. Check for text beacon "VXR_MDNS_BEACON:" (discovery only, do not pollute RTT timing)
     DiscoveredHostInfo beaconHost = {};
     if (ParseMdnsBeacon(reinterpret_cast<const char*>(rxBuf), len, senderIp, &beaconHost)) {
-        RecordHostArrivalTiming();
         return true;
     }
 

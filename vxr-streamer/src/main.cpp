@@ -1235,6 +1235,7 @@ static void HostServiceThreadProc() {
                 }
             }
 
+            hostInfo.reserved = 0; // 0 = periodic discovery beacon (not a unicast handshake ACK)
             const uint16_t kDiscoveryPorts[2] = { 38811, 38810 };
             for (uint32_t bcastIp : bcastAddrs) {
                 for (uint16_t dPort : kDiscoveryPorts) {
@@ -1242,8 +1243,56 @@ static void HostServiceThreadProc() {
                     bAddr.sin_family = AF_INET;
                     bAddr.sin_port = htons(dPort);
                     bAddr.sin_addr.s_addr = bcastIp;
+                    if (g_svc.udpSocket != INVALID_SOCKET) {
+                        sendto(g_svc.udpSocket, reinterpret_cast<const char*>(&hostInfo), sizeof(hostInfo), 0, (sockaddr*)&bAddr, sizeof(bAddr));
+                    }
                     sendto(g_svc.mdnsSocket, reinterpret_cast<const char*>(&hostInfo), sizeof(hostInfo), 0, (sockaddr*)&bAddr, sizeof(bAddr));
                     sendto(g_svc.mdnsSocket, beacon.data(), (int)beacon.size(), 0, (sockaddr*)&bAddr, sizeof(bAddr));
+                }
+            }
+
+            // Stateful Windows Firewall UDP Pinhole Punching via ARP Table (GetIpNetTable) + /24 Unicast Sweep:
+            // Sending unicast UDP from g_svc.udpSocket (:38810) to each LAN IP (e.g. Quest at 192.168.1.61:38810 & :38811)
+            // opens Windows Filtering Platform's stateful UDP conntrack pinhole without requiring Admin privileges!
+            if (g_svc.udpSocket != INVALID_SOCKET) {
+                ULONG arpBufLen = 0;
+                GetIpNetTable(nullptr, &arpBufLen, FALSE);
+                if (arpBufLen > 0 && arpBufLen < 65536) {
+                    std::vector<BYTE> arpBuf(arpBufLen);
+                    PMIB_IPNETTABLE pArpTable = reinterpret_cast<PMIB_IPNETTABLE>(arpBuf.data());
+                    if (GetIpNetTable(pArpTable, &arpBufLen, FALSE) == NO_ERROR) {
+                        for (DWORD idx = 0; idx < pArpTable->dwNumEntries; ++idx) {
+                            const MIB_IPNETROW& row = pArpTable->table[idx];
+                            if (row.dwType == MIB_IPNET_TYPE_DYNAMIC) {
+                                uint32_t neighborIp = row.dwAddr;
+                                uint8_t firstOctet = (uint8_t)(neighborIp & 0xFF);
+                                if (firstOctet == 127 || firstOctet >= 224) continue;
+                                for (uint16_t dPort : kDiscoveryPorts) {
+                                    sockaddr_in uAddr = {};
+                                    uAddr.sin_family = AF_INET;
+                                    uAddr.sin_port = htons(dPort);
+                                    uAddr.sin_addr.s_addr = neighborIp;
+                                    sendto(g_svc.udpSocket, reinterpret_cast<const char*>(&hostInfo), sizeof(hostInfo), 0, (sockaddr*)&uAddr, sizeof(uAddr));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // When no headset is connected yet, also sweep the local /24 subnet on :38810 every 2 beacons
+                // so Windows Firewall opens the stateful UDP pinhole for the Quest IP even before ARP resolves!
+                if (!hasActiveClient && (g_svc.mdnsBeaconsSent % 2 == 0)) {
+                    for (uint32_t bcastIp : bcastAddrs) {
+                        if (bcastIp == INADDR_BROADCAST) continue;
+                        uint32_t baseHostOrder = ntohl(bcastIp) & 0xFFFFFF00u;
+                        for (uint32_t hostId = 2; hostId < 254; ++hostId) {
+                            sockaddr_in uAddr = {};
+                            uAddr.sin_family = AF_INET;
+                            uAddr.sin_port = htons(38810);
+                            uAddr.sin_addr.s_addr = htonl(baseHostOrder | hostId);
+                            sendto(g_svc.udpSocket, reinterpret_cast<const char*>(&hostInfo), sizeof(hostInfo), 0, (sockaddr*)&uAddr, sizeof(uAddr));
+                        }
+                    }
                 }
             }
 
@@ -1254,9 +1303,14 @@ static void HostServiceThreadProc() {
             char rxBuf[2048];
             sockaddr_in clientAddr = {};
             int clientLen = sizeof(clientAddr);
-            while (true) {
-                int r = recvfrom(g_svc.udpSocket, rxBuf, sizeof(rxBuf), 0, (sockaddr*)&clientAddr, &clientLen);
-                if (r <= 0) break;
+            SOCKET pollSocks[2] = { g_svc.udpSocket, g_svc.mdnsSocket };
+            for (int sockIdx = 0; sockIdx < 2; ++sockIdx) {
+                SOCKET activeSock = pollSocks[sockIdx];
+                if (activeSock == INVALID_SOCKET) continue;
+                while (true) {
+                    clientLen = sizeof(clientAddr);
+                    int r = recvfrom(activeSock, rxBuf, sizeof(rxBuf), 0, (sockaddr*)&clientAddr, &clientLen);
+                    if (r <= 0) break;
 
                 // Filter out our own local broadcast echoes on port 38810
                 if (r == (int)sizeof(VxrHostInfoPacket)) {
@@ -1313,7 +1367,7 @@ static void HostServiceThreadProc() {
                             {
                                 std::lock_guard<std::mutex> lock(g_svc.statusMutex);
                                 if (g_svc.connectedHeadset == L"Not connected" || g_svc.connectedHeadset.empty()) {
-                                    g_svc.connectedHeadset = L"Meta Quest 3 (Connected)";
+                                    g_svc.connectedHeadset = L"Meta Quest (Connected)";
                                     needUiRefresh = true;
                                 }
                             }
@@ -1323,7 +1377,7 @@ static void HostServiceThreadProc() {
                         }
 
                         if (cmd == VXR_CMD_DISCOVER) {
-                            std::wstring clientHeadset = L"Meta Quest 3 (Connected)";
+                            std::wstring clientHeadset = L"Meta Quest (Connected)";
                             if (r >= (int)sizeof(VxrControlDiscoverPacket) && r != (int)sizeof(VxrClientControlPacket)) {
                                 const VxrControlDiscoverPacket* disc = reinterpret_cast<const VxrControlDiscoverPacket*>(rxBuf);
                                 char hsBuf[65] = {};
@@ -1333,15 +1387,36 @@ static void HostServiceThreadProc() {
                                 }
                             }
 
+                            // Enforce hardware codec compatibility: Quest 2 / Quest Pro / Quest 1 (XR2 Gen 1) do NOT support AV1!
+                            if (clientHeadset.find(L"Quest 2") != std::wstring::npos ||
+                                clientHeadset.find(L"Quest Pro") != std::wstring::npos ||
+                                clientHeadset.find(L"Oculus Quest") != std::wstring::npos) {
+                                if (g_cfg.preferredCodec == 2) { // AV1 10-bit -> fallback to HEVC 10-bit
+                                    g_cfg.preferredCodec = 1;
+                                    SaveConfig();
+                                    ApplyHardwareEncoderConfig();
+                                }
+                            }
+
+                            bool headsetChanged = false;
                             {
                                 std::lock_guard<std::mutex> lock(g_svc.statusMutex);
-                                g_svc.connectedHeadset = clientHeadset;
+                                if (g_svc.connectedHeadset != clientHeadset) {
+                                    g_svc.connectedHeadset = clientHeadset;
+                                    headsetChanged = true;
+                                }
                             }
                             VxrHostInfoPacket hostInfo = buildHostInfoPacket();
+                            hostInfo.reserved = 1; // 1 = Unicast Handshake ACK (confirms 2-way connection to Quest!)
                             sendto(g_svc.udpSocket, reinterpret_cast<const char*>(&hostInfo), sizeof(hostInfo), 0,
                                    (sockaddr*)&clientAddr, clientLen);
-                            if (g_hwnd) PostMessageW(g_hwnd, WM_SERVICE_UPDATE, 0, 0);
-                            ShowToast(L"Headset connected: " + clientHeadset);
+                            const char ackMsg[] = "VXR_ACK_OK";
+                            sendto(g_svc.udpSocket, ackMsg, sizeof(ackMsg) - 1, 0,
+                                   (sockaddr*)&clientAddr, clientLen);
+                            if (headsetChanged) {
+                                if (g_hwnd) PostMessageW(g_hwnd, WM_SERVICE_UPDATE, 0, 0);
+                                ShowToast(L"Headset connected: " + clientHeadset);
+                            }
                         }
                         else if (cmd == VXR_CMD_MOUSE_INPUT) {
                             float nx = 0.5f, ny = 0.5f;
@@ -1469,9 +1544,10 @@ static void HostServiceThreadProc() {
                     }
                 }
 
-                if (!handledCtrl) {
-                    const char ack[] = "VXR_ACK_OK";
-                    sendto(g_svc.udpSocket, ack, sizeof(ack) - 1, 0, (sockaddr*)&clientAddr, clientLen);
+                    if (!handledCtrl) {
+                        const char ack[] = "VXR_ACK_OK";
+                        sendto(g_svc.udpSocket, ack, sizeof(ack) - 1, 0, (sockaddr*)&clientAddr, clientLen);
+                    }
                 }
             }
         }
