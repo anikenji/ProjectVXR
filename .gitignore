@@ -22,3 +22,6 @@ gen/
 implementation_plan.md
 task.md
 *.tmp
+
+# Local third-party / reference folders
+VDModder/
