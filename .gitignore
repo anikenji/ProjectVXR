@@ -17,3 +17,8 @@ bin/
 *.keystore
 local.properties
 gen/
+
+# Implementation notes & local planning artifacts
+implementation_plan.md
+task.md
+*.tmp

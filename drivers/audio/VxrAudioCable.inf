@@ -1,0 +1,39 @@
+; VxrAudioCable.inf
+; Project VXR Virtual Audio Cable Driver (Software Loopback / Virtual Audio Endpoint)
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=MEDIA
+ClassGUID={4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider=%ProviderName%
+DriverVer=11/07/2026,1.0.0.1
+CatalogFile=VxrAudioCable.cat
+
+[Manufacturer]
+%ManufacturerName%=Standard,NTamd64
+
+[Standard.NTamd64]
+%VxrAudioCable.DeviceDesc%=VxrAudioCable_Device, Root\VxrAudioCable
+
+[VxrAudioCable_Device.NT]
+CopyFiles=VxrAudioCable_Device.NT.Copy
+
+[VxrAudioCable_Device.NT.Copy]
+VxrAudioCable.dll
+
+[VxrAudioCable_Device.NT.Services]
+AddService=VxrAudioCable,%SPSVCINST_ASSOCSERVICE%,VxrAudioCable_Service_Inst
+
+[VxrAudioCable_Service_Inst]
+DisplayName=%VxrAudioCable.SVCDESC%
+ServiceType=1               ; SERVICE_KERNEL_DRIVER / USER-MODE ENDPOINT
+StartType=3                 ; SERVICE_DEMAND_START
+ErrorControl=1              ; SERVICE_ERROR_NORMAL
+ServiceBinary=%12%\VxrAudioCable.dll
+
+[Strings]
+SPSVCINST_ASSOCSERVICE=0x00000002
+ManufacturerName="Project VXR Team"
+ProviderName="Project VXR"
+VxrAudioCable.DeviceDesc="Project VXR Virtual Audio Device"
+VxrAudioCable.SVCDESC="Project VXR Virtual Audio Service"
