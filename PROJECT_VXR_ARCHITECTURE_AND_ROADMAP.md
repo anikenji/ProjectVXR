@@ -106,3 +106,40 @@ Dự án tích hợp đầy đủ và tối ưu hóa các tính năng tiêu chu�
 - **Phase 4 (Virtual Display)**: Viết driver màn hình ảo IDDCX (UMDF v2), hỗ trợ Wi-Fi Direct P2P.
 - **Phase 5 (VXR-XR Runtime)**: Xây dựng Native OpenXR runtime độc lập để chạy trực tiếp MSFS 2024, DCS World, Assetto Corsa không qua SteamVR.
 - **Phase 6 (Advanced Features)**: Bóc tách từng cửa sổ ứng dụng thành các màn hình nổi 3D (Spatial Canvas), tạo khung nhìn bàn phím thật (Desk Passthrough Cutout), và mở rộng máy chủ sang Linux.
+---
+
+## 4. KẾ HOẠCH TRIỂN KHAI PHẦN CỨNG THẬT & ĐÓNG GÓI APP QUEST (PRODUCTION ROLLOUT)
+
+> **Mục tiêu tối thượng**: Chuyển đổi toàn bộ các tầng Mock/Simulation sang lời gọi API phần cứng thật 100%, build file APK native cho Meta Quest, kết nối không dây thực tế và chơi game PCVR trên kính vật lý.
+
+### Cột Mốc 1: NVENC Hardware Video Encoding Thật (Physical RTX 4060 Ti)
+- **Thực trạng**: Module `vxr-encoder` hiện chỉ nạp DLL `nvEncodeAPI64.dll` và sinh buffer NALU giả lập.
+- **Nhiệm vụ cụ thể**:
+  1. Triển khai đầy đủ con trỏ hàm `NV_ENCODE_API_FUNCTION_LIST` từ `NvEncodeAPICreateInstance`.
+  2. Mở session thật `nvEncOpenEncodeSessionEx` liên kết với Direct3D 11 Device của `vxr-capture`.
+  3. Cấu hình Preset Ultra Low Latency (`NV_ENC_PRESET_P1_GUID`), CBR Rate Control, Zero B-frames, Periodic Intra-Refresh.
+  4. Đăng ký texture DXGI qua `nvEncRegisterResource` và map qua `nvEncMapInputResource`.
+  5. Gọi `nvEncEncodePicture` thật và `nvEncLockBitstream` để trích xuất NALU bitstream HEVC 10-bit / AV1 10-bit.
+  6. **Nghiệm thu thực tế**: Ghi bitstream ra file `.hevc`, phát thử bằng `ffmpeg`/`ffplay` trên máy tính để kiểm chứng hình ảnh desktop chuyển động thật.
+
+### Cột Mốc 2: WASAPI Audio Capture Thật & Server Pipeline Hoàn Chỉnh (`vxr-server`)
+- **Thực trạng**: `crates/vxr-audio` đã khởi tạo COM nhưng hàm `read_samples` trả về vec silence `0.0`. Dashboard Tauri gán cứng telemetry.
+- **Nhiệm vụ cụ thể**:
+  1. Gọi thật `IAudioCaptureClient::GetBuffer` để rút mẫu PCM thực tế từ card âm thanh Windows.
+  2. Mã hóa Opus thật qua crate `audiopus` (khung 5ms) và chuyển sang `AudioPayload`.
+  3. Xây dựng Server Orchestrator kết nối luồng: `vxr-capture` -> `vxr-encoder (NVENC)` -> `vxr-protocol (FEC)` -> `vxr-pacer` -> `VxrSocket (UDP DSCP 46)`.
+  4. Gắn telemetry đo đạc thời gian thực (FPS thực tế, thời gian capture/encode GPU, ping RTT) vào Dashboard Tauri v2.
+
+### Cột Mốc 3: Thiết lập Android NDK & Đóng gói App Meta Quest APK Thật
+- **Thực trạng**: `quest-client` hiện đang build ra file DLL/EXE trên Windows với con trỏ giả lập (`0xC0DEC001`, `0x11110001`), chưa có APK và máy chưa có Android SDK/NDK.
+- **Nhiệm vụ cụ thể**:
+  1. Cài đặt Android SDK Platform & NDK trên phân vùng ổ `E:\Android` (tiết kiệm ổ C: hiện chỉ còn ~2GB).
+  2. Biên dịch shaders GLSL 450 sang mã bytecode SPIR-V chuẩn bằng `glslc` (thay thế file 88 byte stub hiện tại).
+  3. Cấu hình Gradle (`build.gradle`, `settings.gradle`, `gradlew`) và CMake để biên dịch thư viện chia sẻ `libvxr_quest.so` trên kiến trúc `arm64-v8a`.
+  4. Gọi thật `AMediaCodec_createDecoderByType`, nạp buffer NALU và trích xuất `AHardwareBuffer` sang Vulkan 1.3.
+  5. Tích hợp Meta OpenXR Mobile SDK lấy Head Pose 6DoF và xuất file cài đặt `vxr-quest-client.apk`.
+  6. **Nghiệm thu thực tế**: Cài file APK vào kính Meta Quest thật qua `adb install`.
+
+### Cột Mốc 4: Kết Nối E2E Không Dây Từ PC Đến Meta Quest
+- **Mục tiêu**: Kính Quest mở app lên, tự tìm thấy PC qua mDNS, xác thực mã PIN 6 số, stream màn hình 90/120Hz mượt mà và điều khiển chuột 0ms.
+- **Kiểm thử VR**: Tích hợp `driver_vrserver.dll` với SteamVR để chơi game PCVR bằng tay cầm Quest Touch Controller.

@@ -63,6 +63,8 @@ public:
         return (eye == vr::Eye_Left) ? m_lastSubmittedLeftEye : m_lastSubmittedRightEye;
     }
 
+    void SetOpticalConfig(float hFovScale, float vFovScale, float renderScale);
+
 private:
     std::string m_serialNumber;
     uint32_t m_objectId;
@@ -82,6 +84,8 @@ private:
     uint32_t m_renderHeightPerEye;
     float m_displayFrequency;
     float m_ipdMeters;
+    float m_hFovScale = 1.0f;
+    float m_vFovScale = 1.0f;
 };
 
 } // namespace vxr

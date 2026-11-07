@@ -8,6 +8,9 @@ pub enum UiError {
     #[error("Command execution failed: {0}")]
     Command(String),
 
+    #[error("Protocol error: {0}")]
+    Protocol(#[from] vxr_protocol::ProtocolError),
+
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 

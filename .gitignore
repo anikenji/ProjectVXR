@@ -1,5 +1,6 @@
 target/
 build/
+build-android/
 *.log
 .idea/
 .vscode/
@@ -8,4 +9,11 @@ bin/
 *.lib
 *.exp
 *.pdb
+*.dll
+*.exe
+*.hevc
+*.ini
+*.idsig
+*.keystore
+local.properties
 gen/

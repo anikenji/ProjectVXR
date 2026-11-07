@@ -4062,7 +4062,9 @@ dependencies = [
  "tauri-build",
  "thiserror 2.0.21",
  "tokio",
+ "vxr-audio",
  "vxr-discovery",
+ "vxr-input",
  "vxr-pacer",
  "vxr-protocol",
 ]

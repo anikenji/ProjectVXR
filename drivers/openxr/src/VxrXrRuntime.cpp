@@ -114,27 +114,41 @@ XrResult VxrXrRuntime::EnumerateViewConfigurationViews(
         return XR_ERROR_SIZE_INSUFFICIENT;
     }
 
-    // View 0: Left Eye (2064x2208 native Quest 3 panel)
+    uint32_t scaledW = static_cast<uint32_t>(2064.0f * m_renderScale);
+    uint32_t scaledH = static_cast<uint32_t>(2208.0f * m_renderScale);
+    if (scaledW < 512) scaledW = 512;
+    if (scaledH < 512) scaledH = 512;
+
+    // View 0: Left Eye (scaled by VXR-XR Render Resolution)
     views[0].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
     views[0].next = nullptr;
-    views[0].recommendedImageRectWidth = 2064;
+    views[0].recommendedImageRectWidth = scaledW;
     views[0].maxImageRectWidth = 4096;
-    views[0].recommendedImageRectHeight = 2208;
+    views[0].recommendedImageRectHeight = scaledH;
     views[0].maxImageRectHeight = 4096;
     views[0].recommendedSwapchainSampleCount = 1;
     views[0].maxSwapchainSampleCount = 4;
 
-    // View 1: Right Eye (2064x2208 native Quest 3 panel)
+    // View 1: Right Eye (scaled by VXR-XR Render Resolution)
     views[1].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
     views[1].next = nullptr;
-    views[1].recommendedImageRectWidth = 2064;
+    views[1].recommendedImageRectWidth = scaledW;
     views[1].maxImageRectWidth = 4096;
-    views[1].recommendedImageRectHeight = 2208;
+    views[1].recommendedImageRectHeight = scaledH;
     views[1].maxImageRectHeight = 4096;
     views[1].recommendedSwapchainSampleCount = 1;
     views[1].maxSwapchainSampleCount = 4;
 
     return XR_SUCCESS;
+}
+
+void VxrXrRuntime::SetOpticalConfig(float hFovScale, float vFovScale, float renderScale, float foveaRatio, bool useFovStencil) {
+    std::lock_guard<std::mutex> lock(m_runtimeMutex);
+    m_hFovScale = hFovScale;
+    m_vFovScale = vFovScale;
+    m_renderScale = renderScale;
+    m_foveaRatio = foveaRatio;
+    m_useFovStencil = useFovStencil;
 }
 
 XrResult VxrXrRuntime::EnumerateEnvironmentBlendModes(

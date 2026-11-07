@@ -1,5 +1,7 @@
 #include "VxrXrSession.h"
+#include "VxrXrRuntime.h"
 #include <chrono>
+#include <cmath>
 #include <iostream>
 
 namespace vxr {
@@ -97,6 +99,12 @@ XrResult VxrXrSession::LocateViews(
                               | XR_VIEW_STATE_ORIENTATION_TRACKED_BIT
                               | XR_VIEW_STATE_POSITION_TRACKED_BIT;
 
+    float hScale = VxrXrRuntime::GetInstance().GetHorizontalFovScale();
+    float vScale = VxrXrRuntime::GetInstance().GetVerticalFovScale();
+    // Apply Horizontal & Vertical FOV Tangent clamping (default 1.05 rad when scale = 1.0)
+    float angleH = (hScale == 1.0f) ? 1.05f : std::atan(std::tan(1.05f) * hScale);
+    float angleV = (vScale == 1.0f) ? 1.05f : std::atan(std::tan(1.05f) * vScale);
+
     // Left eye view: IPD = -0.0315m
     views[0].type = XR_TYPE_VIEW;
     views[0].next = nullptr;
@@ -107,10 +115,10 @@ XrResult VxrXrSession::LocateViews(
     views[0].pose.orientation.y = 0.0f;
     views[0].pose.orientation.z = 0.0f;
     views[0].pose.orientation.w = 1.0f;
-    views[0].fov.angleLeft = -1.05f;
-    views[0].fov.angleRight = 1.05f;
-    views[0].fov.angleUp = 1.05f;
-    views[0].fov.angleDown = -1.05f;
+    views[0].fov.angleLeft = -angleH;
+    views[0].fov.angleRight = angleH;
+    views[0].fov.angleUp = angleV;
+    views[0].fov.angleDown = -angleV;
 
     // Right eye view: IPD = +0.0315m
     views[1].type = XR_TYPE_VIEW;
@@ -122,10 +130,10 @@ XrResult VxrXrSession::LocateViews(
     views[1].pose.orientation.y = 0.0f;
     views[1].pose.orientation.z = 0.0f;
     views[1].pose.orientation.w = 1.0f;
-    views[1].fov.angleLeft = -1.05f;
-    views[1].fov.angleRight = 1.05f;
-    views[1].fov.angleUp = 1.05f;
-    views[1].fov.angleDown = -1.05f;
+    views[1].fov.angleLeft = -angleH;
+    views[1].fov.angleRight = angleH;
+    views[1].fov.angleUp = angleV;
+    views[1].fov.angleDown = -angleV;
 
     return XR_SUCCESS;
 }

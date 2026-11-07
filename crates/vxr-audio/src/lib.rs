@@ -149,4 +149,34 @@ mod tests {
         assert_eq!(payloads[1].sequence_number, 1);
         assert_eq!(payloads[2].sequence_number, 2);
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_real_wasapi_loopback_capture_and_opus() {
+        let capture_res = WasapiLoopbackCapture::new();
+        assert!(capture_res.is_ok());
+        let mut capture = capture_res.unwrap();
+
+        let start_res = capture.start();
+        if start_res.is_ok() {
+            assert!(capture.is_capturing_real_audio());
+            assert!(capture.sample_rate() > 0);
+            assert!(capture.channels() > 0);
+
+            // Read available audio packets from real Windows audio engine
+            let samples = capture.read_samples().expect("Read samples");
+            // If desktop is currently playing audio or silent, it yields valid buffer
+            println!("Real WASAPI captured {} samples from default endpoint", samples.len());
+
+            // Test pipeline integration with real WASAPI capture
+            let boxed_capture = Box::new(capture);
+            let mut pipeline = AudioPipeline::new(boxed_capture, AudioPipelineConfig::default())
+                .expect("Create real WASAPI pipeline");
+
+            let _ = pipeline.process_capture();
+            let _ = pipeline.stop();
+        } else {
+            println!("WASAPI start skipped (no active audio render endpoint on system)");
+        }
+    }
 }

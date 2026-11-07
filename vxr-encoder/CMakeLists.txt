@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../vxr-capture/include
 )
 
 set(ENCODER_SOURCES
@@ -20,6 +21,11 @@ add_library(vxr_encoder SHARED
     ${ENCODER_SOURCES}
 )
 
+target_link_libraries(vxr_encoder PUBLIC
+    d3d11
+    dxgi
+)
+
 target_compile_definitions(vxr_encoder PRIVATE
     VXR_ENCODER_EXPORTS
     _CRT_SECURE_NO_WARNINGS
@@ -30,10 +36,16 @@ target_include_directories(vxr_encoder PUBLIC
     $<INSTALL_INTERFACE:include>
 )
 
-# Test Executable
+# Test Executable: includes DxgiDuplicator for real capture-to-encode hardware pipeline test
 add_executable(test_encoder
     tests/test_encoder.cpp
     ${ENCODER_SOURCES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../vxr-capture/src/DxgiDuplicator.cpp
+)
+
+target_link_libraries(test_encoder PRIVATE
+    d3d11
+    dxgi
 )
 
 target_compile_definitions(test_encoder PRIVATE
@@ -42,4 +54,5 @@ target_compile_definitions(test_encoder PRIVATE
 
 target_include_directories(test_encoder PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../vxr-capture/include
 )

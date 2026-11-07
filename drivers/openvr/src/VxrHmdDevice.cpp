@@ -158,11 +158,18 @@ void VxrHmdDevice::GetEyeOutputViewport(vr::EVREye eEye, uint32_t* pnX, uint32_t
 }
 
 void VxrHmdDevice::GetProjectionRaw(vr::EVREye eEye, float* pfLeft, float* pfRight, float* pfTop, float* pfBottom) {
-    // Symmetrical tangent FOV ~96-100 degrees per eye matching Meta Quest 3 optics
-    if (pfLeft) *pfLeft = -1.05f;
-    if (pfRight) *pfRight = 1.05f;
-    if (pfTop) *pfTop = -1.05f;
-    if (pfBottom) *pfBottom = 1.05f;
+    // Symmetrical tangent FOV ~96-100 degrees per eye scaled by Horizontal & Vertical FOV Tangent sliders
+    if (pfLeft) *pfLeft = -1.05f * m_hFovScale;
+    if (pfRight) *pfRight = 1.05f * m_hFovScale;
+    if (pfTop) *pfTop = -1.05f * m_vFovScale;
+    if (pfBottom) *pfBottom = 1.05f * m_vFovScale;
+}
+
+void VxrHmdDevice::SetOpticalConfig(float hFovScale, float vFovScale, float renderScale) {
+    m_hFovScale = hFovScale;
+    m_vFovScale = vFovScale;
+    m_renderWidthPerEye = static_cast<uint32_t>(2064.0f * renderScale);
+    m_renderHeightPerEye = static_cast<uint32_t>(2208.0f * renderScale);
 }
 
 vr::DistortionCoordinates_t VxrHmdDevice::ComputeDistortion(vr::EVREye eEye, float fU, float fV) {

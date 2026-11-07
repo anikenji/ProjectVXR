@@ -3,6 +3,8 @@
 
 #include "VxrVideoEncoder.h"
 #include <windows.h>
+#include <d3d11.h>
+#include "nvEncodeAPI.h"
 #include <vector>
 #include <mutex>
 
@@ -23,15 +25,19 @@ public:
     virtual bool IsInitialized() const override { return m_initialized; }
 
     bool IsHardwareActive() const { return m_hardwareActive; }
+    bool IsRealNvencSessionActive() const { return m_encoderSession != nullptr; }
     bool IsTenBitEnabled() const { return m_config.color_format == VXR_COLOR_P010; }
     bool IsTwoPassEnabled() const { return m_config.enable_two_pass; }
     bool IsAdaptiveQuantizationEnabled() const { return m_config.enable_spatial_aq && m_config.enable_temporal_aq; }
     bool IsIntraRefreshEnabled() const { return m_config.enable_intra_refresh; }
 
+    void* GetEncoderSession() const { return m_encoderSession; }
+    NV_ENCODE_API_FUNCTION_LIST& GetNvencApi() { return m_nvenc; }
+
 private:
     bool LoadNvencLibrary();
-    bool CreateNvencSession(void* d3d11_device);
-    void SetupNvencConfig();
+    bool CreateNvencSession(ID3D11Device* pDevice);
+    bool CreateBitstreamBuffer();
 
     VxrEncoderConfig m_config;
     bool m_initialized;
@@ -39,8 +45,10 @@ private:
     uint64_t m_frameCount;
 
     HMODULE m_hNvencDll;
+    NV_ENCODE_API_FUNCTION_LIST m_nvenc;
     void* m_encoderSession;
-    void* m_d3d11Device;
+    ID3D11Device* m_pD3D11Device;
+    NV_ENC_OUTPUT_PTR m_bitstreamOutput;
 
     std::vector<uint8_t> m_bitstreamBuffer;
     mutable std::mutex m_encoderMutex;

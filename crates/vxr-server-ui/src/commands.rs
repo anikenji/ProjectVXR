@@ -11,6 +11,12 @@ pub fn get_stream_metrics(state: tauri::State<'_, ServerAppState>) -> StreamMetr
 }
 
 #[tauri::command]
+pub fn set_live_metrics(metrics: StreamMetrics, state: tauri::State<'_, ServerAppState>) -> Result<(), String> {
+    state.update_live_telemetry(metrics);
+    Ok(())
+}
+
+#[tauri::command]
 pub fn get_settings(state: tauri::State<'_, ServerAppState>) -> StreamerSettings {
     state.get_settings()
 }

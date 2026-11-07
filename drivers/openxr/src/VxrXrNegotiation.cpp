@@ -8,6 +8,10 @@
 // Global OpenXR Entry Points (exported by runtime)
 extern "C" {
 
+__declspec(dllexport) void vxr_xr_set_optical_config(float h_fov_scale, float v_fov_scale, float render_scale, float fovea_ratio, int use_fov_stencil) {
+    vxr::VxrXrRuntime::GetInstance().SetOpticalConfig(h_fov_scale, v_fov_scale, render_scale, fovea_ratio, use_fov_stencil != 0);
+}
+
 XRAPI_ATTR XrResult XRAPI_CALL xrCreateInstance(const XrInstanceCreateInfo* createInfo, XrInstance* instance) {
     return vxr::VxrXrRuntime::GetInstance().CreateInstance(createInfo, instance);
 }

@@ -37,8 +37,21 @@ public:
 
     PFN_xrVoidFunction ResolveFunction(const char* name);
 
+    // Advanced Optical & Foveation Parameters (from Project VXR Streamer)
+    void SetOpticalConfig(float hFovScale, float vFovScale, float renderScale, float foveaRatio, bool useFovStencil);
+    float GetHorizontalFovScale() const { return m_hFovScale; }
+    float GetVerticalFovScale() const { return m_vFovScale; }
+    float GetRenderResolutionScale() const { return m_renderScale; }
+    float GetFoveaRatio() const { return m_foveaRatio; }
+    bool  GetUseFovStencil() const { return m_useFovStencil; }
+
 private:
     bool m_initialized;
+    float m_hFovScale = 1.0f;
+    float m_vFovScale = 1.0f;
+    float m_renderScale = 1.0f;
+    float m_foveaRatio = 0.15f;
+    bool  m_useFovStencil = false;
     mutable std::mutex m_runtimeMutex;
     std::map<XrInstance, bool> m_instances;
     std::map<XrSession, std::unique_ptr<VxrXrSession>> m_sessions;

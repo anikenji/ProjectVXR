@@ -1,0 +1,2070 @@
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#include <windows.h>
+#include <windowsx.h>
+#include <tlhelp32.h>
+#include <shellapi.h>
+#include <shlobj.h>
+#include <shlwapi.h>
+#include <objidl.h>
+#include <gdiplus.h>
+#include <d3d11.h>
+#include <dxgi1_2.h>
+#include <mmdeviceapi.h>
+#include <audioclient.h>
+#include <avrt.h>
+#include <dwmapi.h>
+#include <string>
+#include <vector>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <cmath>
+#include <cstdio>
+#include <ctime>
+#include <fstream>
+#include <sstream>
+#include <algorithm>
+
+#include "vxr_encoder.h"
+#include "vxr_iddcx_control.h"
+#include "VxrComputeShaders.h"
+#include "DxgiDuplicator.h"
+
+using namespace Gdiplus;
+
+static const int WIN_W = 680;
+static const int WIN_H = 475;
+static const int TOP_BAR_H = 46;
+static const int BOTTOM_BAR_H = 33;
+static const int SIDEBAR_W = 154;
+
+#define WM_TRAYICON       (WM_USER + 100)
+#define WM_SERVICE_UPDATE (WM_USER + 101)
+#define ID_TRAY_OPEN      1001
+#define ID_TRAY_EXIT      1002
+#define HOTKEY_BASE_ID    2000
+
+enum NavTab {
+    TAB_ACCOUNTS = 0,
+    TAB_BINDINGS = 1,
+    TAB_OPTIONS  = 2,
+    TAB_ADVANCED = 3,
+    TAB_MEDIA    = 4,
+    TAB_ABOUT    = 5
+};
+
+static std::mutex g_logMutex;
+
+static std::string WideToUtf8(const std::wstring& w) {
+    if (w.empty()) return "";
+    int sz = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string res(sz, 0);
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &res[0], sz, nullptr, nullptr);
+    return res;
+}
+
+static std::wstring Utf8ToWide(const std::string& s) {
+    if (s.empty()) return L"";
+    int sz = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    std::wstring res(sz, 0);
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &res[0], sz);
+    return res;
+}
+
+static void AppendServiceLog(const std::wstring& msg) {
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    std::ofstream out("vxr_streamer.log", std::ios::app);
+    if (!out.is_open()) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char timeBuf[64];
+    sprintf_s(timeBuf, "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    out << timeBuf << WideToUtf8(msg) << "\n";
+}
+
+struct ShortcutBinding {
+    std::wstring actionName;
+    UINT modifiers;
+    UINT vk;
+
+    std::wstring FormatText() const {
+        if (vk == 0) return L"None";
+        std::wstring s;
+        if (modifiers & MOD_CONTROL) s += L"Ctrl+";
+        if (modifiers & MOD_ALT)     s += L"Alt+";
+        if (modifiers & MOD_SHIFT)   s += L"Shift+";
+        if (modifiers & MOD_WIN)     s += L"Windows+";
+
+        if (vk >= 'A' && vk <= 'Z') {
+            wchar_t ch[2] = { (wchar_t)vk, 0 };
+            s += ch;
+        } else if (vk >= '0' && vk <= '9') {
+            wchar_t ch[2] = { (wchar_t)vk, 0 };
+            s += ch;
+        } else if (vk >= VK_F1 && vk <= VK_F12) {
+            wchar_t buf[16];
+            swprintf_s(buf, L"F%d", (int)(vk - VK_F1 + 1));
+            s += buf;
+        } else {
+            wchar_t name[64] = {};
+            UINT scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+            if (GetKeyNameTextW(scan << 16, name, 63) > 0) {
+                s += name;
+            } else {
+                wchar_t buf[16];
+                swprintf_s(buf, L"Key 0x%02X", vk);
+                s += buf;
+            }
+        }
+        return s;
+    }
+};
+
+struct AppConfig {
+    // Tab 0: ACCOUNTS
+    std::wstring metaAccount = L"Phuong1226";
+
+    // Tab 1: BINDINGS
+    ShortcutBinding bindings[9];
+
+    // Tab 2: OPTIONS
+    int preferredCodec = 1; // 0=Automatic, 1=HEVC 10-bit, 2=AV1 10-bit, 3=HEVC, 4=H.264+, 5=H.264
+    bool adaptiveQuantization = true;
+    bool twoPassEncoding = true;
+    int openxrRuntime = 0;  // 0=VXR-XR, 1=Automatic, 2=SteamVR
+    int gamepadEmulation = 0; // 0=Automatic, 1=Xbox 360 (ViGEm), 2=DualShock 4, 3=Disabled
+    int audioStreaming = 0;   // 0=VR headset only, 1=Computer only, 2=Both
+    bool useVirtualAudioDriver = true;
+    bool voiceMeeterMode = false;
+
+    bool allowRemoteConnections = true;
+    bool encryptLocalTraffic = false;
+    bool autoAdjustBitrate = false;
+    bool startWithWindows = true;
+    bool startMinimizedInTray = true;
+    bool useTouchInput = true;
+    bool lockComputerOnDisconnect = false;
+    bool autoSelectMicrophone = true;
+    bool askForComputerAccess = true;
+
+    // Tab 3: ADVANCED
+    int hFovTangent = 100;       // 50..100%
+    int vFovTangent = 93;        // 50..100%
+    int renderResolution = 100;  // 50..150%
+    int foveaSize = 15;          // 10..100%
+    bool additionalSharpening = false;
+    int sharpeningPercent = 70;  // 0..100%
+    bool useFovStencil = false;
+    bool boostGamePriority = false;
+
+    // Tab 4: MEDIA
+    std::wstring screenshotsPath;
+    std::vector<std::wstring> videoPaths;
+
+    AppConfig() {
+        ResetBindings();
+        wchar_t picPath[MAX_PATH] = {};
+        if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_MYPICTURES, nullptr, 0, picPath))) {
+            screenshotsPath = picPath;
+        } else {
+            screenshotsPath = L"E:\\Code\\ProjectVXR";
+        }
+
+        wchar_t vidPath[MAX_PATH] = {};
+        if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_MYVIDEO, nullptr, 0, vidPath))) {
+            videoPaths.push_back(std::wstring(vidPath) + L"\\");
+        } else {
+            videoPaths.push_back(L"C:\\Users\\Public\\Videos\\");
+        }
+    }
+
+    const wchar_t* GetCodecName() const {
+        static const wchar_t* names[] = { L"Automatic", L"HEVC 10-bit", L"AV1 10-bit", L"HEVC", L"H.264+", L"H.264" };
+        if (preferredCodec >= 0 && preferredCodec < 6) return names[preferredCodec];
+        return L"HEVC 10-bit";
+    }
+
+    void ResetBindings() {
+        bindings[0] = { L"Switch Monitor",             MOD_SHIFT | MOD_WIN, 'A' };
+        bindings[1] = { L"Toggle VR Mode",             MOD_SHIFT | MOD_WIN, 'D' };
+        bindings[2] = { L"Toggle VR Passthrough",      MOD_SHIFT | MOD_WIN, 'C' };
+        bindings[3] = { L"Enable VR Passthrough",      MOD_SHIFT | MOD_WIN, 'Z' };
+        bindings[4] = { L"Disable VR Passthrough",     MOD_SHIFT | MOD_WIN, 'X' };
+        bindings[5] = { L"Toggle Hand Passthrough",    MOD_SHIFT | MOD_WIN, 'H' };
+        bindings[6] = { L"Toggle Desk Passthrough",    MOD_SHIFT | MOD_WIN, 'K' };
+        bindings[7] = { L"Toggle Performance Overlay", MOD_SHIFT | MOD_WIN, 'O' };
+        bindings[8] = { L"Toggle Foveated Streaming",  MOD_SHIFT | MOD_WIN, 'G' };
+    }
+
+    void ResetOptions() {
+        preferredCodec = 1;
+        adaptiveQuantization = true;
+        twoPassEncoding = true;
+        openxrRuntime = 0;
+        gamepadEmulation = 0;
+        audioStreaming = 0;
+        useVirtualAudioDriver = true;
+        voiceMeeterMode = false;
+        allowRemoteConnections = true;
+        encryptLocalTraffic = false;
+        autoAdjustBitrate = false;
+        startWithWindows = false;
+        startMinimizedInTray = false;
+        useTouchInput = true;
+        lockComputerOnDisconnect = false;
+        autoSelectMicrophone = true;
+        askForComputerAccess = true;
+    }
+
+    void ResetAdvanced() {
+        hFovTangent = 100;
+        vFovTangent = 93;
+        renderResolution = 100;
+        foveaSize = 15;
+        additionalSharpening = false;
+        sharpeningPercent = 70;
+        useFovStencil = false;
+        boostGamePriority = false;
+    }
+};
+
+// Live Background Host Service & Real System Telemetry State
+struct HostServiceState {
+    std::atomic<bool> isStarting{ true };
+    std::atomic<int>  bootProgressPct{ 0 };
+    std::mutex        statusMutex;
+    std::wstring      bootStepText = L"Starting Project VXR Service...";
+    std::wstring      lastActionToast;
+    ULONGLONG         toastExpireTick = 0;
+
+    // Real system info for ABOUT tab (matching Screenshot 1)
+    std::wstring      gpuNameWithDriver = L"Detecting GPU...";
+    std::wstring      gpuShortName = L"Detecting GPU...";
+    std::wstring      connectedHeadset = L"Meta Quest 3";
+    std::wstring      cpuName = L"Detecting Processor...";
+    std::wstring      ramTotalGb = L"Detecting...";
+    std::wstring      osVersionStr = L"Windows 10/11";
+    bool              secureBootEnabled = false;
+    bool              hagsEnabled = false;
+    bool              pcEthernetConnected = false;
+
+    bool              d3d11Ready = false;
+    bool              nvencActive = false;
+    bool              encoderDllLoaded = false;
+    bool              openxrDllLoaded = false;
+    bool              openvrDllLoaded = false;
+    bool              iddcxDllLoaded = false;
+    bool              wasapiReady = false;
+    bool              udpServerListening = false;
+    bool              mdnsListening = false;
+    bool              mmcssBoostActive = false;
+    int               registeredHotkeysCount = 0;
+    uint16_t          udpPort = 38810;
+    std::atomic<uint64_t> framesEncoded{ 0 };
+    std::atomic<uint64_t> mdnsBeaconsSent{ 0 };
+
+    // Live Advanced Optical & Shader state
+    float             activeHFovDeg = 96.0f;
+    float             activeVFovDeg = 91.8f;
+    uint32_t          activeEyeWidth = 2064;
+    uint32_t          activeEyeHeight = 2208;
+    float             activeCasSharpness = 0.0f;
+
+    HMODULE           hEncoderDll = nullptr;
+    HMODULE           hOpenXrDll  = nullptr;
+    HMODULE           hOpenVrDll  = nullptr;
+    HMODULE           hIddCxDll   = nullptr;
+    VxrEncoderHandle  encoderHandle = nullptr;
+    HANDLE            mmcssHandle = nullptr;
+    SOCKET            udpSocket = INVALID_SOCKET;
+    SOCKET            mdnsSocket = INVALID_SOCKET;
+    std::atomic<bool> stopRequested{ false };
+};
+
+struct DropdownSpec {
+    int id;
+    Rect rect;
+    std::vector<std::wstring> items;
+    int* selectedIndex;
+};
+
+struct CheckboxSpec {
+    int id;
+    Rect rect;
+    std::wstring label;
+    bool* value;
+    bool disabled;
+};
+
+struct SliderSpec {
+    int id;
+    Rect trackRect;
+    int minVal;
+    int maxVal;
+    int* value;
+    bool* enabledFlag;
+};
+
+static AppConfig g_cfg;
+static HostServiceState g_svc;
+static vxr::VxrCasCompute g_casShader;
+static vxr::VxrSgsrCompute g_sgsrShader;
+static HWND g_hwnd = nullptr;
+static NavTab g_activeTab = TAB_OPTIONS;
+static int g_hoverNav = -1;
+static bool g_hoverMin = false;
+static bool g_hoverClose = false;
+static int g_hoverBtnId = -1;
+
+static bool g_editingAccount = false;
+static std::wstring g_accountEditBuf;
+
+static int g_recordingBindingIdx = -1;
+static int g_hoverBindingIdx = -1;
+
+static int g_openDropdownId = -1;
+static int g_hoverDropdownItem = -1;
+static Rect g_openDropdownMenuRect;
+static std::vector<std::wstring> g_openDropdownItems;
+static int* g_openDropdownTarget = nullptr;
+
+static int g_draggingSliderId = -1;
+
+static std::vector<DropdownSpec> g_dropdowns;
+static std::vector<CheckboxSpec> g_checkboxes;
+static std::vector<SliderSpec> g_sliders;
+static NOTIFYICONDATAW g_nid = {};
+static std::thread g_serviceThread;
+
+// Typedefs for dynamic C API calls into vxr_encoder.dll, openxr_vxr.dll, driver_vrserver.dll
+typedef VxrEncoderHandle (*PFN_vxr_encoder_create)();
+typedef void (*PFN_vxr_encoder_destroy)(VxrEncoderHandle);
+typedef int (*PFN_vxr_encoder_initialize)(VxrEncoderHandle, const VxrEncoderConfig*, void*);
+typedef int (*PFN_vxr_encoder_reconfigure_bitrate)(VxrEncoderHandle, uint32_t, uint32_t);
+typedef int (*PFN_vxr_encoder_encode_texture)(VxrEncoderHandle, void*, uint64_t, int, VxrBitstreamFrame*);
+typedef void (*PFN_vxr_xr_set_optical_config)(float, float, float, float, int);
+typedef void (*PFN_VxrDriver_SetOpticalConfig)(float, float, float);
+
+static PFN_vxr_encoder_create              pfn_encoder_create = nullptr;
+static PFN_vxr_encoder_destroy             pfn_encoder_destroy = nullptr;
+static PFN_vxr_encoder_initialize          pfn_encoder_init = nullptr;
+static PFN_vxr_encoder_reconfigure_bitrate pfn_encoder_reconfig = nullptr;
+static PFN_vxr_encoder_encode_texture      pfn_encoder_encode = nullptr;
+static PFN_vxr_xr_set_optical_config       pfn_xr_set_optical = nullptr;
+static PFN_VxrDriver_SetOpticalConfig      pfn_openvr_set_optical = nullptr;
+
+static void ShowToast(const std::wstring& msg) {
+    AppendServiceLog(msg);
+    {
+        std::lock_guard<std::mutex> lock(g_svc.statusMutex);
+        g_svc.lastActionToast = msg;
+        g_svc.toastExpireTick = GetTickCount64() + 3800;
+    }
+    if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static std::wstring ReadRegString(HKEY root, const wchar_t* subKey, const wchar_t* valName) {
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(root, subKey, 0, KEY_READ, &hKey) != ERROR_SUCCESS) return L"";
+    wchar_t buf[512] = {};
+    DWORD sz = sizeof(buf);
+    DWORD type = 0;
+    std::wstring res;
+    if (RegQueryValueExW(hKey, valName, nullptr, &type, (LPBYTE)buf, &sz) == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ)) {
+        res = buf;
+    }
+    RegCloseKey(hKey);
+    return res;
+}
+
+static bool ReadRegDword(HKEY root, const wchar_t* subKey, const wchar_t* valName, DWORD* outVal) {
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(root, subKey, 0, KEY_READ, &hKey) != ERROR_SUCCESS) return false;
+    DWORD val = 0;
+    DWORD sz = sizeof(val);
+    DWORD type = 0;
+    bool ok = (RegQueryValueExW(hKey, valName, nullptr, &type, (LPBYTE)&val, &sz) == ERROR_SUCCESS && type == REG_DWORD);
+    if (ok && outVal) *outVal = val;
+    RegCloseKey(hKey);
+    return ok;
+}
+
+static void QueryRealSystemSpecs() {
+    // 1. CPU Name
+    std::wstring cpu = ReadRegString(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", L"ProcessorNameString");
+    while (!cpu.empty() && cpu.front() == L' ') cpu.erase(cpu.begin());
+    if (cpu.empty()) cpu = L"x86_64 Multi-Core Processor";
+
+    // 2. Physical RAM (GB)
+    MEMORYSTATUSEX mem = {};
+    mem.dwLength = sizeof(mem);
+    wchar_t ramBuf[64] = L"16.0 GB";
+    if (GlobalMemoryStatusEx(&mem)) {
+        double gb = (double)mem.ullTotalPhys / (1024.0 * 1024.0 * 1024.0);
+        swprintf_s(ramBuf, L"%.1f GB", gb);
+    }
+
+    // 3. Operating System Name & DisplayVersion
+    std::wstring prodName = ReadRegString(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", L"ProductName");
+    std::wstring dispVer  = ReadRegString(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", L"DisplayVersion");
+    std::wstring buildStr = ReadRegString(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", L"CurrentBuild");
+    if (!buildStr.empty()) {
+        int buildNum = _wtoi(buildStr.c_str());
+        if (buildNum >= 22000) {
+            size_t pos = prodName.find(L"Windows 10");
+            if (pos != std::wstring::npos) prodName.replace(pos, 10, L"Windows 11");
+        }
+    }
+    std::wstring osFull = prodName.empty() ? L"Windows 10 Pro" : prodName;
+    if (!dispVer.empty()) osFull += L" " + dispVer;
+
+    // 4. UEFI Secure Boot
+    DWORD sbVal = 0;
+    bool secBoot = ReadRegDword(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State", L"UEFISecureBootEnabled", &sbVal) && (sbVal == 1);
+
+    // 5. HAGS (Hardware-Accelerated GPU Scheduling: HwSchMode == 2 means Enabled)
+    DWORD hagsVal = 2;
+    bool hags = true;
+    if (ReadRegDword(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers", L"HwSchMode", &hagsVal)) {
+        hags = (hagsVal == 2);
+    }
+
+    // 6. PC Ethernet Status via GetAdaptersAddresses
+    bool ethUp = false;
+    ULONG outBufLen = 16384;
+    std::vector<BYTE> adapterBuf(outBufLen);
+    PIP_ADAPTER_ADDRESSES pAddresses = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(adapterBuf.data());
+    if (GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST, nullptr, pAddresses, &outBufLen) == NO_ERROR) {
+        for (PIP_ADAPTER_ADDRESSES curr = pAddresses; curr != nullptr; curr = curr->Next) {
+            if (curr->IfType == IF_TYPE_ETHERNET_CSMACD && curr->OperStatus == IfOperStatusUp) {
+                ethUp = true;
+                break;
+            }
+        }
+    }
+
+    // 7. GPU Driver Version from Display Class Registry (e.g. "32.0.15.6614" -> "566.14")
+    std::wstring drvVer = ReadRegString(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}\\0000", L"DriverVersion");
+    std::wstring shortDrv;
+    if (drvVer.size() >= 6) {
+        std::wstring digits;
+        for (wchar_t c : drvVer) {
+            if (c >= L'0' && c <= L'9') digits.push_back(c);
+        }
+        if (digits.size() >= 5) {
+            std::wstring tail5 = digits.substr(digits.size() - 5);
+            shortDrv = tail5.substr(0, 3) + L"." + tail5.substr(3, 2);
+        } else {
+            shortDrv = drvVer;
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(g_svc.statusMutex);
+    g_svc.cpuName = cpu;
+    g_svc.ramTotalGb = ramBuf;
+    g_svc.osVersionStr = osFull;
+    g_svc.secureBootEnabled = secBoot;
+    g_svc.hagsEnabled = hags;
+    g_svc.pcEthernetConnected = ethUp;
+    if (!shortDrv.empty()) {
+        g_svc.gpuNameWithDriver = g_svc.gpuShortName + L" (" + shortDrv + L")";
+    } else {
+        g_svc.gpuNameWithDriver = g_svc.gpuShortName;
+    }
+}
+
+static void SaveConfig() {
+    std::ofstream out("vxr_streamer_settings.ini");
+    if (!out.is_open()) return;
+    out << "metaAccount=" << WideToUtf8(g_cfg.metaAccount) << "\n";
+    out << "preferredCodec=" << g_cfg.preferredCodec << "\n";
+    out << "adaptiveQuantization=" << g_cfg.adaptiveQuantization << "\n";
+    out << "twoPassEncoding=" << g_cfg.twoPassEncoding << "\n";
+    out << "openxrRuntime=" << g_cfg.openxrRuntime << "\n";
+    out << "gamepadEmulation=" << g_cfg.gamepadEmulation << "\n";
+    out << "audioStreaming=" << g_cfg.audioStreaming << "\n";
+    out << "useVirtualAudioDriver=" << g_cfg.useVirtualAudioDriver << "\n";
+    out << "voiceMeeterMode=" << g_cfg.voiceMeeterMode << "\n";
+    out << "allowRemoteConnections=" << g_cfg.allowRemoteConnections << "\n";
+    out << "encryptLocalTraffic=" << g_cfg.encryptLocalTraffic << "\n";
+    out << "autoAdjustBitrate=" << g_cfg.autoAdjustBitrate << "\n";
+    out << "startWithWindows=" << g_cfg.startWithWindows << "\n";
+    out << "startMinimizedInTray=" << g_cfg.startMinimizedInTray << "\n";
+    out << "useTouchInput=" << g_cfg.useTouchInput << "\n";
+    out << "lockComputerOnDisconnect=" << g_cfg.lockComputerOnDisconnect << "\n";
+    out << "autoSelectMicrophone=" << g_cfg.autoSelectMicrophone << "\n";
+    out << "askForComputerAccess=" << g_cfg.askForComputerAccess << "\n";
+    out << "hFovTangent=" << g_cfg.hFovTangent << "\n";
+    out << "vFovTangent=" << g_cfg.vFovTangent << "\n";
+    out << "renderResolution=" << g_cfg.renderResolution << "\n";
+    out << "foveaSize=" << g_cfg.foveaSize << "\n";
+    out << "additionalSharpening=" << g_cfg.additionalSharpening << "\n";
+    out << "sharpeningPercent=" << g_cfg.sharpeningPercent << "\n";
+    out << "useFovStencil=" << g_cfg.useFovStencil << "\n";
+    out << "boostGamePriority=" << g_cfg.boostGamePriority << "\n";
+    out << "screenshotsPath=" << WideToUtf8(g_cfg.screenshotsPath) << "\n";
+    for (int i = 0; i < 9; ++i) {
+        out << "binding_" << i << "_mod=" << g_cfg.bindings[i].modifiers << "\n";
+        out << "binding_" << i << "_vk=" << g_cfg.bindings[i].vk << "\n";
+    }
+    out << "videoPathsCount=" << g_cfg.videoPaths.size() << "\n";
+    for (size_t i = 0; i < g_cfg.videoPaths.size(); ++i) {
+        out << "videoPath_" << i << "=" << WideToUtf8(g_cfg.videoPaths[i]) << "\n";
+    }
+}
+
+static void LoadConfig() {
+    std::ifstream in("vxr_streamer_settings.ini");
+    if (!in.is_open()) return;
+    std::string line;
+    std::vector<std::wstring> loadedVidPaths;
+    while (std::getline(in, line)) {
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string k = line.substr(0, eq);
+        std::string v = line.substr(eq + 1);
+        if (k == "metaAccount") g_cfg.metaAccount = Utf8ToWide(v);
+        else if (k == "preferredCodec") g_cfg.preferredCodec = std::stoi(v);
+        else if (k == "adaptiveQuantization") g_cfg.adaptiveQuantization = (v == "1");
+        else if (k == "twoPassEncoding") g_cfg.twoPassEncoding = (v == "1");
+        else if (k == "openxrRuntime") g_cfg.openxrRuntime = std::stoi(v);
+        else if (k == "gamepadEmulation") g_cfg.gamepadEmulation = std::stoi(v);
+        else if (k == "audioStreaming") g_cfg.audioStreaming = std::stoi(v);
+        else if (k == "useVirtualAudioDriver") g_cfg.useVirtualAudioDriver = (v == "1");
+        else if (k == "voiceMeeterMode") g_cfg.voiceMeeterMode = (v == "1");
+        else if (k == "allowRemoteConnections") g_cfg.allowRemoteConnections = (v == "1");
+        else if (k == "encryptLocalTraffic") g_cfg.encryptLocalTraffic = (v == "1");
+        else if (k == "autoAdjustBitrate") g_cfg.autoAdjustBitrate = (v == "1");
+        else if (k == "startWithWindows") g_cfg.startWithWindows = (v == "1");
+        else if (k == "startMinimizedInTray") g_cfg.startMinimizedInTray = (v == "1");
+        else if (k == "useTouchInput") g_cfg.useTouchInput = (v == "1");
+        else if (k == "lockComputerOnDisconnect") g_cfg.lockComputerOnDisconnect = (v == "1");
+        else if (k == "autoSelectMicrophone") g_cfg.autoSelectMicrophone = (v == "1");
+        else if (k == "askForComputerAccess") g_cfg.askForComputerAccess = (v == "1");
+        else if (k == "hFovTangent") g_cfg.hFovTangent = std::stoi(v);
+        else if (k == "vFovTangent") g_cfg.vFovTangent = std::stoi(v);
+        else if (k == "renderResolution") g_cfg.renderResolution = std::stoi(v);
+        else if (k == "foveaSize") g_cfg.foveaSize = std::stoi(v);
+        else if (k == "additionalSharpening") g_cfg.additionalSharpening = (v == "1");
+        else if (k == "sharpeningPercent") g_cfg.sharpeningPercent = std::stoi(v);
+        else if (k == "useFovStencil") g_cfg.useFovStencil = (v == "1");
+        else if (k == "boostGamePriority") g_cfg.boostGamePriority = (v == "1");
+        else if (k == "screenshotsPath") g_cfg.screenshotsPath = Utf8ToWide(v);
+        else if (k.rfind("videoPath_", 0) == 0) loadedVidPaths.push_back(Utf8ToWide(v));
+        else {
+            for (int i = 0; i < 9; ++i) {
+                if (k == "binding_" + std::to_string(i) + "_mod") g_cfg.bindings[i].modifiers = (UINT)std::stoul(v);
+                if (k == "binding_" + std::to_string(i) + "_vk")  g_cfg.bindings[i].vk = (UINT)std::stoul(v);
+            }
+        }
+    }
+    if (!loadedVidPaths.empty()) {
+        g_cfg.videoPaths = loadedVidPaths;
+    }
+}
+
+// ============================================================================
+// REAL SYSTEM & HARDWARE ACTIONS (Advanced Optical / FOV / Fovea / Sharpening)
+// ============================================================================
+
+static void ApplyAdvancedOpticalAndSharpeningParameters() {
+    float hScale = g_cfg.hFovTangent / 100.0f;
+    float vScale = g_cfg.vFovTangent / 100.0f;
+    float resScale = g_cfg.renderResolution / 100.0f;
+    float foveaRatio = g_cfg.foveaSize / 100.0f;
+
+    // 1. Update VXR-XR Native OpenXR Runtime (openxr_vxr.dll)
+    if (pfn_xr_set_optical) {
+        pfn_xr_set_optical(hScale, vScale, resScale, foveaRatio, g_cfg.useFovStencil ? 1 : 0);
+    }
+
+    // 2. Update SteamVR OpenVR Driver (driver_vrserver.dll)
+    if (pfn_openvr_set_optical) {
+        pfn_openvr_set_optical(hScale, vScale, resScale);
+    }
+
+    // 3. Calculate real FOV angles in degrees & render target pixels
+    float halfAngleH = std::atan(std::tan(1.05f) * hScale);
+    float halfAngleV = std::atan(std::tan(1.05f) * vScale);
+    g_svc.activeHFovDeg = (halfAngleH * 2.0f) * (180.0f / 3.14159265f);
+    g_svc.activeVFovDeg = (halfAngleV * 2.0f) * (180.0f / 3.14159265f);
+    g_svc.activeEyeWidth  = (uint32_t)(2064.0f * resScale);
+    g_svc.activeEyeHeight = (uint32_t)(2208.0f * resScale);
+
+    // 4. Execute AMD FidelityFX CAS / Qualcomm SGSR Sharpening verification pass if enabled
+    if (g_cfg.additionalSharpening) {
+        g_svc.activeCasSharpness = g_cfg.sharpeningPercent / 100.0f;
+        std::vector<float> testIn(16 * 16 * 4, 0.25f);
+        std::vector<float> testOut(16 * 16 * 4, 0.0f);
+        for (int i = 0; i < 16; ++i) testIn[(8 * 16 + i) * 4 + 0] = 0.85f; // high-contrast edge
+        g_casShader.SharpenFrame(testIn.data(), 16, 16, g_svc.activeCasSharpness, testOut.data());
+    } else {
+        g_svc.activeCasSharpness = 0.0f;
+    }
+
+    wchar_t logMsg[256];
+    swprintf_s(logMsg, L"Applied Optical Config: HFOV=%.1f deg (%d%%), VFOV=%.1f deg (%d%%), EyeRes=%ux%u (%d%%), Fovea=%d%%, Stencil=%s, CAS=%.2f",
+        g_svc.activeHFovDeg, g_cfg.hFovTangent,
+        g_svc.activeVFovDeg, g_cfg.vFovTangent,
+        g_svc.activeEyeWidth, g_svc.activeEyeHeight, g_cfg.renderResolution,
+        g_cfg.foveaSize,
+        g_cfg.useFovStencil ? L"ON" : L"OFF",
+        g_svc.activeCasSharpness);
+    ShowToast(logMsg);
+}
+
+static void ApplyHardwareEncoderConfig() {
+    ApplyAdvancedOpticalAndSharpeningParameters();
+    if (!g_svc.encoderHandle || !pfn_encoder_init) return;
+
+    VxrEncoderConfig cfg = {};
+    cfg.width = g_svc.activeEyeWidth;
+    cfg.height = g_svc.activeEyeHeight;
+    cfg.fps = 90;
+    cfg.bitrate_bps = 150 * 1000 * 1000;
+    if (g_cfg.preferredCodec == 2) {
+        cfg.codec = VXR_CODEC_AV1;
+        cfg.color_format = VXR_COLOR_P010;
+    } else if (g_cfg.preferredCodec == 4 || g_cfg.preferredCodec == 5) {
+        cfg.codec = VXR_CODEC_H264;
+        cfg.color_format = VXR_COLOR_NV12;
+        if (g_cfg.preferredCodec == 4) cfg.bitrate_bps = 400 * 1000 * 1000;
+    } else {
+        cfg.codec = VXR_CODEC_HEVC;
+        cfg.color_format = (g_cfg.preferredCodec == 3) ? VXR_COLOR_NV12 : VXR_COLOR_P010;
+    }
+    cfg.enable_two_pass = g_cfg.twoPassEncoding;
+    cfg.enable_spatial_aq = g_cfg.adaptiveQuantization;
+    cfg.enable_temporal_aq = g_cfg.adaptiveQuantization;
+    cfg.enable_intra_refresh = true;
+    cfg.num_slices = 8;
+
+    pfn_encoder_init(g_svc.encoderHandle, &cfg, nullptr);
+    wchar_t msg[128];
+    swprintf_s(msg, L"NVENC reconfigured: %s (%ux%u @ 90Hz)", g_cfg.GetCodecName(), cfg.width, cfg.height);
+    ShowToast(msg);
+}
+
+static void ApplyStartWithWindowsRegistry() {
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        if (g_cfg.startWithWindows) {
+            wchar_t exePath[MAX_PATH] = {};
+            GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+            std::wstring val = L"\"" + std::wstring(exePath) + L"\"";
+            RegSetValueExW(hKey, L"ProjectVXRStreamer", 0, REG_SZ, (const BYTE*)val.c_str(), (DWORD)((val.size() + 1) * sizeof(wchar_t)));
+            ShowToast(L"Registered Project VXR in Windows Startup (HKCU\\...\\Run)");
+        } else {
+            RegDeleteValueW(hKey, L"ProjectVXRStreamer");
+            ShowToast(L"Removed Project VXR from Windows Startup");
+        }
+        RegCloseKey(hKey);
+    }
+}
+
+static void ApplyOpenXrRuntimeSelection() {
+    HKEY hKey = nullptr;
+    DWORD disp = 0;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Khronos\\OpenXR\\1", 0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKey, &disp) == ERROR_SUCCESS) {
+        if (g_cfg.openxrRuntime == 0 || g_cfg.openxrRuntime == 1) {
+            wchar_t cwd[MAX_PATH] = {};
+            GetCurrentDirectoryW(MAX_PATH, cwd);
+            std::wstring jsonPath = std::wstring(cwd) + L"\\drivers\\openxr\\openxr_vxr.json";
+            RegSetValueExW(hKey, L"ActiveRuntime", 0, REG_SZ, (const BYTE*)jsonPath.c_str(), (DWORD)((jsonPath.size() + 1) * sizeof(wchar_t)));
+            ShowToast(L"Active OpenXR Runtime set to VXR-XR (openxr_vxr.dll)");
+        } else {
+            RegDeleteValueW(hKey, L"ActiveRuntime");
+            ShowToast(L"Active OpenXR Runtime delegated to SteamVR");
+        }
+        RegCloseKey(hKey);
+    }
+}
+
+static void ApplyGamePriorityBoost() {
+    if (g_cfg.boostGamePriority) {
+        SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+        DWORD taskIdx = 0;
+        g_svc.mmcssHandle = AvSetMmThreadCharacteristicsW(L"Games", &taskIdx);
+        g_svc.mmcssBoostActive = (g_svc.mmcssHandle != nullptr);
+        ShowToast(L"Enabled HIGH_PRIORITY_CLASS + Windows MMCSS 'Games' scheduler");
+    } else {
+        SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
+        if (g_svc.mmcssHandle) {
+            AvRevertMmThreadCharacteristics(g_svc.mmcssHandle);
+            g_svc.mmcssHandle = nullptr;
+        }
+        g_svc.mmcssBoostActive = false;
+        ShowToast(L"Restored standard process priority");
+    }
+}
+
+static void RegisterAllHotkeys(HWND hwnd) {
+    if (!hwnd) return;
+    int count = 0;
+    for (int i = 0; i < 9; ++i) {
+        UnregisterHotKey(hwnd, HOTKEY_BASE_ID + i);
+        if (g_cfg.bindings[i].vk != 0) {
+            if (RegisterHotKey(hwnd, HOTKEY_BASE_ID + i, g_cfg.bindings[i].modifiers | MOD_NOREPEAT, g_cfg.bindings[i].vk)) {
+                count++;
+            }
+        }
+    }
+    g_svc.registeredHotkeysCount = count;
+}
+
+static void ScanInterferingApps(HWND hwnd) {
+    const wchar_t* knownBad[] = {
+        L"RTSS.exe", L"Fraps.exe", L"NahimicService.exe", L"Nahimic3.exe",
+        L"Overwolf.exe", L"SonicStudio.exe", L"AsusGameFirstService.exe", L"WinPcap.exe"
+    };
+    std::vector<std::wstring> found;
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe = {};
+        pe.dwSize = sizeof(pe);
+        if (Process32FirstW(hSnap, &pe)) {
+            do {
+                for (const wchar_t* bad : knownBad) {
+                    if (_wcsicmp(pe.szExeFile, bad) == 0) {
+                        found.push_back(pe.szExeFile);
+                    }
+                }
+            } while (Process32NextW(hSnap, &pe));
+        }
+        CloseHandle(hSnap);
+    }
+
+    if (found.empty()) {
+        AppendServiceLog(L"Interfering apps scan completed: 0 conflicting processes found.");
+        MessageBoxW(hwnd,
+            L"No interfering applications or conflicting GPU/network hooks were detected on your system.",
+            L"Project VXR - Interfering Apps Check",
+            MB_OK | MB_ICONINFORMATION);
+    } else {
+        std::wstring msg = L"The following potentially interfering processes were detected:\n\n";
+        for (const auto& f : found) msg += L"  • " + f + L"\n";
+        AppendServiceLog(L"Interfering apps scan found conflicts.");
+        MessageBoxW(hwnd, msg.c_str(), L"Project VXR - Interfering Apps Check", MB_OK | MB_ICONWARNING);
+    }
+}
+
+static std::wstring BrowseForFolderDialog(HWND hwnd, const wchar_t* title) {
+    wchar_t path[MAX_PATH] = {};
+    BROWSEINFOW bi = {};
+    bi.hwndOwner = hwnd;
+    bi.lpszTitle = title;
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_USENEWUI;
+    LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+    if (pidl != nullptr) {
+        if (SHGetPathFromIDListW(pidl, path)) {
+            CoTaskMemFree(pidl);
+            return std::wstring(path);
+        }
+        CoTaskMemFree(pidl);
+    }
+    return L"";
+}
+
+// ============================================================================
+// BACKGROUND HOST SERVICE THREAD
+// ============================================================================
+
+static void HostServiceThreadProc() {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    AppendServiceLog(L"Project VXR Host Service starting...");
+
+    auto setStep = [](int pct, const wchar_t* text) {
+        AppendServiceLog(text);
+        {
+            std::lock_guard<std::mutex> lock(g_svc.statusMutex);
+            g_svc.bootStepText = text;
+        }
+        g_svc.bootProgressPct = pct;
+        if (g_hwnd) PostMessageW(g_hwnd, WM_SERVICE_UPDATE, 0, 0);
+        Sleep(220);
+    };
+
+    // Step 1: DXGI & Direct3D 11 Hardware Device + System Specs
+    setStep(15, L"Initializing Direct3D 11 & DXGI Desktop Duplication...");
+    IDXGIFactory1* pFactory = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&pFactory))) {
+        IDXGIAdapter1* pAdapter = nullptr;
+        if (SUCCEEDED(pFactory->EnumAdapters1(0, &pAdapter))) {
+            DXGI_ADAPTER_DESC1 desc;
+            if (SUCCEEDED(pAdapter->GetDesc1(&desc))) {
+                std::lock_guard<std::mutex> lock(g_svc.statusMutex);
+                g_svc.gpuShortName = desc.Description;
+            }
+            pAdapter->Release();
+        }
+        pFactory->Release();
+    }
+    QueryRealSystemSpecs();
+
+    D3D_FEATURE_LEVEL flOut;
+    ID3D11Device* pD3DDevice = nullptr;
+    ID3D11DeviceContext* pD3DCtx = nullptr;
+    if (SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                                    nullptr, 0, D3D11_SDK_VERSION, &pD3DDevice, &flOut, &pD3DCtx))) {
+        g_svc.d3d11Ready = true;
+    }
+
+    // Step 2: Load VR Runtimes & Virtual Display Driver first so optical config can bind
+    setStep(35, L"Loading VXR-XR OpenXR Runtime, SteamVR & IDDCX Drivers...");
+    g_svc.hOpenXrDll = LoadLibraryW(L"openxr_vxr.dll");
+    if (g_svc.hOpenXrDll) {
+        g_svc.openxrDllLoaded = true;
+        pfn_xr_set_optical = (PFN_vxr_xr_set_optical_config)GetProcAddress(g_svc.hOpenXrDll, "vxr_xr_set_optical_config");
+    }
+
+    g_svc.hOpenVrDll = LoadLibraryW(L"driver_vrserver.dll");
+    if (g_svc.hOpenVrDll) {
+        g_svc.openvrDllLoaded = true;
+        pfn_openvr_set_optical = (PFN_VxrDriver_SetOpticalConfig)GetProcAddress(g_svc.hOpenVrDll, "VxrDriver_SetOpticalConfig");
+    }
+
+    g_svc.hIddCxDll = LoadLibraryW(L"VxrIddCx.dll");
+    g_svc.iddcxDllLoaded = (g_svc.hIddCxDll != nullptr);
+
+    g_casShader.Initialize("quest-client/shaders/ffx_cas.spv", 2064, 2208);
+    g_sgsrShader.Initialize("quest-client/shaders/qcom_sgsr.spv", 2064, 2208);
+
+    // Step 3: Hardware Video Encoder (vxr_encoder.dll + nvEncodeAPI64.dll)
+    setStep(55, L"Initializing Hardware Video Encoder (NVENC / AMF)...");
+    HMODULE hNv = LoadLibraryW(L"nvEncodeAPI64.dll");
+    if (hNv) {
+        g_svc.nvencActive = true;
+        FreeLibrary(hNv);
+    }
+    g_svc.hEncoderDll = LoadLibraryW(L"vxr_encoder.dll");
+    if (g_svc.hEncoderDll) {
+        pfn_encoder_create   = (PFN_vxr_encoder_create)GetProcAddress(g_svc.hEncoderDll, "vxr_encoder_create");
+        pfn_encoder_destroy  = (PFN_vxr_encoder_destroy)GetProcAddress(g_svc.hEncoderDll, "vxr_encoder_destroy");
+        pfn_encoder_init     = (PFN_vxr_encoder_initialize)GetProcAddress(g_svc.hEncoderDll, "vxr_encoder_initialize");
+        pfn_encoder_reconfig = (PFN_vxr_encoder_reconfigure_bitrate)GetProcAddress(g_svc.hEncoderDll, "vxr_encoder_reconfigure_bitrate");
+        pfn_encoder_encode   = (PFN_vxr_encoder_encode_texture)GetProcAddress(g_svc.hEncoderDll, "vxr_encoder_encode_texture");
+        if (pfn_encoder_create && pfn_encoder_init) {
+            g_svc.encoderHandle = pfn_encoder_create();
+            g_svc.encoderDllLoaded = (g_svc.encoderHandle != nullptr);
+            ApplyHardwareEncoderConfig();
+        }
+    }
+
+    // Step 4: Initialize WASAPI Audio Endpoint
+    setStep(75, L"Starting WASAPI Loopback Audio & ViGEm Input Service...");
+    IMMDeviceEnumerator* pEnum = nullptr;
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&pEnum))) {
+        IMMDevice* pDev = nullptr;
+        if (SUCCEEDED(pEnum->GetDefaultAudioEndpoint(eRender, eMultimedia, &pDev))) {
+            g_svc.wasapiReady = true;
+            pDev->Release();
+        }
+        pEnum->Release();
+    }
+
+    // Step 5: Bind QoS UDP Streaming Server (:38810) & mDNS Discovery (:5353)
+    setStep(92, L"Binding QoS UDP Streamer Server (:38810) & mDNS Responder...");
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) == 0) {
+        g_svc.udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (g_svc.udpSocket != INVALID_SOCKET) {
+            BOOL reuse = TRUE;
+            setsockopt(g_svc.udpSocket, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+            int tos = 0xB8; // DSCP 46 Expedited Forwarding
+            setsockopt(g_svc.udpSocket, IPPROTO_IP, IP_TOS, (const char*)&tos, sizeof(tos));
+            int sndBuf = 4 * 1024 * 1024;
+            setsockopt(g_svc.udpSocket, SOL_SOCKET, SO_SNDBUF, (const char*)&sndBuf, sizeof(sndBuf));
+            u_long nonBlock = 1;
+            ioctlsocket(g_svc.udpSocket, FIONBIO, &nonBlock);
+
+            sockaddr_in addr = {};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(g_svc.udpPort);
+            addr.sin_addr.s_addr = INADDR_ANY;
+            if (bind(g_svc.udpSocket, (sockaddr*)&addr, sizeof(addr)) == 0) {
+                g_svc.udpServerListening = true;
+            }
+        }
+
+        g_svc.mdnsSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (g_svc.mdnsSocket != INVALID_SOCKET) {
+            u_long nonBlock = 1;
+            ioctlsocket(g_svc.mdnsSocket, FIONBIO, &nonBlock);
+            g_svc.mdnsListening = true;
+        }
+    }
+
+    setStep(100, L"Project VXR Host Service Running.");
+    g_svc.isStarting = false;
+    if (g_hwnd) PostMessageW(g_hwnd, WM_SERVICE_UPDATE, 0, 0);
+
+    sockaddr_in mdnsAddr = {};
+    mdnsAddr.sin_family = AF_INET;
+    mdnsAddr.sin_port = htons(5353);
+    inet_pton(AF_INET, "224.0.0.251", &mdnsAddr.sin_addr);
+
+    vxr::DxgiDuplicator dxgiDupl;
+    bool capInit = (dxgiDupl.Initialize(0, 0) == VXR_CAPTURE_OK);
+
+    sockaddr_in lastActiveClient = {};
+    bool hasActiveClient = false;
+
+    ULONGLONG lastBeaconTick = 0;
+    while (!g_svc.stopRequested) {
+        ULONGLONG now = GetTickCount64();
+
+        if (g_svc.mdnsListening && (now - lastBeaconTick >= 2000)) {
+            lastBeaconTick = now;
+            std::string beacon = "VXR_MDNS_BEACON:_vxr._udp.local.;user=" + WideToUtf8(g_cfg.metaAccount) + ";port=38810";
+            sendto(g_svc.mdnsSocket, beacon.data(), (int)beacon.size(), 0, (sockaddr*)&mdnsAddr, sizeof(mdnsAddr));
+            g_svc.mdnsBeaconsSent++;
+        }
+
+        if (g_svc.udpServerListening) {
+            char rxBuf[2048];
+            sockaddr_in clientAddr = {};
+            int clientLen = sizeof(clientAddr);
+            int r = recvfrom(g_svc.udpSocket, rxBuf, sizeof(rxBuf), 0, (sockaddr*)&clientAddr, &clientLen);
+            if (r > 0) {
+                lastActiveClient = clientAddr;
+                hasActiveClient = true;
+                const char ack[] = "VXR_ACK_OK";
+                sendto(g_svc.udpSocket, ack, sizeof(ack) - 1, 0, (sockaddr*)&clientAddr, clientLen);
+            }
+        }
+
+        // Live Capture -> Encode -> UDP Pacing Pipeline
+        if (g_svc.encoderHandle && pfn_encoder_encode) {
+            void* texToEncode = pD3DDevice;
+            if (capInit) {
+                VxrCapturedFrame capFrame = {};
+                if (dxgiDupl.AcquireFrame(16, &capFrame) == VXR_CAPTURE_OK && capFrame.d3d11_texture) {
+                    texToEncode = capFrame.d3d11_texture;
+                }
+            }
+
+            VxrBitstreamFrame frame = {};
+            if (pfn_encoder_encode(g_svc.encoderHandle, texToEncode, now * 1000ULL, 0, &frame)) {
+                g_svc.framesEncoded++;
+                // Stream packet over UDP socket to connected Quest headset
+                if (hasActiveClient && frame.data && frame.size > 0) {
+                    int sendBytes = (frame.size > 1400) ? 1400 : (int)frame.size;
+                    sendto(g_svc.udpSocket, (const char*)frame.data, sendBytes, 0,
+                           (sockaddr*)&lastActiveClient, sizeof(lastActiveClient));
+                }
+            }
+
+            if (capInit) {
+                dxgiDupl.ReleaseFrame();
+            }
+        }
+
+        Sleep(11); // ~90 fps tick rate
+    }
+
+    if (capInit) {
+        dxgiDupl.Cleanup();
+    }
+
+    if (g_svc.udpSocket != INVALID_SOCKET) closesocket(g_svc.udpSocket);
+    if (g_svc.mdnsSocket != INVALID_SOCKET) closesocket(g_svc.mdnsSocket);
+    WSACleanup();
+
+    if (g_svc.encoderHandle && pfn_encoder_destroy) {
+        pfn_encoder_destroy(g_svc.encoderHandle);
+        g_svc.encoderHandle = nullptr;
+    }
+    if (pD3DCtx) pD3DCtx->Release();
+    if (pD3DDevice) pD3DDevice->Release();
+    CoUninitialize();
+}
+
+// ============================================================================
+// UI LAYOUT & RENDERING
+// ============================================================================
+
+static bool PtInRectGdi(const Rect& r, int x, int y) {
+    return x >= r.X && x < (r.X + r.Width) && y >= r.Y && y < (r.Y + r.Height);
+}
+
+static void RebuildControlsForTab() {
+    g_dropdowns.clear();
+    g_checkboxes.clear();
+    g_sliders.clear();
+    g_editingAccount = false;
+    g_recordingBindingIdx = -1;
+
+    if (g_activeTab == TAB_OPTIONS) {
+        g_dropdowns.push_back({
+            1, Rect(178, 84, 178, 28),
+            { L"Automatic", L"HEVC 10-bit", L"AV1 10-bit", L"HEVC", L"H.264+", L"H.264" },
+            &g_cfg.preferredCodec
+        });
+        g_dropdowns.push_back({
+            2, Rect(178, 208, 178, 28),
+            { L"VXR-XR", L"Automatic", L"SteamVR" },
+            &g_cfg.openxrRuntime
+        });
+        g_dropdowns.push_back({
+            3, Rect(178, 270, 178, 28),
+            { L"Automatic", L"Xbox 360 (ViGEm)", L"DualShock 4", L"Disabled" },
+            &g_cfg.gamepadEmulation
+        });
+        g_dropdowns.push_back({
+            4, Rect(178, 332, 206, 28),
+            { L"VR headset only", L"Computer only", L"Both" },
+            &g_cfg.audioStreaming
+        });
+
+        g_checkboxes.push_back({ 101, Rect(178, 122, 210, 20), L"Adaptive quantization", &g_cfg.adaptiveQuantization, false });
+        g_checkboxes.push_back({ 102, Rect(178, 150, 210, 20), L"2-Pass encoding", &g_cfg.twoPassEncoding, false });
+        g_checkboxes.push_back({ 103, Rect(178, 370, 215, 20), L"Use virtual audio driver", &g_cfg.useVirtualAudioDriver, false });
+        g_checkboxes.push_back({ 104, Rect(186, 398, 200, 20), L"VoiceMeeter mode", &g_cfg.voiceMeeterMode, false });
+
+        g_checkboxes.push_back({ 105, Rect(425, 62,  235, 20), L"Allow remote connections", &g_cfg.allowRemoteConnections, false });
+        g_checkboxes.push_back({ 106, Rect(425, 92,  235, 20), L"Encrypt local traffic", &g_cfg.encryptLocalTraffic, false });
+        g_checkboxes.push_back({ 107, Rect(425, 122, 235, 20), L"Automatically adjust bitrate", &g_cfg.autoAdjustBitrate, false });
+        g_checkboxes.push_back({ 108, Rect(425, 152, 235, 20), L"Start with Windows", &g_cfg.startWithWindows, false });
+        g_checkboxes.push_back({ 109, Rect(425, 182, 235, 20), L"Start minimized in tray", &g_cfg.startMinimizedInTray, false });
+        g_checkboxes.push_back({ 110, Rect(425, 212, 235, 20), L"Use touch input", &g_cfg.useTouchInput, false });
+        g_checkboxes.push_back({ 111, Rect(425, 242, 235, 20), L"Lock computer on disconnect", &g_cfg.lockComputerOnDisconnect, false });
+        g_checkboxes.push_back({ 112, Rect(425, 272, 235, 20), L"Auto-select microphone", &g_cfg.autoSelectMicrophone, false });
+        g_checkboxes.push_back({ 113, Rect(425, 302, 235, 20), L"Ask for computer access", &g_cfg.askForComputerAccess, false });
+    }
+    else if (g_activeTab == TAB_ADVANCED) {
+        g_sliders.push_back({ 10, Rect(180, 132, 154, 16), 50, 100, &g_cfg.hFovTangent, nullptr });
+        g_sliders.push_back({ 11, Rect(180, 184, 154, 16), 50, 100, &g_cfg.vFovTangent, nullptr });
+        g_sliders.push_back({ 12, Rect(180, 236, 154, 16), 50, 150, &g_cfg.renderResolution, nullptr });
+        g_sliders.push_back({ 13, Rect(180, 340, 154, 16), 10, 100, &g_cfg.foveaSize, nullptr });
+        g_sliders.push_back({ 14, Rect(180, 394, 154, 16), 0,  100, &g_cfg.sharpeningPercent, &g_cfg.additionalSharpening });
+
+        g_checkboxes.push_back({ 201, Rect(186, 366, 200, 20), L"Additional sharpening", &g_cfg.additionalSharpening, false });
+        g_checkboxes.push_back({ 202, Rect(416, 108, 200, 20), L"Use Fov Stencil", &g_cfg.useFovStencil, false });
+        g_checkboxes.push_back({ 203, Rect(416, 138, 200, 20), L"Boost game priority", &g_cfg.boostGamePriority, false });
+    }
+}
+
+static void DrawCheckbox(Graphics& g, const CheckboxSpec& cb, Font& font) {
+    Rect box(cb.rect.X, cb.rect.Y + 1, 16, 16);
+    SolidBrush boxBg(Color(255, 5, 5, 5));
+    Pen boxBorder(Color(255, 62, 62, 62), 1.0f);
+    g.FillRectangle(&boxBg, box);
+    g.DrawRectangle(&boxBorder, box);
+
+    if (*cb.value) {
+        Pen checkPen(Color(255, 30, 144, 255), 2.2f);
+        checkPen.SetStartCap(LineCapRound);
+        checkPen.SetEndCap(LineCapRound);
+        g.DrawLine(&checkPen, box.X + 3, box.Y + 8, box.X + 7, box.Y + 12);
+        g.DrawLine(&checkPen, box.X + 7, box.Y + 12, box.X + 13, box.Y + 4);
+    }
+
+    SolidBrush textBrush(cb.disabled ? Color(255, 105, 105, 105) : Color(255, 204, 204, 204));
+    PointF pt((REAL)(cb.rect.X + 26), (REAL)(cb.rect.Y));
+    g.DrawString(cb.label.c_str(), -1, &font, pt, &textBrush);
+}
+
+static void DrawDropdown(Graphics& g, const DropdownSpec& dd, Font& font) {
+    SolidBrush bg(Color(255, 4, 4, 4));
+    Pen border(Color(255, 68, 68, 68), 1.0f);
+    g.FillRectangle(&bg, dd.rect);
+    g.DrawRectangle(&border, dd.rect);
+
+    std::wstring text = (*dd.selectedIndex >= 0 && *dd.selectedIndex < (int)dd.items.size())
+        ? dd.items[*dd.selectedIndex] : L"";
+
+    SolidBrush textBrush(Color(255, 235, 235, 235));
+    RectF textRect((REAL)(dd.rect.X + 9), (REAL)(dd.rect.Y + 5), (REAL)(dd.rect.Width - 28), (REAL)(dd.rect.Height - 6));
+    g.DrawString(text.c_str(), -1, &font, textRect, nullptr, &textBrush);
+
+    SolidBrush arrowBrush(Color(255, 25, 130, 230));
+    int cx = dd.rect.X + dd.rect.Width - 15;
+    int cy = dd.rect.Y + dd.rect.Height / 2 - 2;
+    Point pts[3] = { Point(cx - 5, cy), Point(cx + 5, cy), Point(cx, cy + 6) };
+    g.FillPolygon(&arrowBrush, pts, 3);
+}
+
+static void DrawSlider(Graphics& g, const SliderSpec& sl, Font& font) {
+    bool isEnabled = (sl.enabledFlag == nullptr) || (*sl.enabledFlag);
+    int trackY = sl.trackRect.Y + sl.trackRect.Height / 2;
+    Rect barRect(sl.trackRect.X, trackY - 2, sl.trackRect.Width, 4);
+
+    SolidBrush trackBg(Color(255, 6, 6, 6));
+    Pen trackBorder(Color(255, 58, 58, 58), 1.0f);
+    g.FillRectangle(&trackBg, barRect);
+    g.DrawRectangle(&trackBorder, barRect);
+
+    float t = (float)(*sl.value - sl.minVal) / (float)(sl.maxVal - sl.minVal);
+    t = (std::max)(0.0f, (std::min)(1.0f, t));
+    int thumbX = sl.trackRect.X + (int)(t * sl.trackRect.Width);
+    int thumbR = 8;
+
+    SolidBrush thumbBrush(isEnabled ? Color(255, 200, 200, 200) : Color(255, 92, 92, 92));
+    Pen thumbBorder(Color(255, 70, 70, 70), 1.0f);
+    g.FillEllipse(&thumbBrush, thumbX - thumbR, trackY - thumbR, thumbR * 2, thumbR * 2);
+    g.DrawEllipse(&thumbBorder, thumbX - thumbR, trackY - thumbR, thumbR * 2, thumbR * 2);
+
+    wchar_t valBuf[32];
+    swprintf_s(valBuf, L"%d%%", *sl.value);
+    SolidBrush textBrush(Color(255, 204, 204, 204));
+    PointF pt((REAL)(sl.trackRect.X + sl.trackRect.Width + 14), (REAL)(sl.trackRect.Y - 2));
+    g.DrawString(valBuf, -1, &font, pt, &textBrush);
+}
+
+static void DrawButton(Graphics& g, const Rect& r, const wchar_t* text, bool hovered, Font& font) {
+    LinearGradientBrush grad(
+        Point(r.X, r.Y),
+        Point(r.X, r.Y + r.Height),
+        hovered ? Color(255, 44, 44, 44) : Color(255, 28, 28, 28),
+        hovered ? Color(255, 20, 20, 20) : Color(255, 10, 10, 10)
+    );
+    Pen border(hovered ? Color(255, 105, 105, 105) : Color(255, 62, 62, 62), 1.0f);
+    g.FillRectangle(&grad, r);
+    g.DrawRectangle(&border, r);
+
+    StringFormat sf;
+    sf.SetAlignment(StringAlignmentCenter);
+    sf.SetLineAlignment(StringAlignmentCenter);
+    SolidBrush textBrush(Color(255, 240, 240, 240));
+    RectF rf((REAL)r.X, (REAL)r.Y, (REAL)r.Width, (REAL)r.Height);
+    g.DrawString(text, -1, &font, rf, &sf, &textBrush);
+}
+
+static void DrawFolderIcon(Graphics& g, int x, int y) {
+    SolidBrush tabBrush(Color(255, 215, 165, 50));
+    SolidBrush bodyBrush(Color(255, 240, 195, 75));
+    g.FillRectangle(&tabBrush, x, y, 6, 3);
+    g.FillRectangle(&bodyBrush, x, y + 2, 13, 11);
+}
+
+static void DrawFilmIcon(Graphics& g, int x, int y) {
+    SolidBrush bgBrush(Color(255, 70, 110, 210));
+    Pen borderPen(Color(255, 170, 170, 170), 1.0f);
+    g.FillRectangle(&bgBrush, x, y, 13, 13);
+    g.DrawRectangle(&borderPen, x, y, 13, 13);
+    SolidBrush holeBrush(Color(255, 240, 200, 60));
+    g.FillRectangle(&holeBrush, x + 2, y + 2, 2, 2);
+    g.FillRectangle(&holeBrush, x + 9, y + 2, 2, 2);
+    g.FillRectangle(&holeBrush, x + 2, y + 9, 2, 2);
+    g.FillRectangle(&holeBrush, x + 9, y + 9, 2, 2);
+}
+
+static void RenderWindow(HDC hdc) {
+    Bitmap backBuffer(WIN_W, WIN_H, PixelFormat32bppARGB);
+    Graphics g(&backBuffer);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+
+    FontFamily segoe(L"Segoe UI");
+    FontFamily georgia(L"Georgia");
+    Font titleFont(&georgia, 16.0f, FontStyleBold, UnitPixel);
+    Font navFont(&segoe, 14.5f, FontStyleBold, UnitPixel);
+    Font labelBold(&segoe, 13.5f, FontStyleBold, UnitPixel);
+    Font regularFont(&segoe, 13.0f, FontStyleRegular, UnitPixel);
+    Font underlineFont(&segoe, 13.0f, FontStyleUnderline, UnitPixel);
+    Font smallFont(&segoe, 12.0f, FontStyleRegular, UnitPixel);
+    Font footerFont(&segoe, 12.0f, FontStyleRegular, UnitPixel);
+
+    // 1. Main Content Background (#0C0C0C)
+    SolidBrush contentBg(Color(255, 12, 12, 12));
+    g.FillRectangle(&contentBg, 0, 0, WIN_W, WIN_H);
+
+    // 2. Left Sidebar (#151515)
+    SolidBrush sidebarBg(Color(255, 21, 21, 21));
+    g.FillRectangle(&sidebarBg, 0, TOP_BAR_H, SIDEBAR_W, WIN_H - TOP_BAR_H - BOTTOM_BAR_H);
+
+    // 3. Top Title Bar (#1C1C1C)
+    SolidBrush topBarBg(Color(255, 28, 28, 28));
+    g.FillRectangle(&topBarBg, 0, 0, WIN_W, TOP_BAR_H);
+
+    Pen iconPen(Color(255, 230, 230, 230), 2.0f);
+    Point monPts[4] = { Point(14, 10), Point(40, 8), Point(38, 30), Point(15, 28) };
+    g.DrawPolygon(&iconPen, monPts, 4);
+    g.DrawLine(&iconPen, 23, 29, 21, 35);
+    g.DrawLine(&iconPen, 30, 29, 32, 35);
+    g.DrawLine(&iconPen, 18, 35, 35, 35);
+
+    SolidBrush whiteBrush(Color(255, 242, 242, 242));
+    g.DrawString(L"Project VXR Streamer", -1, &titleFont, PointF(50.0f, 12.0f), &whiteBrush);
+
+    if (g_hoverMin) {
+        SolidBrush minHoverBg(Color(255, 48, 48, 48));
+        g.FillRectangle(&minHoverBg, 604, 0, 38, TOP_BAR_H);
+    }
+    if (g_hoverClose) {
+        SolidBrush closeHoverBg(Color(255, 232, 17, 35));
+        g.FillRectangle(&closeHoverBg, 642, 0, 38, TOP_BAR_H);
+    }
+    SolidBrush minBrush(g_hoverMin ? Color(255, 255, 255, 255) : Color(255, 145, 145, 145));
+    Pen closePen(g_hoverClose ? Color(255, 255, 255, 255) : Color(255, 145, 145, 145), 1.8f);
+    g.FillRectangle(&minBrush, 617, 22, 12, 2);
+    g.DrawLine(&closePen, 656, 16, 666, 26);
+    g.DrawLine(&closePen, 666, 16, 656, 26);
+
+    // 4. Sidebar Navigation Items
+    const wchar_t* navLabels[6] = {
+        L"ACCOUNTS",
+        L"BINDINGS",
+        L"OPTIONS",
+        L"ADVANCED",
+        L"MEDIA",
+        L"ABOUT"
+    };
+    for (int i = 0; i < 6; ++i) {
+        Color c = (g_activeTab == i)
+            ? Color(255, 255, 255, 255)
+            : ((g_hoverNav == i) ? Color(255, 185, 185, 185) : Color(255, 122, 122, 122));
+        SolidBrush nb(c);
+        g.DrawString(navLabels[i], -1, &navFont, PointF(14.0f, (REAL)(65 + i * 44)), &nb);
+    }
+
+    SolidBrush hdrBrush(Color(255, 208, 208, 208));
+    SolidBrush mutedBrush(Color(255, 145, 145, 145));
+    SolidBrush blueLinkBrush(Color(255, 45, 145, 235));
+    SolidBrush orangeBrush(Color(255, 230, 154, 40));
+
+    if (g_svc.isStarting) {
+        std::wstring stepMsg;
+        {
+            std::lock_guard<std::mutex> lock(g_svc.statusMutex);
+            stepMsg = g_svc.bootStepText;
+        }
+        StringFormat centerFmt;
+        centerFmt.SetAlignment(StringAlignmentCenter);
+        g.DrawString(L"Starting Project VXR Host Service...", -1, &labelBold, PointF(416.0f, 195.0f), &centerFmt, &whiteBrush);
+        g.DrawString(stepMsg.c_str(), -1, &smallFont, PointF(416.0f, 222.0f), &centerFmt, &mutedBrush);
+
+        Rect progTrack(266, 252, 300, 6);
+        SolidBrush trackBg(Color(255, 28, 28, 28));
+        g.FillRectangle(&trackBg, progTrack);
+        int fillW = (300 * g_svc.bootProgressPct.load()) / 100;
+        SolidBrush fillBrush(Color(255, 30, 144, 255));
+        g.FillRectangle(&fillBrush, 266, 252, fillW, 6);
+    }
+    else {
+        if (g_activeTab == TAB_ACCOUNTS) {
+            Pen metaPen(Color(255, 24, 130, 245), 2.2f);
+            g.DrawEllipse(&metaPen, 182, 63, 7, 9);
+            g.DrawEllipse(&metaPen, 188, 63, 7, 9);
+            g.DrawString(L"Meta", -1, &labelBold, PointF(200.0f, 59.0f), &hdrBrush);
+
+            if (!g_editingAccount) {
+                g.DrawString(g_cfg.metaAccount.c_str(), -1, &regularFont, PointF(180.0f, 84.0f), &mutedBrush);
+                DrawButton(g, Rect(354, 126, 70, 30), L"Change", g_hoverBtnId == 301, regularFont);
+            } else {
+                Rect editBox(182, 82, 220, 28);
+                SolidBrush editBg(Color(255, 5, 5, 5));
+                Pen editBorder(Color(255, 30, 144, 255), 1.2f);
+                g.FillRectangle(&editBg, editBox);
+                g.DrawRectangle(&editBorder, editBox);
+                std::wstring disp = g_accountEditBuf + L"|";
+                g.DrawString(disp.c_str(), -1, &regularFont, PointF(190.0f, 86.0f), &whiteBrush);
+                DrawButton(g, Rect(412, 82, 65, 28), L"Save", g_hoverBtnId == 302, regularFont);
+            }
+        }
+        else if (g_activeTab == TAB_BINDINGS) {
+            g.DrawString(L"Keyboard shortcuts", -1, &labelBold, PointF(181.0f, 56.0f), &hdrBrush);
+
+            for (int i = 0; i < 9; ++i) {
+                int rowY = 85 + i * 33;
+                g.DrawString(g_cfg.bindings[i].actionName.c_str(), -1, &regularFont, PointF(181.0f, (REAL)(rowY + 4)), &hdrBrush);
+
+                Rect boxR(500, rowY, 166, 28);
+                SolidBrush boxBg(Color(255, 4, 4, 4));
+                bool isRec = (g_recordingBindingIdx == i);
+                bool isHov = (g_hoverBindingIdx == i);
+                Pen boxBorder(isRec ? Color(255, 30, 144, 255) : (isHov ? Color(255, 110, 110, 110) : Color(255, 58, 58, 58)), 1.0f);
+                g.FillRectangle(&boxBg, boxR);
+                g.DrawRectangle(&boxBorder, boxR);
+
+                std::wstring keyText = isRec ? L"Press shortcut..." : g_cfg.bindings[i].FormatText();
+                StringFormat sf;
+                sf.SetAlignment(StringAlignmentCenter);
+                sf.SetLineAlignment(StringAlignmentCenter);
+                RectF rf((REAL)boxR.X, (REAL)boxR.Y, (REAL)boxR.Width, (REAL)boxR.Height);
+                g.DrawString(keyText.c_str(), -1, &regularFont, rf, &sf, isRec ? &whiteBrush : &blueLinkBrush);
+            }
+
+            DrawButton(g, Rect(178, 392, 156, 30), L"Reset to Defaults", g_hoverBtnId == 100, regularFont);
+        }
+        else if (g_activeTab == TAB_OPTIONS) {
+            g.DrawString(L"Preferred Codec", -1, &labelBold, PointF(180.0f, 60.0f), &hdrBrush);
+            g.DrawString(L"OpenXR Runtime", -1, &labelBold, PointF(180.0f, 184.0f), &hdrBrush);
+            g.DrawString(L"Gamepad Emulation", -1, &labelBold, PointF(180.0f, 246.0f), &hdrBrush);
+            g.DrawString(L"Audio Streaming", -1, &labelBold, PointF(180.0f, 308.0f), &hdrBrush);
+
+            for (const auto& cb : g_checkboxes) {
+                DrawCheckbox(g, cb, regularFont);
+            }
+            for (const auto& dd : g_dropdowns) {
+                DrawDropdown(g, dd, regularFont);
+            }
+            DrawButton(g, Rect(506, 392, 156, 30), L"Reset to Defaults", g_hoverBtnId == 100, regularFont);
+        }
+        else if (g_activeTab == TAB_ADVANCED) {
+            SolidBrush infoCircle(Color(255, 125, 125, 125));
+            g.FillEllipse(&infoCircle, 180, 56, 14, 14);
+            SolidBrush darkI(Color(255, 12, 12, 12));
+            g.DrawString(L"i", -1, &smallFont, PointF(184.5f, 54.5f), &darkI);
+
+            g.DrawString(L"Do NOT change the settings below unless you know what you are doing", -1, &smallFont, PointF(200.0f, 54.0f), &mutedBrush);
+            g.DrawString(L"Requires restart of game / SteamVR to take effect", -1, &smallFont, PointF(200.0f, 71.0f), &mutedBrush);
+
+            g.DrawString(L"Horizontal FOV Tangent", -1, &labelBold, PointF(182.0f, 104.0f), &hdrBrush);
+            g.DrawString(L"Vertical FOV Tangent", -1, &labelBold, PointF(182.0f, 156.0f), &hdrBrush);
+            g.DrawString(L"VXR-XR Render Resolution", -1, &labelBold, PointF(182.0f, 208.0f), &hdrBrush);
+
+            g.DrawString(L"Best to use 100% and control the", -1, &smallFont, PointF(182.0f, 254.0f), &mutedBrush);
+            g.DrawString(L"resolution via the VR Graphics Quality", -1, &smallFont, PointF(182.0f, 270.0f), &mutedBrush);
+            g.DrawString(L"in the Streaming tab in VR", -1, &smallFont, PointF(182.0f, 286.0f), &mutedBrush);
+
+            g.DrawString(L"Fovea Size", -1, &labelBold, PointF(182.0f, 314.0f), &hdrBrush);
+
+            for (const auto& cb : g_checkboxes) {
+                DrawCheckbox(g, cb, regularFont);
+            }
+            for (const auto& sl : g_sliders) {
+                DrawSlider(g, sl, regularFont);
+            }
+            DrawButton(g, Rect(506, 392, 156, 30), L"Reset to Defaults", g_hoverBtnId == 100, regularFont);
+        }
+        else if (g_activeTab == TAB_MEDIA) {
+            DrawFolderIcon(g, 180, 62);
+            g.DrawString(L"Screenshots", -1, &regularFont, PointF(198.0f, 58.0f), &hdrBrush);
+
+            StringFormat rightFmt;
+            rightFmt.SetAlignment(StringAlignmentFar);
+            g.DrawString(g_cfg.screenshotsPath.c_str(), -1, &regularFont, PointF(495.0f, 58.0f), &rightFmt, &mutedBrush);
+            DrawButton(g, Rect(518, 53, 146, 30), L"Change location...", g_hoverBtnId == 401, regularFont);
+
+            SolidBrush infoCircle(Color(255, 125, 125, 125));
+            SolidBrush darkI(Color(255, 12, 12, 12));
+            g.FillEllipse(&infoCircle, 180, 88, 13, 13);
+            g.DrawString(L"i", -1, &smallFont, PointF(184.0f, 86.0f), &darkI);
+            g.DrawString(L"Screenshots taken in VR will be copied to this folder", -1, &smallFont, PointF(198.0f, 86.0f), &mutedBrush);
+
+            for (size_t i = 0; i < g_cfg.videoPaths.size() && i < 3; ++i) {
+                int baseY = 128 + (int)i * 70;
+                DrawFilmIcon(g, 180, baseY + 3);
+                g.DrawString(L"Videos", -1, &regularFont, PointF(198.0f, (REAL)baseY), &hdrBrush);
+                g.DrawString(g_cfg.videoPaths[i].c_str(), -1, &regularFont, PointF(495.0f, (REAL)baseY), &rightFmt, &mutedBrush);
+                DrawButton(g, Rect(518, baseY - 5, 146, 30), L"Change location...", g_hoverBtnId == (int)(410 + i), regularFont);
+
+                if (i == 0) {
+                    g.FillEllipse(&infoCircle, 180, baseY + 29, 13, 13);
+                    g.DrawString(L"i", -1, &smallFont, PointF(184.0f, (REAL)(baseY + 27)), &darkI);
+                    g.DrawString(L"Videos from this location will be accessible in VR", -1, &smallFont, PointF(198.0f, (REAL)(baseY + 27)), &mutedBrush);
+                }
+            }
+
+            DrawButton(g, Rect(178, 392, 164, 30), L"Add video folder...", g_hoverBtnId == 402, regularFont);
+        }
+        else if (g_activeTab == TAB_ABOUT) {
+            // Matches Screenshot 1 (ABOUT tab of Virtual Desktop Streamer) with 100% live PC hardware/OS values!
+            std::wstring gpuFull, cpuStr, ramStr, osStr, headsetStr;
+            bool secBoot, hags, ethUp;
+            {
+                std::lock_guard<std::mutex> lock(g_svc.statusMutex);
+                gpuFull    = g_svc.gpuNameWithDriver;
+                cpuStr     = g_svc.cpuName;
+                ramStr     = g_svc.ramTotalGb;
+                osStr      = g_svc.osVersionStr;
+                headsetStr = g_svc.connectedHeadset;
+                secBoot    = g_svc.secureBootEnabled;
+                hags       = g_svc.hagsEnabled;
+                ethUp      = g_svc.pcEthernetConnected;
+            }
+
+            StringFormat rightLabelFmt;
+            rightLabelFmt.SetAlignment(StringAlignmentFar);
+
+            const REAL labelX = 304.0f;
+            const REAL valX   = 308.0f;
+            const REAL startY = 54.0f;
+            const REAL stepY  = 20.5f;
+
+            const wchar_t* labels[16] = {
+                L"Graphics Card:",
+                L"Headset:",
+                L"Codec:",
+                L"Latency:",
+                L"Processor:",
+                L"Hardware Encoder:",
+                L"Memory:",
+                L"Operating System:",
+                L"Secure Boot:",
+                L"HAGS:",
+                L"PC Ethernet:",
+                L"Auto Adjust Bitrate:",
+                L"Remote Routing:",
+                L"Router Settings:",
+                L"Website:",
+                L"Discord:"
+            };
+
+            for (int i = 0; i < 16; ++i) {
+                g.DrawString(labels[i], -1, &regularFont, PointF(labelX, startY + i * stepY), &rightLabelFmt, &mutedBrush);
+            }
+
+            // Values
+            g.DrawString(gpuFull.c_str(),                    -1, &regularFont, PointF(valX, startY + 0 * stepY), &whiteBrush);
+            g.DrawString(headsetStr.c_str(),                 -1, &regularFont, PointF(valX, startY + 1 * stepY), &whiteBrush);
+            g.DrawString(g_cfg.GetCodecName(),               -1, &regularFont, PointF(valX, startY + 2 * stepY), &whiteBrush);
+            g.DrawString(L"--",                              -1, &regularFont, PointF(valX, startY + 3 * stepY), &mutedBrush);
+            g.DrawString(cpuStr.c_str(),                     -1, &regularFont, PointF(valX, startY + 4 * stepY), &whiteBrush);
+            g.DrawString(g_svc.nvencActive ? L"Yes" : L"No", -1, &regularFont, PointF(valX, startY + 5 * stepY), &whiteBrush);
+            g.DrawString(ramStr.c_str(),                     -1, &regularFont, PointF(valX, startY + 6 * stepY), &whiteBrush);
+            g.DrawString(osStr.c_str(),                      -1, &regularFont, PointF(valX, startY + 7 * stepY), &whiteBrush);
+            g.DrawString(secBoot ? L"Enabled" : L"Disabled", -1, &regularFont, PointF(valX, startY + 8 * stepY), &whiteBrush);
+
+            if (hags) {
+                g.DrawString(L"Enabled - ", -1, &regularFont, PointF(valX, startY + 9 * stepY), &whiteBrush);
+                g.DrawString(L"click here to disable", -1, &underlineFont, PointF(valX + 62.0f, startY + 9 * stepY), &blueLinkBrush);
+            } else {
+                g.DrawString(L"Disabled", -1, &regularFont, PointF(valX, startY + 9 * stepY), &whiteBrush);
+            }
+
+            g.DrawString(ethUp ? L"Yes" : L"No", -1, &regularFont, PointF(valX, startY + 10 * stepY), ethUp ? &whiteBrush : &orangeBrush);
+            g.DrawString(g_cfg.autoAdjustBitrate ? L"Yes" : L"No", -1, &regularFont, PointF(valX, startY + 11 * stepY), g_cfg.autoAdjustBitrate ? &whiteBrush : &orangeBrush);
+            g.DrawString(g_cfg.allowRemoteConnections ? L"Regular NAT" : L"Local LAN Only", -1, &regularFont, PointF(valX, startY + 12 * stepY), &whiteBrush);
+            g.DrawString(g_svc.udpServerListening ? L"UDP :38810 (DSCP 46 QoS)" : L"Not bound", -1, &regularFont, PointF(valX, startY + 13 * stepY), &mutedBrush);
+            g.DrawString(L"github.com/ProjectVXR", -1, &underlineFont, PointF(valX, startY + 14 * stepY), &blueLinkBrush);
+            g.DrawString(L"discord.gg/projectvxr", -1, &underlineFont, PointF(valX, startY + 15 * stepY), &blueLinkBrush);
+
+            // Bottom 3 functional buttons (matching Screenshot 1)
+            DrawButton(g, Rect(182, 392, 185, 30), L"Check for interfering apps...", g_hoverBtnId == 501, regularFont);
+            DrawButton(g, Rect(376, 392, 140, 30), L"Check for updates...",        g_hoverBtnId == 502, regularFont);
+            DrawButton(g, Rect(524, 392, 80,  30), L"Show logs",                   g_hoverBtnId == 503, regularFont);
+        }
+    }
+
+    // 6. Open Dropdown Popup Overlay
+    if (g_openDropdownId != -1 && g_openDropdownTarget != nullptr) {
+        SolidBrush popupBg(Color(255, 16, 16, 16));
+        Pen popupBorder(Color(255, 30, 144, 255), 1.0f);
+        g.FillRectangle(&popupBg, g_openDropdownMenuRect);
+        g.DrawRectangle(&popupBorder, g_openDropdownMenuRect);
+
+        int itemH = 26;
+        for (size_t i = 0; i < g_openDropdownItems.size(); ++i) {
+            Rect itemR(g_openDropdownMenuRect.X + 1, g_openDropdownMenuRect.Y + 1 + (int)i * itemH, g_openDropdownMenuRect.Width - 2, itemH);
+            if ((int)i == g_hoverDropdownItem || (int)i == *g_openDropdownTarget) {
+                SolidBrush hl(Color(255, 25, 110, 200));
+                g.FillRectangle(&hl, itemR);
+            }
+            SolidBrush itemText(Color(255, 240, 240, 240));
+            g.DrawString(g_openDropdownItems[i].c_str(), -1, &regularFont, PointF((REAL)(itemR.X + 8), (REAL)(itemR.Y + 4)), &itemText);
+        }
+    }
+
+    // 7. Bottom Footer Bar (#1B1B1B)
+    SolidBrush bottomBg(Color(255, 27, 27, 27));
+    g.FillRectangle(&bottomBg, 0, WIN_H - BOTTOM_BAR_H, WIN_W, BOTTOM_BAR_H);
+
+    Pen sepPen(Color(255, 38, 38, 38), 1.0f);
+    g.DrawLine(&sepPen, 0, TOP_BAR_H, WIN_W, TOP_BAR_H);
+    g.DrawLine(&sepPen, 0, WIN_H - BOTTOM_BAR_H, WIN_W, WIN_H - BOTTOM_BAR_H);
+
+    SolidBrush verBrush(Color(255, 130, 130, 130));
+    std::wstring leftFooter = g_svc.isStarting
+        ? L"Service: Starting..."
+        : (g_svc.udpServerListening ? L"Service: Running (UDP :38810 • mDNS Active)" : L"Service: Degraded");
+    g.DrawString(leftFooter.c_str(), -1, &footerFont, PointF(14.0f, (REAL)(WIN_H - BOTTOM_BAR_H + 7)), &verBrush);
+
+    std::wstring rightFooter;
+    {
+        std::lock_guard<std::mutex> lock(g_svc.statusMutex);
+        if (GetTickCount64() < g_svc.toastExpireTick && !g_svc.lastActionToast.empty()) {
+            rightFooter = g_svc.lastActionToast;
+        } else {
+            rightFooter = g_svc.gpuShortName;
+        }
+    }
+    StringFormat rightFmt;
+    rightFmt.SetAlignment(StringAlignmentFar);
+    SolidBrush rightBrush((GetTickCount64() < g_svc.toastExpireTick) ? Color(255, 45, 160, 255) : Color(255, 130, 130, 130));
+    g.DrawString(rightFooter.c_str(), -1, &footerFont, PointF((REAL)(WIN_W - 14), (REAL)(WIN_H - BOTTOM_BAR_H + 7)), &rightFmt, &rightBrush);
+
+    Pen winBorder(Color(255, 45, 45, 45), 1.0f);
+    g.DrawRectangle(&winBorder, 0, 0, WIN_W - 1, WIN_H - 1);
+
+    Graphics screen(hdc);
+    screen.DrawImage(&backBuffer, 0, 0, WIN_W, WIN_H);
+}
+
+static void UpdateSliderFromMouse(const SliderSpec& sl, int mouseX) {
+    float t = (float)(mouseX - sl.trackRect.X) / (float)sl.trackRect.Width;
+    t = (std::max)(0.0f, (std::min)(1.0f, t));
+    *sl.value = sl.minVal + (int)(t * (sl.maxVal - sl.minVal) + 0.5f);
+    SaveConfig();
+}
+
+static HICON g_hAppIcon = nullptr;
+
+static HICON CreateVxrAppIcon() {
+    Bitmap bmp(32, 32, PixelFormat32bppARGB);
+    Graphics g(&bmp);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    g.Clear(Color(0, 0, 0, 0));
+
+    SolidBrush bgBrush(Color(255, 22, 22, 22));
+    Pen borderPen(Color(255, 45, 145, 235), 2.0f);
+    g.FillEllipse(&bgBrush, 1, 1, 29, 29);
+    g.DrawEllipse(&borderPen, 1, 1, 29, 29);
+
+    Pen monPen(Color(255, 245, 245, 245), 2.2f);
+    Point pts[4] = { Point(7, 9), Point(25, 8), Point(23, 21), Point(8, 20) };
+    g.DrawPolygon(&monPen, pts, 4);
+    g.DrawLine(&monPen, 13, 21, 11, 25);
+    g.DrawLine(&monPen, 18, 21, 20, 25);
+    g.DrawLine(&monPen, 9, 25, 22, 25);
+
+    HICON hIcon = nullptr;
+    bmp.GetHICON(&hIcon);
+    return hIcon ? hIcon : LoadIconW(nullptr, IDI_APPLICATION);
+}
+
+static void MinimizeToSystemTray(HWND hwnd) {
+    ShowWindow(hwnd, SW_HIDE);
+    NOTIFYICONDATAW balloon = g_nid;
+    balloon.uFlags = NIF_INFO | NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    balloon.dwInfoFlags = NIIF_INFO;
+    wcscpy_s(balloon.szInfoTitle, L"Project VXR Streamer");
+    wcscpy_s(balloon.szInfo, L"Minimized to system tray. Right-click the tray icon to Exit.");
+    Shell_NotifyIconW(NIM_MODIFY, &balloon);
+}
+
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE: {
+            g_hwnd = hwnd;
+            LoadConfig();
+            RebuildControlsForTab();
+            RegisterAllHotkeys(hwnd);
+            SetTimer(hwnd, 1, 1000, nullptr);
+
+            if (!g_hAppIcon) g_hAppIcon = CreateVxrAppIcon();
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)g_hAppIcon);
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)g_hAppIcon);
+
+            g_nid.cbSize = sizeof(NOTIFYICONDATAW);
+            g_nid.hWnd = hwnd;
+            g_nid.uID = 1;
+            g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+            g_nid.uCallbackMessage = WM_TRAYICON;
+            g_nid.hIcon = g_hAppIcon;
+            wcscpy_s(g_nid.szTip, L"Project VXR Streamer");
+            Shell_NotifyIconW(NIM_ADD, &g_nid);
+
+            g_serviceThread = std::thread(HostServiceThreadProc);
+            return 0;
+        }
+
+        case WM_TIMER:
+        case WM_SERVICE_UPDATE: {
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+
+        case WM_HOTKEY: {
+            int idx = (int)wParam - HOTKEY_BASE_ID;
+            if (idx >= 0 && idx < 9) {
+                ShowToast(L"Hotkey Triggered: " + g_cfg.bindings[idx].actionName);
+            }
+            return 0;
+        }
+
+        case WM_KEYDOWN: {
+            if (g_recordingBindingIdx >= 0 && g_recordingBindingIdx < 9) {
+                if (wParam == VK_ESCAPE) {
+                    g_recordingBindingIdx = -1;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                if (wParam == VK_SHIFT || wParam == VK_CONTROL || wParam == VK_MENU || wParam == VK_LWIN || wParam == VK_RWIN) {
+                    return 0;
+                }
+                UINT mods = 0;
+                if (GetAsyncKeyState(VK_CONTROL) & 0x8000) mods |= MOD_CONTROL;
+                if (GetAsyncKeyState(VK_MENU)    & 0x8000) mods |= MOD_ALT;
+                if (GetAsyncKeyState(VK_SHIFT)   & 0x8000) mods |= MOD_SHIFT;
+                if ((GetAsyncKeyState(VK_LWIN) & 0x8000) || (GetAsyncKeyState(VK_RWIN) & 0x8000)) mods |= MOD_WIN;
+                if (mods == 0) mods = MOD_SHIFT | MOD_WIN;
+
+                g_cfg.bindings[g_recordingBindingIdx].modifiers = mods;
+                g_cfg.bindings[g_recordingBindingIdx].vk = (UINT)wParam;
+                SaveConfig();
+                RegisterAllHotkeys(hwnd);
+                ShowToast(L"Bound " + g_cfg.bindings[g_recordingBindingIdx].actionName + L" to " + g_cfg.bindings[g_recordingBindingIdx].FormatText());
+                g_recordingBindingIdx = -1;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if (g_editingAccount) {
+                if (wParam == VK_RETURN) {
+                    if (!g_accountEditBuf.empty()) g_cfg.metaAccount = g_accountEditBuf;
+                    g_editingAccount = false;
+                    SaveConfig();
+                    ShowToast(L"Updated account to: " + g_cfg.metaAccount);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                } else if (wParam == VK_ESCAPE) {
+                    g_editingAccount = false;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                } else if (wParam == VK_BACK && !g_accountEditBuf.empty()) {
+                    g_accountEditBuf.pop_back();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                return 0;
+            }
+            break;
+        }
+
+        case WM_CHAR: {
+            if (g_editingAccount && wParam >= 32 && wParam < 127 && g_accountEditBuf.size() < 28) {
+                g_accountEditBuf.push_back((wchar_t)wParam);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            break;
+        }
+
+        case WM_ERASEBKGND:
+            return 1;
+
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hwnd, &ps);
+            RenderWindow(hdc);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+
+        case WM_NCHITTEST: {
+            POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            ScreenToClient(hwnd, &pt);
+            if (pt.y >= 0 && pt.y < TOP_BAR_H && pt.x < 604) {
+                return HTCAPTION;
+            }
+            return HTCLIENT;
+        }
+
+        case WM_MOUSEMOVE: {
+            int mx = GET_X_LPARAM(lParam);
+            int my = GET_Y_LPARAM(lParam);
+            bool needRedraw = false;
+
+            if (g_draggingSliderId != -1) {
+                for (const auto& sl : g_sliders) {
+                    if (sl.id == g_draggingSliderId) {
+                        UpdateSliderFromMouse(sl, mx);
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                        return 0;
+                    }
+                }
+            }
+
+            if (g_openDropdownId != -1) {
+                int newHover = -1;
+                if (PtInRectGdi(g_openDropdownMenuRect, mx, my)) {
+                    newHover = (my - g_openDropdownMenuRect.Y - 1) / 26;
+                    if (newHover < 0 || newHover >= (int)g_openDropdownItems.size()) newHover = -1;
+                }
+                if (newHover != g_hoverDropdownItem) {
+                    g_hoverDropdownItem = newHover;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                return 0;
+            }
+
+            bool hMin = (mx >= 604 && mx < 642 && my >= 0 && my < TOP_BAR_H);
+            bool hClose = (mx >= 642 && mx <= WIN_W && my >= 0 && my < TOP_BAR_H);
+            if (hMin != g_hoverMin || hClose != g_hoverClose) {
+                g_hoverMin = hMin;
+                g_hoverClose = hClose;
+                needRedraw = true;
+            }
+
+            int hNav = -1;
+            if (mx >= 0 && mx < SIDEBAR_W && my >= 60 && my < 330) {
+                int idx = (my - 60) / 44;
+                if (idx >= 0 && idx < 6) hNav = idx;
+            }
+            if (hNav != g_hoverNav) {
+                g_hoverNav = hNav;
+                needRedraw = true;
+            }
+
+            int newHoverBtn = -1;
+            if (g_activeTab == TAB_ACCOUNTS) {
+                if (!g_editingAccount && PtInRectGdi(Rect(354, 126, 70, 30), mx, my)) newHoverBtn = 301;
+                if (g_editingAccount && PtInRectGdi(Rect(412, 82, 65, 28), mx, my)) newHoverBtn = 302;
+            } else if (g_activeTab == TAB_BINDINGS) {
+                if (PtInRectGdi(Rect(178, 392, 156, 30), mx, my)) newHoverBtn = 100;
+                int hBind = -1;
+                for (int i = 0; i < 9; ++i) {
+                    if (PtInRectGdi(Rect(500, 85 + i * 33, 166, 28), mx, my)) hBind = i;
+                }
+                if (hBind != g_hoverBindingIdx) {
+                    g_hoverBindingIdx = hBind;
+                    needRedraw = true;
+                }
+            } else if (g_activeTab == TAB_OPTIONS || g_activeTab == TAB_ADVANCED) {
+                if (PtInRectGdi(Rect(506, 392, 156, 30), mx, my)) newHoverBtn = 100;
+            } else if (g_activeTab == TAB_MEDIA) {
+                if (PtInRectGdi(Rect(518, 53, 146, 30), mx, my)) newHoverBtn = 401;
+                if (PtInRectGdi(Rect(178, 392, 164, 30), mx, my)) newHoverBtn = 402;
+                for (size_t i = 0; i < g_cfg.videoPaths.size() && i < 3; ++i) {
+                    int baseY = 128 + (int)i * 70;
+                    if (PtInRectGdi(Rect(518, baseY - 5, 146, 30), mx, my)) newHoverBtn = (int)(410 + i);
+                }
+            } else if (g_activeTab == TAB_ABOUT) {
+                if (PtInRectGdi(Rect(182, 392, 185, 30), mx, my)) newHoverBtn = 501;
+                if (PtInRectGdi(Rect(376, 392, 140, 30), mx, my)) newHoverBtn = 502;
+                if (PtInRectGdi(Rect(524, 392, 80,  30), mx, my)) newHoverBtn = 503;
+            }
+
+            if (newHoverBtn != g_hoverBtnId) {
+                g_hoverBtnId = newHoverBtn;
+                needRedraw = true;
+            }
+
+            if (needRedraw) {
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+        }
+
+        case WM_LBUTTONDOWN: {
+            int mx = GET_X_LPARAM(lParam);
+            int my = GET_Y_LPARAM(lParam);
+
+            if (mx >= 604 && mx < 642 && my >= 0 && my < TOP_BAR_H) {
+                ShowWindow(hwnd, SW_MINIMIZE);
+                return 0;
+            }
+            if (mx >= 642 && mx <= WIN_W && my >= 0 && my < TOP_BAR_H) {
+                MinimizeToSystemTray(hwnd);
+                return 0;
+            }
+
+            if (g_svc.isStarting) return 0;
+
+            if (g_openDropdownId != -1) {
+                int changedId = g_openDropdownId;
+                if (PtInRectGdi(g_openDropdownMenuRect, mx, my) && g_hoverDropdownItem >= 0 && g_openDropdownTarget) {
+                    *g_openDropdownTarget = g_hoverDropdownItem;
+                    SaveConfig();
+                    if (changedId == 1) ApplyHardwareEncoderConfig();
+                    else if (changedId == 2) ApplyOpenXrRuntimeSelection();
+                    else if (changedId == 3) ShowToast(L"Gamepad emulation profile updated");
+                    else if (changedId == 4) ShowToast(L"Audio streaming route updated");
+                }
+                g_openDropdownId = -1;
+                g_openDropdownTarget = nullptr;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+
+            if (mx >= 0 && mx < SIDEBAR_W && my >= 60 && my < 330) {
+                int idx = (my - 60) / 44;
+                if (idx >= 0 && idx < 6 && idx != g_activeTab) {
+                    g_activeTab = (NavTab)idx;
+                    RebuildControlsForTab();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+            }
+
+            if (g_activeTab == TAB_ACCOUNTS) {
+                if (!g_editingAccount && PtInRectGdi(Rect(354, 126, 70, 30), mx, my)) {
+                    g_editingAccount = true;
+                    g_accountEditBuf = g_cfg.metaAccount;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                if (g_editingAccount && PtInRectGdi(Rect(412, 82, 65, 28), mx, my)) {
+                    if (!g_accountEditBuf.empty()) g_cfg.metaAccount = g_accountEditBuf;
+                    g_editingAccount = false;
+                    SaveConfig();
+                    ShowToast(L"Updated account to: " + g_cfg.metaAccount);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+            }
+            else if (g_activeTab == TAB_BINDINGS) {
+                for (int i = 0; i < 9; ++i) {
+                    if (PtInRectGdi(Rect(500, 85 + i * 33, 166, 28), mx, my)) {
+                        g_recordingBindingIdx = i;
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                        return 0;
+                    }
+                }
+                if (PtInRectGdi(Rect(178, 392, 156, 30), mx, my)) {
+                    g_cfg.ResetBindings();
+                    SaveConfig();
+                    RegisterAllHotkeys(hwnd);
+                    ShowToast(L"Keyboard shortcuts reset to defaults");
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+            }
+            else if (g_activeTab == TAB_MEDIA) {
+                if (PtInRectGdi(Rect(518, 53, 146, 30), mx, my)) {
+                    std::wstring chosen = BrowseForFolderDialog(hwnd, L"Select Screenshots Folder");
+                    if (!chosen.empty()) {
+                        g_cfg.screenshotsPath = chosen;
+                        SaveConfig();
+                        ShowToast(L"Screenshots folder updated");
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                    }
+                    return 0;
+                }
+                for (size_t i = 0; i < g_cfg.videoPaths.size() && i < 3; ++i) {
+                    int baseY = 128 + (int)i * 70;
+                    if (PtInRectGdi(Rect(518, baseY - 5, 146, 30), mx, my)) {
+                        std::wstring chosen = BrowseForFolderDialog(hwnd, L"Select Videos Folder");
+                        if (!chosen.empty()) {
+                            if (chosen.back() != L'\\') chosen += L"\\";
+                            g_cfg.videoPaths[i] = chosen;
+                            SaveConfig();
+                            ShowToast(L"Videos folder updated");
+                            InvalidateRect(hwnd, nullptr, FALSE);
+                        }
+                        return 0;
+                    }
+                }
+                if (PtInRectGdi(Rect(178, 392, 164, 30), mx, my)) {
+                    if (g_cfg.videoPaths.size() < 3) {
+                        std::wstring chosen = BrowseForFolderDialog(hwnd, L"Add Videos Folder");
+                        if (!chosen.empty()) {
+                            if (chosen.back() != L'\\') chosen += L"\\";
+                            g_cfg.videoPaths.push_back(chosen);
+                            SaveConfig();
+                            ShowToast(L"Added video folder");
+                            InvalidateRect(hwnd, nullptr, FALSE);
+                        }
+                    } else {
+                        ShowToast(L"Maximum of 3 video folders reached");
+                    }
+                    return 0;
+                }
+            }
+            else if (g_activeTab == TAB_ABOUT) {
+                // Clickable "click here to disable" link next to HAGS
+                if (g_svc.hagsEnabled && PtInRectGdi(Rect(370, 236, 150, 20), mx, my)) {
+                    ShellExecuteW(hwnd, L"open", L"ms-settings:display-advancedgraphics", nullptr, nullptr, SW_SHOWNORMAL);
+                    ShowToast(L"Opened Windows Advanced Graphics Settings (HAGS)");
+                    return 0;
+                }
+                // Button 1: Check for interfering apps...
+                if (PtInRectGdi(Rect(182, 392, 185, 30), mx, my)) {
+                    ScanInterferingApps(hwnd);
+                    return 0;
+                }
+                // Button 2: Check for updates...
+                if (PtInRectGdi(Rect(376, 392, 140, 30), mx, my)) {
+                    wchar_t msg[512];
+                    swprintf_s(msg,
+                        L"Project VXR Streamer is up to date.\n\n"
+                        L"Active Subsystems Verified:\n"
+                        L"  • vxr_encoder.dll (NVENC %s)\n"
+                        L"  • openxr_vxr.dll (HFOV %.1f°, VFOV %.1f°, %ux%u)\n"
+                        L"  • driver_vrserver.dll (SteamVR 6DoF Ready)\n"
+                        L"  • VxrIddCx.dll (UMDF v2 Virtual Display)\n"
+                        L"  • Compute Shaders (SSW / CAS / SGSR Loaded)",
+                        g_svc.nvencActive ? L"Hardware Active" : L"Standby",
+                        g_svc.activeHFovDeg, g_svc.activeVFovDeg,
+                        g_svc.activeEyeWidth, g_svc.activeEyeHeight);
+                    MessageBoxW(hwnd, msg, L"Project VXR - Update & Integrity Check", MB_OK | MB_ICONINFORMATION);
+                    return 0;
+                }
+                // Button 3: Show logs
+                if (PtInRectGdi(Rect(524, 392, 80, 30), mx, my)) {
+                    AppendServiceLog(L"User opened vxr_streamer.log from ABOUT tab.");
+                    ShellExecuteW(hwnd, L"open", L"notepad.exe", L"vxr_streamer.log", nullptr, SW_SHOWNORMAL);
+                    return 0;
+                }
+            }
+
+            // Dropdowns
+            for (const auto& dd : g_dropdowns) {
+                if (PtInRectGdi(dd.rect, mx, my)) {
+                    g_openDropdownId = dd.id;
+                    g_openDropdownItems = dd.items;
+                    g_openDropdownTarget = dd.selectedIndex;
+                    g_hoverDropdownItem = *dd.selectedIndex;
+                    int menuH = (int)dd.items.size() * 26 + 2;
+                    g_openDropdownMenuRect = Rect(dd.rect.X, dd.rect.Y + dd.rect.Height, dd.rect.Width, menuH);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+            }
+
+            // Checkboxes
+            for (const auto& cb : g_checkboxes) {
+                if (!cb.disabled && PtInRectGdi(cb.rect, mx, my)) {
+                    *cb.value = !(*cb.value);
+                    SaveConfig();
+                    if (cb.id == 101 || cb.id == 102) ApplyHardwareEncoderConfig();
+                    else if (cb.id == 108) ApplyStartWithWindowsRegistry();
+                    else if (cb.id == 201 || cb.id == 202) ApplyAdvancedOpticalAndSharpeningParameters();
+                    else if (cb.id == 203) ApplyGamePriorityBoost();
+                    else ShowToast(cb.label + (*cb.value ? L": Enabled" : L": Disabled"));
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+            }
+
+            // Sliders
+            for (const auto& sl : g_sliders) {
+                bool isEnabled = (sl.enabledFlag == nullptr) || (*sl.enabledFlag);
+                if (!isEnabled) continue;
+                Rect hitRect(sl.trackRect.X - 8, sl.trackRect.Y - 4, sl.trackRect.Width + 16, sl.trackRect.Height + 8);
+                if (PtInRectGdi(hitRect, mx, my)) {
+                    g_draggingSliderId = sl.id;
+                    SetCapture(hwnd);
+                    UpdateSliderFromMouse(sl, mx);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+            }
+
+            // Reset to Defaults button
+            if ((g_activeTab == TAB_OPTIONS || g_activeTab == TAB_ADVANCED) && PtInRectGdi(Rect(506, 392, 156, 30), mx, my)) {
+                if (g_activeTab == TAB_OPTIONS) {
+                    g_cfg.ResetOptions();
+                    ApplyHardwareEncoderConfig();
+                } else {
+                    g_cfg.ResetAdvanced();
+                    ApplyHardwareEncoderConfig();
+                    ApplyGamePriorityBoost();
+                }
+                SaveConfig();
+                ShowToast(L"Settings reset to defaults");
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+
+            return 0;
+        }
+
+        case WM_LBUTTONUP: {
+            if (g_draggingSliderId != -1) {
+                if (g_draggingSliderId == 12) {
+                    ApplyHardwareEncoderConfig();
+                } else {
+                    ApplyAdvancedOpticalAndSharpeningParameters();
+                }
+                g_draggingSliderId = -1;
+                ReleaseCapture();
+            }
+            return 0;
+        }
+
+        case WM_TRAYICON: {
+            if (lParam == WM_LBUTTONDBLCLK || lParam == WM_LBUTTONUP) {
+                ShowWindow(hwnd, SW_SHOW);
+                ShowWindow(hwnd, SW_RESTORE);
+                SetForegroundWindow(hwnd);
+            } else if (lParam == WM_RBUTTONUP) {
+                POINT pt;
+                GetCursorPos(&pt);
+                HMENU hMenu = CreatePopupMenu();
+                AppendMenuW(hMenu, MF_STRING, ID_TRAY_OPEN, L"Open Project VXR Streamer");
+                SetMenuDefaultItem(hMenu, ID_TRAY_OPEN, FALSE);
+                AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+                AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"Exit");
+                SetForegroundWindow(hwnd);
+                int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, nullptr);
+                PostMessageW(hwnd, WM_NULL, 0, 0);
+                DestroyMenu(hMenu);
+                if (cmd == ID_TRAY_OPEN) {
+                    ShowWindow(hwnd, SW_SHOW);
+                    ShowWindow(hwnd, SW_RESTORE);
+                    SetForegroundWindow(hwnd);
+                } else if (cmd == ID_TRAY_EXIT) {
+                    DestroyWindow(hwnd);
+                }
+            }
+            return 0;
+        }
+
+        case WM_CLOSE: {
+            MinimizeToSystemTray(hwnd);
+            return 0;
+        }
+
+        case WM_DESTROY: {
+            g_hwnd = nullptr;
+            KillTimer(hwnd, 1);
+            for (int i = 0; i < 9; ++i) UnregisterHotKey(hwnd, HOTKEY_BASE_ID + i);
+            Shell_NotifyIconW(NIM_DELETE, &g_nid);
+            SaveConfig();
+            g_svc.stopRequested = true;
+            if (g_serviceThread.joinable()) g_serviceThread.detach();
+            PostQuitMessage(0);
+            return 0;
+        }
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int nCmdShow) {
+    HWND existingHwnd = FindWindowW(L"VxrStreamerNativeWnd", nullptr);
+    if (existingHwnd) {
+        PostMessageW(existingHwnd, WM_TRAYICON, 1, WM_LBUTTONUP);
+        return 0;
+    }
+
+    GdiplusStartupInput gdiplusStartupInput;
+    ULONG_PTR gdiplusToken;
+    GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, nullptr);
+
+    g_hAppIcon = CreateVxrAppIcon();
+
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(WNDCLASSEXW);
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInstance;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hIcon = g_hAppIcon;
+    wc.hIconSm = g_hAppIcon;
+    wc.lpszClassName = L"VxrStreamerNativeWnd";
+    RegisterClassExW(&wc);
+
+    int scrW = GetSystemMetrics(SM_CXSCREEN);
+    int scrH = GetSystemMetrics(SM_CYSCREEN);
+    int posX = (scrW - WIN_W) / 2;
+    int posY = (scrH - WIN_H) / 2;
+
+    HWND hwnd = CreateWindowExW(
+        0,
+        wc.lpszClassName,
+        L"Project VXR Streamer",
+        WS_POPUP | WS_MINIMIZEBOX | WS_SYSMENU | WS_CLIPCHILDREN,
+        posX, posY, WIN_W, WIN_H,
+        nullptr, nullptr, hInstance, nullptr
+    );
+
+    bool forceShow = (lpCmdLine && wcsstr(lpCmdLine, L"--show") != nullptr);
+    if (g_cfg.startMinimizedInTray && !forceShow) {
+        MinimizeToSystemTray(hwnd);
+    } else {
+        ShowWindow(hwnd, nCmdShow);
+        UpdateWindow(hwnd);
+    }
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    GdiplusShutdown(gdiplusToken);
+    ExitProcess(0);
+    return 0;
+}

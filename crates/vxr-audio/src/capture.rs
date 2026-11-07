@@ -84,18 +84,32 @@ pub mod wasapi {
     pub struct WasapiLoopbackCapture {
         sample_rate: u32,
         channels: u16,
+        bits_per_sample: u16,
+        is_float: bool,
         is_running: bool,
         com_initialized: bool,
+        audio_client: Option<IAudioClient>,
+        capture_client: Option<IAudioCaptureClient>,
     }
+
+    unsafe impl Send for WasapiLoopbackCapture {}
 
     impl WasapiLoopbackCapture {
         pub fn new() -> Result<Self> {
             Ok(Self {
                 sample_rate: 48_000,
                 channels: 2,
+                bits_per_sample: 32,
+                is_float: true,
                 is_running: false,
                 com_initialized: false,
+                audio_client: None,
+                capture_client: None,
             })
+        }
+
+        pub fn is_capturing_real_audio(&self) -> bool {
+            self.capture_client.is_some()
         }
     }
 
@@ -123,6 +137,8 @@ pub mod wasapi {
                 let mix_format = &*mix_format_ptr;
                 self.sample_rate = mix_format.nSamplesPerSec;
                 self.channels = mix_format.nChannels;
+                self.bits_per_sample = mix_format.wBitsPerSample;
+                self.is_float = mix_format.wBitsPerSample == 32;
 
                 // 10ms buffer duration in 100ns units
                 let buffer_duration = 100_000;
@@ -135,11 +151,20 @@ pub mod wasapi {
                     None,
                 ).map_err(|e| AudioError::Wasapi(format!("Initialize loopback failed: {:?}", e)))?;
 
+                let capture_client: IAudioCaptureClient = audio_client.GetService()
+                    .map_err(|e| AudioError::Wasapi(format!("Failed to get IAudioCaptureClient service: {:?}", e)))?;
+
                 audio_client.Start()
                     .map_err(|e| AudioError::Wasapi(format!("Failed to start audio client: {:?}", e)))?;
 
+                self.audio_client = Some(audio_client);
+                self.capture_client = Some(capture_client);
                 self.is_running = true;
-                log::info!("WASAPI Loopback capture started: {} Hz, {} channels", self.sample_rate, self.channels);
+
+                log::info!(
+                    "[VXR-Audio] Real WASAPI Loopback capture started: {} Hz, {} channels, {} bits (float={})",
+                    self.sample_rate, self.channels, self.bits_per_sample, self.is_float
+                );
                 Ok(())
             }
         }
@@ -149,15 +174,87 @@ pub mod wasapi {
                 return Ok(Vec::new());
             }
 
-            // Return silent/standby buffer if no audio packet is currently playing
-            Ok(vec![0.0f32; 480])
+            let mut out_samples = Vec::new();
+
+            if let Some(ref client) = self.capture_client {
+                unsafe {
+                    loop {
+                        let next_packet_size = match client.GetNextPacketSize() {
+                            Ok(size) => size,
+                            Err(_) => break,
+                        };
+
+                        if next_packet_size == 0 {
+                            break;
+                        }
+
+                        let mut p_data: *mut u8 = std::ptr::null_mut();
+                        let mut frames_read = 0u32;
+                        let mut flags = 0u32;
+
+                        let hr = client.GetBuffer(
+                            &mut p_data,
+                            &mut frames_read,
+                            &mut flags,
+                            None,
+                            None,
+                        );
+
+                        if hr.is_err() || frames_read == 0 {
+                            break;
+                        }
+
+                        let channels = self.channels as usize;
+                        let is_silent = (flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)) != 0 || p_data.is_null();
+
+                        if is_silent {
+                            // Emit silent stereo samples for the duration
+                            out_samples.resize(out_samples.len() + (frames_read as usize) * 2, 0.0);
+                        } else if self.is_float {
+                            // IEEE 32-bit float samples
+                            let float_slice = std::slice::from_raw_parts(
+                                p_data as *const f32,
+                                (frames_read as usize) * channels,
+                            );
+
+                            for frame in float_slice.chunks_exact(channels) {
+                                out_samples.push(frame[0]); // Left
+                                out_samples.push(if channels > 1 { frame[1] } else { frame[0] }); // Right
+                            }
+                        } else {
+                            // 16-bit integer PCM samples
+                            let i16_slice = std::slice::from_raw_parts(
+                                p_data as *const i16,
+                                (frames_read as usize) * channels,
+                            );
+
+                            for frame in i16_slice.chunks_exact(channels) {
+                                out_samples.push(frame[0] as f32 / 32768.0);
+                                out_samples.push(if channels > 1 { frame[1] as f32 / 32768.0 } else { frame[0] as f32 / 32768.0 });
+                            }
+                        }
+
+                        let _ = client.ReleaseBuffer(frames_read);
+                    }
+                }
+            }
+
+            Ok(out_samples)
         }
 
         fn stop(&mut self) -> Result<()> {
-            self.is_running = false;
-            if self.com_initialized {
-                unsafe { CoUninitialize(); }
-                self.com_initialized = false;
+            if self.is_running {
+                if let Some(ref client) = self.audio_client {
+                    unsafe { let _ = client.Stop(); }
+                }
+                self.capture_client = None;
+                self.audio_client = None;
+                self.is_running = false;
+
+                if self.com_initialized {
+                    unsafe { CoUninitialize(); }
+                    self.com_initialized = false;
+                }
             }
             Ok(())
         }

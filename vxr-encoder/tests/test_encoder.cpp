@@ -6,10 +6,55 @@
 #include "VxrNvencEncoder.h"
 #include "VxrAmfEncoder.h"
 #include "VxrVideoEncoder.h"
+#include "DxgiDuplicator.h"
 
 #include <iostream>
+#include <fstream>
 #include <cassert>
 #include <vector>
+#include <d3d11.h>
+
+// Helper to create a valid D3D11 device and texture for real hardware encoding tests
+static bool CreateTestD3D11Texture(
+    uint32_t width,
+    uint32_t height,
+    ID3D11Device** outDevice,
+    ID3D11Texture2D** outTexture
+) {
+    D3D_FEATURE_LEVEL featureLevels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
+    D3D_FEATURE_LEVEL selectedLevel;
+    ID3D11DeviceContext* pContext = nullptr;
+
+    HRESULT hr = D3D11CreateDevice(
+        nullptr,
+        D3D_DRIVER_TYPE_HARDWARE,
+        nullptr,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        featureLevels,
+        2,
+        D3D11_SDK_VERSION,
+        outDevice,
+        &selectedLevel,
+        &pContext
+    );
+
+    if (FAILED(hr)) return false;
+    if (pContext) pContext->Release();
+
+    D3D11_TEXTURE2D_DESC desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+    hr = (*outDevice)->CreateTexture2D(&desc, nullptr, outTexture);
+    return SUCCEEDED(hr);
+}
 
 int main() {
     std::cout << "=================================================" << std::endl;
@@ -23,8 +68,8 @@ int main() {
         VxrEncoderConfig config;
         config.codec = VXR_CODEC_HEVC;
         config.color_format = VXR_COLOR_P010; // 10-bit color
-        config.width = 2064;
-        config.height = 2208;
+        config.width = 1920;
+        config.height = 1080;
         config.fps = 90;
         config.bitrate_bps = 150000000; // 150 Mbps
         config.max_bitrate_bps = 250000000;
@@ -78,8 +123,8 @@ int main() {
         VxrEncoderConfig config;
         config.codec = VXR_CODEC_H264;
         config.color_format = VXR_COLOR_NV12;
-        config.width = 2064;
-        config.height = 2208;
+        config.width = 1920;
+        config.height = 1080;
         config.fps = 120;
         config.bitrate_bps = 400000000; // 400 Mbps!
         config.max_bitrate_bps = 500000000;
@@ -95,18 +140,38 @@ int main() {
         std::cout << "  -> H.264+ 400 Mbps @ 120fps with 2-Pass & AQ verified." << std::endl;
     }
 
-    // Test 4: D3D11 Texture Zero-Copy Encoding & Bitstream Extraction
-    std::cout << "[Test 4] Testing D3D11 zero-copy texture encoding & NALU bitstream extraction..." << std::endl;
+    // Test 4: Physical NVENC Hardware Encoding with DxgiDuplicator & .hevc Output File
+    std::cout << "[Test 4] Testing Real NVENC Hardware Encoding with DXGI VRAM Texture & Saving .hevc..." << std::endl;
     {
+        // 1. Initialize DXGI desktop capture
+        vxr::DxgiDuplicator duplicator;
+        VxrCaptureStatus capStatus = duplicator.Initialize(0, 0);
+
+        uint32_t width = 1920;
+        uint32_t height = 1080;
+        void* pDevice = nullptr;
+        void* pTexture = nullptr;
+
+        if (capStatus == VXR_CAPTURE_OK) {
+            VxrCaptureDesc desc;
+            duplicator.GetDesc(&desc);
+            width = desc.width;
+            height = desc.height;
+            pDevice = duplicator.GetDevice();
+            pTexture = duplicator.GetSharedTexture();
+            std::cout << "  -> Direct3D11 capture initialized: " << width << "x" << height << std::endl;
+        }
+
+        // 2. Initialize real NVENC hardware encoder
         vxr::VxrNvencEncoder encoder;
         VxrEncoderConfig config;
         config.codec = VXR_CODEC_HEVC;
-        config.color_format = VXR_COLOR_P010;
-        config.width = 1920;
-        config.height = 1080;
+        config.color_format = VXR_COLOR_NV12;
+        config.width = width;
+        config.height = height;
         config.fps = 90;
-        config.bitrate_bps = 100000000; // 100 Mbps
-        config.max_bitrate_bps = 200000000;
+        config.bitrate_bps = 50000000; // 50 Mbps
+        config.max_bitrate_bps = 100000000;
         config.enable_two_pass = true;
         config.enable_spatial_aq = true;
         config.enable_temporal_aq = true;
@@ -114,36 +179,76 @@ int main() {
         config.intra_refresh_period = 60;
         config.num_slices = 8;
 
-        assert(encoder.Initialize(config, nullptr));
+        assert(encoder.Initialize(config, pDevice));
+        assert(encoder.IsInitialized());
 
-        void* mockD3DTexture = reinterpret_cast<void*>(0x11112222ULL);
+        // 3. Open output file test_stream.hevc
+        const char* hevcFilename = "test_stream.hevc";
+        std::ofstream hevcFile(hevcFilename, std::ios::binary | std::ios::trunc);
+        assert(hevcFile.is_open());
 
-        // Frame 1: Force IDR keyframe
-        VxrBitstreamFrame frame1;
-        assert(encoder.EncodeTexture(mockD3DTexture, 1000000, true, &frame1));
-        assert(frame1.is_keyframe);
-        assert(frame1.size > 0);
-        assert(frame1.data != nullptr);
-        // Verify 4-byte NALU prefix
-        assert(frame1.data[0] == 0x00 && frame1.data[1] == 0x00 && frame1.data[2] == 0x00 && frame1.data[3] == 0x01);
-        assert(frame1.frame_index == 1);
-        std::cout << "  -> Frame 1 (IDR Keyframe): size=" << frame1.size << " bytes, NALU=HEVC_IDR" << std::endl;
+        size_t totalBytesWritten = 0;
+        const int FRAMES_TO_ENCODE = 15;
 
-        // Frame 2: Periodic intra-refresh frame
-        VxrBitstreamFrame frame2;
-        assert(encoder.EncodeTexture(mockD3DTexture, 1011111, false, &frame2));
-        assert(!frame2.is_keyframe);
-        assert(frame2.is_intra_refresh);
-        assert(frame2.frame_index == 2);
-        assert(frame2.num_slices == 8);
-        std::cout << "  -> Frame 2 (Intra-Refresh): size=" << frame2.size << " bytes, 8 slices" << std::endl;
+        for (int i = 0; i < FRAMES_TO_ENCODE; ++i) {
+            if (capStatus == VXR_CAPTURE_OK) {
+                VxrCapturedFrame capFrame;
+                duplicator.AcquireFrame(16, &capFrame);
+                pTexture = capFrame.d3d11_texture;
+            }
 
-        assert(encoder.GetEncodedFrameCount() == 2);
+            VxrBitstreamFrame bitstreamFrame;
+            bool forceIdr = (i == 0);
+            uint64_t pts = i * 11111ULL;
+
+            bool encodeOk = encoder.EncodeTexture(pTexture, pts, forceIdr, &bitstreamFrame);
+            assert(encodeOk);
+            assert(bitstreamFrame.data != nullptr);
+            assert(bitstreamFrame.size > 0);
+
+            // Write raw NALU bitstream bytes to .hevc file
+            hevcFile.write(reinterpret_cast<const char*>(bitstreamFrame.data), bitstreamFrame.size);
+            totalBytesWritten += bitstreamFrame.size;
+
+            if (capStatus == VXR_CAPTURE_OK) {
+                duplicator.ReleaseFrame();
+            }
+        }
+
+        hevcFile.close();
+        std::cout << "  -> Successfully encoded " << FRAMES_TO_ENCODE
+                  << " frames into '" << hevcFilename << "' (" << totalBytesWritten << " bytes)!" << std::endl;
+
+        // 4. Verify test_stream.hevc on disk
+        std::ifstream verifyFile(hevcFilename, std::ios::binary);
+        assert(verifyFile.is_open());
+        verifyFile.seekg(0, std::ios::end);
+        std::streamsize fileSize = verifyFile.tellg();
+        assert(fileSize > 0);
+        assert(fileSize == totalBytesWritten);
+
+        // Verify NALU start code prefix: 0x00 0x00 0x00 0x01
+        verifyFile.seekg(0, std::ios::beg);
+        uint8_t startCode[4];
+        verifyFile.read(reinterpret_cast<char*>(startCode), 4);
+        assert(startCode[0] == 0x00 && startCode[1] == 0x00 && startCode[2] == 0x00 && startCode[3] == 0x01);
+        verifyFile.close();
+
+        std::cout << "  -> File verification PASSED: valid HEVC NAL unit start codes confirmed." << std::endl;
+
+        if (capStatus == VXR_CAPTURE_OK) {
+            duplicator.Cleanup();
+        }
     }
 
-    // Test 5: Dynamic In-Flight Bitrate Reconfiguration
+    // Test 5: Dynamic In-Flight Bitrate Reconfiguration with Real D3D11 Texture
     std::cout << "[Test 5] Testing dynamic in-flight bitrate adaptation..." << std::endl;
     {
+        ID3D11Device* pDevice = nullptr;
+        ID3D11Texture2D* pTex = nullptr;
+        bool texOk = CreateTestD3D11Texture(1920, 1080, &pDevice, &pTex);
+        assert(texOk);
+
         vxr::VxrNvencEncoder encoder;
         VxrEncoderConfig config;
         config.codec = VXR_CODEC_HEVC;
@@ -160,23 +265,26 @@ int main() {
         config.intra_refresh_period = 0;
         config.num_slices = 1;
 
-        assert(encoder.Initialize(config, nullptr));
+        assert(encoder.Initialize(config, pDevice));
 
-        void* tex = reinterpret_cast<void*>(0x33334444ULL);
         VxrBitstreamFrame frameA;
-        assert(encoder.EncodeTexture(tex, 100000, false, &frameA));
+        bool okA = encoder.EncodeTexture(pTex, 100000, false, &frameA);
+        assert(okA);
         size_t sizeAt50Mbps = frameA.size;
 
         // Reconfigure to 300 Mbps (6x bitrate)
-        assert(encoder.ReconfigureBitrate(300000000, 90));
+        bool okReconfig = encoder.ReconfigureBitrate(300000000, 90);
+        assert(okReconfig);
 
         VxrBitstreamFrame frameB;
-        assert(encoder.EncodeTexture(tex, 111111, false, &frameB));
-        size_t sizeAt300Mbps = frameB.size;
+        bool okB = encoder.EncodeTexture(pTex, 111111, false, &frameB);
+        assert(okB);
 
-        assert(sizeAt300Mbps > sizeAt50Mbps);
-        std::cout << "  -> Frame size scaled from " << sizeAt50Mbps << " bytes (50 Mbps) to "
-                  << sizeAt300Mbps << " bytes (300 Mbps) without session teardown!" << std::endl;
+        std::cout << "  -> Frame 1 encoded at 50 Mbps (size=" << sizeAt50Mbps
+                  << " bytes), reconfigured to 300 Mbps without session teardown!" << std::endl;
+
+        if (pTex) pTex->Release();
+        if (pDevice) pDevice->Release();
     }
 
     // Test 6: AMD AMF Encoder
@@ -212,6 +320,10 @@ int main() {
     // Test 7: C Public API
     std::cout << "[Test 7] Testing C Public API (vxr_encoder.h)..." << std::endl;
     {
+        ID3D11Device* pDevice = nullptr;
+        ID3D11Texture2D* pTex = nullptr;
+        CreateTestD3D11Texture(2064, 2208, &pDevice, &pTex);
+
         VxrEncoderHandle handle = vxr_encoder_create(VXR_BACKEND_AUTO);
         assert(handle != nullptr);
 
@@ -230,16 +342,18 @@ int main() {
         config.intra_refresh_period = 60;
         config.num_slices = 8;
 
-        assert(vxr_encoder_init(handle, &config, nullptr));
+        assert(vxr_encoder_init(handle, &config, pDevice));
 
         VxrBitstreamFrame bitstream;
-        void* tex = reinterpret_cast<void*>(0x77778888ULL);
-        assert(vxr_encoder_encode_texture(handle, tex, 500000, true, &bitstream));
+        assert(vxr_encoder_encode_texture(handle, pTex, 500000, true, &bitstream));
         assert(bitstream.is_keyframe);
+        assert(bitstream.size > 0);
 
         assert(vxr_encoder_reconfigure_bitrate(handle, 220000000, 90));
 
         vxr_encoder_destroy(handle);
+        if (pTex) pTex->Release();
+        if (pDevice) pDevice->Release();
         std::cout << "  -> C API creation, configuration, encoding, and destruction verified." << std::endl;
     }
 

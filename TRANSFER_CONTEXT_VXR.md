@@ -1,19 +1,37 @@
-# PROJECT VXR: TỔNG QUAN HỆ THỐNG & CHUYỂN GIAO (BẢN CẬP NHẬT 2026)
+# PROJECT VXR: TỔNG QUAN HỆ THỐNG & KẾ HOẠCH HOÀN THIỆN THỰC CHIẾN (PRODUCTION ROLLOUT)
 
+> **Tài liệu chuyển giao kỹ thuật & Kế hoạch triển khai phần cứng thật**  
 > Dự án: Project VXR (Wireless VR/Desktop Streaming Solution)  
-> Kiến trúc: Pragmatic Hybrid (Rust + C++).
+> Bối cảnh: Đã hoàn tất 6 Phase Thiết kế kiến trúc & Mock Validation. Bước vào Giai đoạn Hoàn thiện Phần cứng Thật (Production Rollout).
 
-## 1. PHẠM VI DỰ ÁN
-Project VXR bao gồm 2 thực thể phần mềm chạy song hành:
-1. **PC Streamer Host (Rust/C++)**: Thực hiện bắt frame (DXGI), mã hóa cứng (NVENC), giả lập driver (IDDCX/OpenVR).
-2. **Quest Client (APK, C++/NDK)**: Native NDK, giải mã phần cứng (AMediaCodec), nội suy khung hình (SSW/SGSR).
+---
 
-## 2. TRIẾT LÝ PHÁT TRIỂN: "THE PRAGMATIC HYBRID"
-- **Không Rust cực đoan**: Driver (C++) và Renderer (C++) phải là Native để tránh overhead/crashed ABI.
-- **Tối đa hóa Rust**: Sử dụng Rust cho toàn bộ logic mạng (Pacing/FEC), Audio, Input, và GUI để đảm bảo an toàn, mượt mà (không GC) và tiết kiệm RAM.
+## 1. THỰC TRẠNG DỰ ÁN & PHÂN ĐỊNH RANH GIỚI KIỂM THỬ
 
-## 3. CÁC ĐIỂM CỐT LÕI (TECHNICAL DIFFERENTIATORS)
-1. **Zero-Copy Pipeline**: Frame giải mã từ `MediaCodec` -> `Vulkan Texture` không qua CPU.
-2. **Micro-Packet Pacing & FEC**: Khử nghẽn router, tự phục hồi gói lỗi tức thời.
-3. **Hardware Cursor 0ms**: Giả lập chuột cục bộ trên kính.
-4. **QoS/DSCP**: Ưu tiên gói tin trên Wi-Fi LAN.
+| Hạng mục | Trạng thái hiện tại | Yêu cầu hoàn thiện thật |
+| :--- | :--- | :--- |
+| **Giao thức mạng (vxr-protocol)** | ✅ Code thật 100% (Đóng gói nhị phân, Reed-Solomon FEC, UDP DSCP 46). | Duy trì, tích hợp vào server pipeline. |
+| **Điều tốc (vxr-pacer)** | ✅ Code thật 100% (Token Bucket micro-packet pacing 40-60µs, AIMD). | Kết nối dữ liệu phản hồi RTT/Loss thực tế từ kính. |
+| **Bắt hình (vxr-capture)** | ✅ Code thật 100% (Direct3D 11 & DXGI Output Duplication trên GPU). | Xuất Texture trực tiếp sang NVENC. |
+| **Mã hóa (vxr-encoder)** | ⚠️ Mock Header NALU (đã nạp nvEncodeAPI64.dll nhưng chưa nén thật). | **Bắt buộc**: Gọi `nvEncEncodePicture` & `nvEncLockBitstream` thật trên RTX 4060 Ti. |
+| **Âm thanh (vxr-audio)** | ⚠️ Đã khởi tạo WASAPI nhưng `read_samples` trả về vec rỗng/silence. | **Bắt buộc**: Đọc PCM thật qua `IAudioCaptureClient::GetBuffer`. |
+| **Server Ghép nối (Orchestrator)**| ⚠️ Chưa nối luồng, Dashboard hiển thị telemetry gán cứng. | **Bắt buộc**: Xây dựng tiến trình stream hoàn chỉnh đo đạc FPS/Latency thật. |
+| **Quest Client (APK)** | ⚠️ Build dạng DLL/EXE trên Windows với con trỏ giả lập. | **Bắt buộc**: Cấu hình Gradle NDK, gọi `AMediaCodec` thật, build ra file `.apk` cài lên Quest. |
+
+---
+
+## 2. LỘ TRÌNH 4 CỘT MỐC HOÀN THIỆN THỰC CHIẾN (PRODUCTION MILESTONES)
+
+```
+[CỘT MỐC A] NVENC Hardware Encoding Thật trên RTX 4060 Ti
+       │ (Mở session thật, nén D3D11 Texture ra HEVC/AV1 thật, kiểm chứng qua ffplay)
+       ▼
+[CỘT MỐC B] Tiến trình Server Hoàn chỉnh & WASAPI Loopback Thật
+       │ (Capture -> NVENC -> FEC -> Pacer -> UDP; Gắn telemetry thật vào Dashboard)
+       ▼
+[CỘT MỐC C] Quest Client Android NDK Thật & Đóng gói APK
+       │ (Cài NDK trên ổ E:, compile SPIR-V shaders thật, AMediaCodec zero-copy, build APK)
+       ▼
+[CỘT MỐC D] Kết nối E2E Không dây Kính Quest - PC & Chơi Game Thật
+       │ (Ghép PIN mDNS, stream 90Hz/120Hz mượt mà, truyền tracking 6DoF vào SteamVR)
+```

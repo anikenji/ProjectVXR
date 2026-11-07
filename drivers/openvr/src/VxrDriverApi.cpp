@@ -30,4 +30,11 @@ bool VxrDriver_IsActive(void) {
     return vxr::VxrDriverServerProvider::GetInstance().IsInitialized();
 }
 
+__declspec(dllexport) void VxrDriver_SetOpticalConfig(float h_fov_scale, float v_fov_scale, float render_scale) {
+    auto hmd = vxr::VxrDriverServerProvider::GetInstance().GetHmd();
+    if (hmd) {
+        hmd->SetOpticalConfig(h_fov_scale, v_fov_scale, render_scale);
+    }
+}
+
 } // extern "C"

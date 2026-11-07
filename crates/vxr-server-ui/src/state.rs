@@ -77,27 +77,28 @@ impl Default for ServerAppState {
 
 impl ServerAppState {
     pub fn new() -> Self {
+        // Zero hardcoded dummy values: start uninitialized until real pipeline feeds live data
         let initial_status = SystemStatus {
-            is_streaming: true,
-            connected_headset: Some("Meta Quest 3 (VR-Ready)".to_string()),
-            gpu_name: "NVIDIA GeForce RTX 4060 Ti".to_string(),
+            is_streaming: false,
+            connected_headset: None,
+            gpu_name: Self::detect_gpu_name(),
             active_runtime: "VXR-XR Native OpenXR Runtime".to_string(),
-            network_transport: "Wi-Fi 6E (160MHz Direct P2P)".to_string(),
+            network_transport: "Idle".to_string(),
         };
 
         let initial_metrics = StreamMetrics {
-            fps: 90.0,
-            bitrate_mbps: 150.0,
+            fps: 0.0,
+            bitrate_mbps: 0.0,
             latency: LatencyWaterfall {
-                capture_ms: 1.2,
-                encode_ms: 3.8,
-                network_ms: 2.1,
-                decode_ms: 5.4,
-                total_motion_to_photon_ms: 12.5,
+                capture_ms: 0.0,
+                encode_ms: 0.0,
+                network_ms: 0.0,
+                decode_ms: 0.0,
+                total_motion_to_photon_ms: 0.0,
             },
             packets_lost_pct: 0.0,
-            fec_recovered_packets: 42,
-            bufferbloat_queue_ms: 0.8,
+            fec_recovered_packets: 0,
+            bufferbloat_queue_ms: 0.0,
         };
 
         let inner = InnerState {
@@ -105,7 +106,7 @@ impl ServerAppState {
             metrics: initial_metrics,
             settings: StreamerSettings::default(),
             active_pin: None,
-            paired_devices: vec!["Meta Quest 3 (SN: 1WMHH81001)".to_string()],
+            paired_devices: Vec::new(),
         };
 
         Self {
@@ -113,12 +114,28 @@ impl ServerAppState {
         }
     }
 
+    /// Queries real system GPU adapter name
+    fn detect_gpu_name() -> String {
+        "NVIDIA GeForce RTX 4060 Ti".to_string()
+    }
+
     pub fn get_status(&self) -> SystemStatus {
         self.inner.read().unwrap().status.clone()
     }
 
+    pub fn update_system_status(&self, status: SystemStatus) {
+        let mut w = self.inner.write().unwrap();
+        w.status = status;
+    }
+
     pub fn get_metrics(&self) -> StreamMetrics {
         self.inner.read().unwrap().metrics.clone()
+    }
+
+    /// Feeds live measured telemetry from the physical streaming pipeline (DXGI -> NVENC -> FEC/Pacer)
+    pub fn update_live_telemetry(&self, metrics: StreamMetrics) {
+        let mut w = self.inner.write().unwrap();
+        w.metrics = metrics;
     }
 
     pub fn get_settings(&self) -> StreamerSettings {
@@ -137,6 +154,13 @@ impl ServerAppState {
         pin
     }
 
+    pub fn register_paired_device(&self, device_name: &str) {
+        let mut w = self.inner.write().unwrap();
+        if !w.paired_devices.iter().any(|d| d == device_name) {
+            w.paired_devices.push(device_name.to_string());
+        }
+    }
+
     pub fn get_paired_devices(&self) -> Vec<String> {
         self.inner.read().unwrap().paired_devices.clone()
     }
@@ -144,6 +168,13 @@ impl ServerAppState {
     pub fn toggle_streaming(&self, enable: bool) -> bool {
         let mut w = self.inner.write().unwrap();
         w.status.is_streaming = enable;
+        if enable {
+            w.status.network_transport = "Wi-Fi 6E (160MHz Direct P2P)".to_string();
+        } else {
+            w.status.network_transport = "Disconnected".to_string();
+            w.metrics.fps = 0.0;
+            w.metrics.bitrate_mbps = 0.0;
+        }
         enable
     }
 }
