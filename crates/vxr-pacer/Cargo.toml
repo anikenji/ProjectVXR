@@ -1,0 +1,15 @@
+[package]
+name = "vxr-pacer"
+version = "0.1.0"
+edition = "2021"
+authors = ["Project VXR Team"]
+description = "Micro-packet token bucket pacing, anti-bufferbloat rate limiter, and dynamic congestion control for Project VXR"
+
+[dependencies]
+vxr-protocol = { path = "../vxr-protocol" }
+thiserror = "2.0"
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+env_logger = "0.11"
